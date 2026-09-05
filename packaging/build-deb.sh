@@ -5,7 +5,7 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 VERSION="0.4-1"
 PKGNAME="lcos-updates_${VERSION}_amd64"
-OVERLAY="/workspace/lcos-live-03"
+OVERLAY="/workspace/lcos-live-04"
 BUILD="$ROOT/build"
 DEST="$OVERLAY/packaging/src/lcos-updates"
 DEB_DIR="$OVERLAY/packaging/debs"

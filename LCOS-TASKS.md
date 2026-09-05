@@ -52,7 +52,7 @@ Stock icon is fine for 0.4 (Bob can replace later). Hidden=false. No MIME.
 
 ## Packaging
 
-- Deb in `/workspace/lcos-live-03/packaging/debs/` and `config/packages.chroot/`
+- Deb in `/workspace/lcos-live-04/packaging/debs/` and `config/packages.chroot/`
 - Depends: gtkmm-3.0 stack, pkexec/policykit, apt
 - Install policy in `/usr/share/polkit-1/actions/`
 - postinst: update-desktop-database
