@@ -12,6 +12,11 @@
 #include <gtkmm.h>
 #include <string>
 
+namespace lcos_updates {
+constexpr const char* kVersion = "0.4";
+constexpr const char* kProductName = "LCOS Updates";
+}  // namespace lcos_updates
+
 class UpdatesWindow : public Gtk::ApplicationWindow {
 public:
   explicit UpdatesWindow(bool check_on_start);
@@ -20,6 +25,7 @@ public:
 protected:
   void on_check_clicked();
   void on_install_clicked();
+  void on_about();
 
 private:
   enum class Job { None, Check, Install };
@@ -37,7 +43,9 @@ private:
   void show_packages(const std::vector<PackageUpgrade>& packages);
   Glib::ustring friendly_error(const std::string& msg) const;
 
-  Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 10};
+  Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 0};
+  Gtk::MenuBar m_menubar;
+  Gtk::Box m_content{Gtk::ORIENTATION_VERTICAL, 10};
   Gtk::Label m_status;
   Gtk::ScrolledWindow m_scroller;
   Gtk::TreeView m_view;

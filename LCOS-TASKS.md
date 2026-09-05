@@ -1,4 +1,4 @@
-# lcos-updates 0.1 — editor assignment (Ted)
+# lcos-updates 0.4 — editor assignment (Ted)
 
 Editor 2026-09-02 approved the UX. You report to Ted. Do not message the editor. Do not bake. Do not touch Lunduke Paint / brushpad.
 
@@ -7,7 +7,7 @@ Editor 2026-09-02 approved the UX. You report to Ted. Do not message the editor.
 Name: **Check for updates…**
 Binary: `lcos-updates`
 App id: `org.lunduke.LcosUpdates`
-Package: `lcos-updates_0.1-1_amd64.deb`
+Package: `lcos-updates_0.4-1_amd64.deb`
 License: GPL-3.0-or-later
 Toolkit: GTK3 / gtkmm-3.0, X11 (`GDK_BACKEND=x11` if unset). Window-manager chrome. No HeaderBar. Follows the GTK theme.
 
@@ -48,7 +48,7 @@ Categories=GTK;System;Settings;PackageManager;
 StartupWMClass=lcos-updates
 ```
 
-Stock icon is fine for 0.1 (Bob can replace later). Hidden=false. No MIME.
+Stock icon is fine for 0.4 (Bob can replace later). Hidden=false. No MIME.
 
 ## Packaging
 

@@ -22,8 +22,17 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 {
   set_title("Check for updates…");
   set_default_size(560, 420);
-  set_border_width(12);
+  set_border_width(0);
   /* Window-manager chrome only: do not call set_titlebar / HeaderBar. */
+
+  auto* help_menu = Gtk::manage(new Gtk::Menu());
+  auto* about_item = Gtk::manage(new Gtk::MenuItem("_About…", true));
+  about_item->signal_activate().connect(sigc::mem_fun(*this, &UpdatesWindow::on_about));
+  help_menu->append(*about_item);
+  auto* help_item = Gtk::manage(new Gtk::MenuItem("_Help", true));
+  help_item->set_submenu(*help_menu);
+  m_menubar.append(*help_item);
+  m_menubar.show_all();
 
   m_status.set_line_wrap(true);
   m_status.set_xalign(0.0f);
@@ -53,9 +62,13 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_check.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_check_clicked));
   m_install.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_install_clicked));
 
-  m_vbox.pack_start(m_status, Gtk::PACK_SHRINK);
-  m_vbox.pack_start(m_scroller, Gtk::PACK_EXPAND_WIDGET);
-  m_vbox.pack_start(m_buttons, Gtk::PACK_SHRINK);
+  m_content.set_border_width(12);
+  m_content.pack_start(m_status, Gtk::PACK_SHRINK);
+  m_content.pack_start(m_scroller, Gtk::PACK_EXPAND_WIDGET);
+  m_content.pack_start(m_buttons, Gtk::PACK_SHRINK);
+
+  m_vbox.pack_start(m_menubar, Gtk::PACK_SHRINK);
+  m_vbox.pack_start(m_content, Gtk::PACK_EXPAND_WIDGET);
   add(m_vbox);
   show_all_children();
   m_check.grab_default();
@@ -387,6 +400,24 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
   /* Offer Check again; keep Install if we still had a list. */
   if (!m_store->children().empty())
     m_install.set_sensitive(true);
+}
+
+void UpdatesWindow::on_about()
+{
+  Gtk::AboutDialog dialog;
+  dialog.set_transient_for(*this);
+  dialog.set_program_name(lcos_updates::kProductName);
+  dialog.set_version(lcos_updates::kVersion);
+  dialog.set_comments(
+      "Checks for and installs apt upgrades from Devuan and the LCOS apt overlay.\n"
+      "Manual only — no background daemon or tray.");
+  dialog.set_copyright("Copyright © 2026 The Lunduke Journal");
+  dialog.set_license_type(Gtk::LICENSE_GPL_3_0);
+  dialog.set_wrap_license(true);
+  dialog.set_website("https://lunduke.com");
+  dialog.set_website_label("lunduke.com");
+  dialog.set_logo_icon_name("system-software-update");
+  dialog.run();
 }
 
 void UpdatesWindow::on_check_clicked()
