@@ -414,7 +414,7 @@ void UpdatesWindow::on_about()
   dialog.set_wrap_license(true);
   dialog.set_website("https://lunduke.com");
   dialog.set_website_label("lunduke.com");
-  dialog.set_logo_icon_name("system-software-update");
+  dialog.set_logo_icon_name("org.lunduke.LcosUpdates");
   dialog.run();
 }
 
