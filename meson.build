@@ -46,6 +46,14 @@ install_data(
   install_dir: get_option('datadir') / 'applications',
 )
 
+
+foreach size : ['32x32', '48x48', '128x128', '256x256']
+  install_data(
+    'data/icons/hicolor' / size / 'apps' / 'org.lunduke.LcosUpdates.png',
+    install_dir: get_option('datadir') / 'icons' / 'hicolor' / size / 'apps',
+  )
+endforeach
+
 install_data(
   'data/org.lunduke.lcos-updates.policy',
   install_dir: get_option('datadir') / 'polkit-1' / 'actions',
