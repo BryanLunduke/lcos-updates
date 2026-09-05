@@ -408,9 +408,7 @@ void UpdatesWindow::on_about()
   dialog.set_transient_for(*this);
   dialog.set_program_name(lcos_updates::kProductName);
   dialog.set_version(lcos_updates::kVersion);
-  dialog.set_comments(
-      "Checks for and installs apt upgrades from Devuan and the LCOS apt overlay.\n"
-      "Manual only — no background daemon or tray.");
+  dialog.set_comments("Updater for the Lunduke Computer Operating System");
   dialog.set_copyright("Copyright © 2026 The Lunduke Journal");
   dialog.set_license_type(Gtk::LICENSE_GPL_3_0);
   dialog.set_wrap_license(true);
