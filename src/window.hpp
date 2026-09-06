@@ -41,6 +41,8 @@ private:
   void apply_check_result(const SimulateResult& result, int wait_status);
   void apply_install_result(const SimulateResult& result, int wait_status);
   void show_packages(const std::vector<PackageUpgrade>& packages);
+  void show_package_list();
+  void hide_package_list();
   Glib::ustring friendly_error(const std::string& msg) const;
 
   Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 0};

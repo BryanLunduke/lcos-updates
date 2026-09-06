@@ -21,7 +21,7 @@ const int kInstallTimeoutMs = 630 * 1000; /* helper upgrade is 600s */
 UpdatesWindow::UpdatesWindow(bool check_on_start)
 {
   set_title("Check for updates…");
-  set_default_size(560, 420);
+  set_default_size(560, 160);
   set_border_width(0);
   /* Window-manager chrome only: do not call set_titlebar / HeaderBar. */
 
@@ -36,7 +36,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 
   m_status.set_line_wrap(true);
   m_status.set_xalign(0.0f);
-  m_status.set_text("Click Check for updates to see if updates are available from Devuan and LCOS.");
+  m_status.set_text("Check for updates for your Computer.");
 
   m_store = Gtk::ListStore::create(m_cols);
   m_view.set_model(m_store);
@@ -49,7 +49,9 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
   m_scroller.set_shadow_type(Gtk::SHADOW_IN);
   m_scroller.set_min_content_height(180);
+  m_scroller.set_no_show_all(true);
   m_scroller.add(m_view);
+  m_scroller.hide();
 
   m_buttons.set_layout(Gtk::BUTTONBOX_END);
   m_buttons.set_spacing(8);
@@ -108,6 +110,22 @@ void UpdatesWindow::show_packages(const std::vector<PackageUpgrade>& packages)
     row[m_cols.old_version] = pkg.old_version;
     row[m_cols.new_version] = pkg.new_version;
   }
+  show_package_list();
+}
+
+void UpdatesWindow::show_package_list()
+{
+  /* Explicit show(): show_all() is a no-op while no_show_all is set on the scroller. */
+  m_view.show();
+  m_scroller.show();
+  resize(560, 420);
+}
+
+void UpdatesWindow::hide_package_list()
+{
+  m_store->clear();
+  m_scroller.hide();
+  resize(560, 160);
 }
 
 Glib::ustring UpdatesWindow::friendly_error(const std::string& msg) const
@@ -284,7 +302,7 @@ bool UpdatesWindow::on_timeout()
   }
   cancel_job();
   if (job == Job::Check) {
-    m_store->clear();
+    hide_package_list();
     m_install.set_sensitive(false);
     set_busy(false, "Timed out waiting for the update check. Check your network and try again.");
   } else {
@@ -350,7 +368,7 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
 {
   const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
   if (result.status == SimulateResult::UpToDate) {
-    m_store->clear();
+    hide_package_list();
     m_install.set_sensitive(false);
     set_busy(false, "You're up to date.");
     m_check.set_sensitive(true);
@@ -364,7 +382,7 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
     return;
   }
 
-  m_store->clear();
+  hide_package_list();
   m_install.set_sensitive(false);
   std::string msg = result.error_msg;
   if (msg.empty() || msg == "No STATUS from helper") {
@@ -382,7 +400,7 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
   const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
   if (result.status == SimulateResult::Success ||
       (result.status != SimulateResult::Error && exit_code == 0)) {
-    m_store->clear();
+    hide_package_list();
     m_install.set_sensitive(false);
     set_busy(false, "Updates installed successfully. You can check again.");
     m_check.set_sensitive(true);
@@ -422,6 +440,7 @@ void UpdatesWindow::on_check_clicked()
 {
   if (m_job != Job::None)
     return;
+  hide_package_list();
   m_install.set_sensitive(false);
   set_busy(true, "Checking for updates…");
   start_helper("simulate", Job::Check, kCheckTimeoutMs);

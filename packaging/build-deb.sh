@@ -1,9 +1,9 @@
 #!/bin/sh
-# Build lcos-updates_0.4-1_amd64.deb and drop it in the LCOS overlay dirs.
+# Build lcos-updates_0.4-2_amd64.deb and drop it in the LCOS overlay dirs.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.4-1"
+VERSION="0.4-2"
 PKGNAME="lcos-updates_${VERSION}_amd64"
 OVERLAY="/workspace/lcos-live-04"
 BUILD="$ROOT/build"
@@ -72,6 +72,8 @@ rm -rf "$DEST/debian"
 
 mkdir -p "$DEB_DIR" "$CHROOT_DIR"
 fakeroot dpkg-deb --root-owner-group --build "$DEST" "$DEB_DIR/${PKGNAME}.deb"
+# Replace prior lcos-updates debs in packages.chroot only (keep history in packaging/debs).
+rm -f "$CHROOT_DIR"/lcos-updates_*.deb
 cp -f "$DEB_DIR/${PKGNAME}.deb" "$CHROOT_DIR/${PKGNAME}.deb"
 
 echo "built $DEB_DIR/${PKGNAME}.deb"
