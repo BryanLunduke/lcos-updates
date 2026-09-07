@@ -1,9 +1,9 @@
 #!/bin/sh
-# Build lcos-updates_0.4-2_amd64.deb and drop it in the LCOS overlay dirs.
+# Build lcos-updates_0.4-3_amd64.deb and drop it in the LCOS overlay dirs.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.4-2"
+VERSION="0.4-3"
 PKGNAME="lcos-updates_${VERSION}_amd64"
 OVERLAY="/workspace/lcos-live-04"
 BUILD="$ROOT/build"
@@ -47,7 +47,7 @@ Architecture: amd64
 Installed-Size: ${SIZE}
 Maintainer: LCOS <lcos@lunduke.com>
 Homepage: https://lunduke.com
-Depends: ${SHLIBS_DEPS}, policykit-1, apt, desktop-file-utils
+Depends: ${SHLIBS_DEPS}, polkitd, pkexec, apt, desktop-file-utils
 Description: Check for updates from Devuan and LCOS
  A small GTK3 tool that checks for and installs apt upgrades
  (not dist-upgrade) via a polkit helper. No daemon, no tray.

@@ -21,7 +21,9 @@ const int kInstallTimeoutMs = 630 * 1000; /* helper upgrade is 600s */
 UpdatesWindow::UpdatesWindow(bool check_on_start)
 {
   set_title("Check for updates…");
-  set_default_size(560, 160);
+  /* Width only: height follows natural request so the pre-check window hugs
+   * status + buttons (no blank strip under a taller default). */
+  set_default_size(560, -1);
   set_border_width(0);
   /* Window-manager chrome only: do not call set_titlebar / HeaderBar. */
 
@@ -70,7 +72,9 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_content.pack_start(m_buttons, Gtk::PACK_SHRINK);
 
   m_vbox.pack_start(m_menubar, Gtk::PACK_SHRINK);
-  m_vbox.pack_start(m_content, Gtk::PACK_EXPAND_WIDGET);
+  /* SHRINK while the list is hidden so expand space does not open under the
+   * buttons. show_package_list() switches this to EXPAND when the list appears. */
+  m_vbox.pack_start(m_content, Gtk::PACK_SHRINK);
   add(m_vbox);
   show_all_children();
   m_check.grab_default();
@@ -118,6 +122,9 @@ void UpdatesWindow::show_package_list()
   /* Explicit show(): show_all() is a no-op while no_show_all is set on the scroller. */
   m_view.show();
   m_scroller.show();
+  /* gtkmm Box no longer wraps this; expand content so the scroller absorbs growth. */
+  gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), TRUE, TRUE, 0,
+                            GTK_PACK_START);
   resize(560, 420);
 }
 
@@ -125,7 +132,19 @@ void UpdatesWindow::hide_package_list()
 {
   m_store->clear();
   m_scroller.hide();
-  resize(560, 160);
+  gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), FALSE, FALSE, 0,
+                            GTK_PACK_START);
+  /* Collapse to the natural height of menubar + status + buttons. */
+  int width = 0;
+  int height = 0;
+  get_size(width, height);
+  if (width < 560)
+    width = 560;
+  queue_resize();
+  int min_h = 0;
+  int nat_h = 0;
+  get_preferred_height(min_h, nat_h);
+  resize(width, nat_h > 0 ? nat_h : 1);
 }
 
 Glib::ustring UpdatesWindow::friendly_error(const std::string& msg) const
