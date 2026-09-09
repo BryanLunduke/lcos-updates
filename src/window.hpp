@@ -13,7 +13,7 @@
 #include <string>
 
 namespace lcos_updates {
-constexpr const char* kVersion = "0.4";
+constexpr const char* kVersion = "0.5";
 constexpr const char* kProductName = "LCOS Updates";
 }  // namespace lcos_updates
 
