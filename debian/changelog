@@ -1,3 +1,10 @@
+lcos-updates (0.6-2) unstable; urgency=medium
+
+  * Helper apt-get upgrade: -o Dpkg::Options::=--force-confdef/confold
+    so upgrades never block on TTY conffile prompts (keep existing local files).
+
+ -- Phil <phil@brushpad.local>  Tue, 15 Sep 2026 19:12:00 -0500
+
 lcos-updates (0.6-1) unstable; urgency=medium
 
   * Bump version to 0.6 / package 0.6-1 for the LCOS 0.6 track.

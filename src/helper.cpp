@@ -264,7 +264,12 @@ int do_simulate()
 
 int do_upgrade()
 {
-  const std::vector<const char*> up_argv = {kAptGet, kSimNoteOpt, kSimNoteVal, "-y", "upgrade"};
+  /* Keep existing conffiles; never block on TTY conffile prompts (Plymouth policy). */
+  const std::vector<const char*> up_argv = {
+      kAptGet, kSimNoteOpt, kSimNoteVal, "-y",
+      "-o", "Dpkg::Options::=--force-confdef",
+      "-o", "Dpkg::Options::=--force-confold",
+      "upgrade"};
   std::string out;
   std::string err;
   const int rc = run_apt(up_argv, kUpgradeTimeoutSec, out, err);
