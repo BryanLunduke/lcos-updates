@@ -16,6 +16,7 @@ namespace {
 const char kHelperPath[] = "/usr/libexec/lcos-updates-helper";
 const int kCheckTimeoutMs = 180 * 1000;    /* 3 minutes, matches spec */
 const int kInstallTimeoutMs = 630 * 1000; /* helper upgrade is 600s */
+const int kPulseIntervalMs = 100;
 }
 
 UpdatesWindow::UpdatesWindow(bool check_on_start)
@@ -26,6 +27,8 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   set_default_size(560, -1);
   set_border_width(0);
   /* Window-manager chrome only: do not call set_titlebar / HeaderBar. */
+  /* Reinforce default icon for WMs that ignore gtk_window_set_default_icon_name. */
+  set_icon_name(lcos_updates::kAppId);
 
   auto* help_menu = Gtk::manage(new Gtk::Menu());
   auto* about_item = Gtk::manage(new Gtk::MenuItem("_About…", true));
@@ -39,6 +42,17 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_status.set_line_wrap(true);
   m_status.set_xalign(0.0f);
   m_status.set_text("Check for updates for your Computer.");
+
+  /* Spinner lives beside status (not in ButtonBox — GtkButtonBox is for buttons). */
+  m_spinner.set_no_show_all(true);
+  m_spinner.set_size_request(18, 18);
+  m_status_row.pack_start(m_spinner, Gtk::PACK_SHRINK, 0);
+  m_status_row.pack_start(m_status, Gtk::PACK_EXPAND_WIDGET, 0);
+
+  m_progress.set_no_show_all(true);
+  m_progress.set_show_text(false);
+  m_progress.set_pulse_step(0.05);
+  m_progress.hide();
 
   m_store = Gtk::ListStore::create(m_cols);
   m_view.set_model(m_store);
@@ -57,8 +71,6 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 
   m_buttons.set_layout(Gtk::BUTTONBOX_END);
   m_buttons.set_spacing(8);
-  m_spinner.set_no_show_all(true);
-  m_buttons.pack_start(m_spinner, Gtk::PACK_SHRINK);
   m_install.set_sensitive(false);
   m_check.set_can_default(true);
   m_buttons.pack_start(m_install, Gtk::PACK_SHRINK);
@@ -67,7 +79,8 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_install.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_install_clicked));
 
   m_content.set_border_width(12);
-  m_content.pack_start(m_status, Gtk::PACK_SHRINK);
+  m_content.pack_start(m_status_row, Gtk::PACK_SHRINK);
+  m_content.pack_start(m_progress, Gtk::PACK_SHRINK);
   m_content.pack_start(m_scroller, Gtk::PACK_EXPAND_WIDGET);
   m_content.pack_start(m_buttons, Gtk::PACK_SHRINK);
 
@@ -92,17 +105,40 @@ UpdatesWindow::~UpdatesWindow()
 
 void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
 {
+  /* Always replace prior error/status text — never leave a stale string. */
   m_status.set_text(status);
   m_check.set_sensitive(!busy);
   if (busy)
     m_install.set_sensitive(false);
+  m_pulse.disconnect();
   if (busy) {
     m_spinner.show();
     m_spinner.start();
+    m_progress.set_fraction(0.0);
+    m_progress.pulse();
+    m_progress.show();
+    m_pulse = Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::on_pulse_tick),
+                                             kPulseIntervalMs);
   } else {
     m_spinner.stop();
     m_spinner.hide();
+    m_progress.set_fraction(0.0);
+    m_progress.hide();
   }
+}
+
+void UpdatesWindow::set_idle_status(const Glib::ustring& status)
+{
+  /* Explicit success/idle path: clear any prior error and stop busy chrome. */
+  set_busy(false, status);
+}
+
+bool UpdatesWindow::on_pulse_tick()
+{
+  if (m_job == Job::None)
+    return false;
+  m_progress.pulse();
+  return true;
 }
 
 void UpdatesWindow::show_packages(const std::vector<PackageUpgrade>& packages)
@@ -168,6 +204,7 @@ Glib::ustring UpdatesWindow::friendly_error(const std::string& msg) const
 void UpdatesWindow::cancel_job()
 {
   m_timeout.disconnect();
+  m_pulse.disconnect();
   m_out_watch.disconnect();
   m_err_watch.disconnect();
   m_child_watch.disconnect();
@@ -197,6 +234,7 @@ void UpdatesWindow::cancel_job()
 void UpdatesWindow::finish_job()
 {
   m_timeout.disconnect();
+  m_pulse.disconnect();
   m_out_watch.disconnect();
   m_err_watch.disconnect();
   m_out_ch.reset();
@@ -245,7 +283,7 @@ void UpdatesWindow::start_helper(const char* helper_arg, Job job, int timeout_ms
         &out_fd, &err_fd);
   } catch (const Glib::SpawnError& e) {
     m_job = Job::None;
-    set_busy(false, "Could not run pkexec. Install policykit-1 and try again.");
+    set_idle_status("Could not run pkexec. Install policykit-1 and try again.");
     m_install.set_sensitive(false);
     return;
   }
@@ -323,9 +361,9 @@ bool UpdatesWindow::on_timeout()
   if (job == Job::Check) {
     hide_package_list();
     m_install.set_sensitive(false);
-    set_busy(false, "Timed out waiting for the update check. Check your network and try again.");
+    set_idle_status("Timed out waiting for the update check. Check your network and try again.");
   } else {
-    set_busy(false, "Timed out while installing updates.");
+    set_idle_status("Timed out while installing updates.");
     m_install.set_sensitive(true);
   }
   m_check.set_sensitive(true);
@@ -380,23 +418,24 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
   else if (job == Job::Install)
     apply_install_result(parsed, wait_status);
   else
-    set_busy(false, m_status.get_text());
+    set_idle_status(m_status.get_text());
 }
 
 void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_status)
 {
   const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
-  if (result.status == SimulateResult::UpToDate) {
+  if (result.status == SimulateResult::UpToDate || result.status == SimulateResult::Success) {
     hide_package_list();
     m_install.set_sensitive(false);
-    set_busy(false, "You're up to date.");
+    /* Clear any prior error; show a definite idle/success string. */
+    set_idle_status("You're up to date.");
     m_check.set_sensitive(true);
     return;
   }
   if (result.status == SimulateResult::Upgrades && !result.packages.empty()) {
     show_packages(result.packages);
     m_install.set_sensitive(true);
-    set_busy(false, "Updates are available.");
+    set_idle_status("Updates are available.");
     m_check.set_sensitive(true);
     return;
   }
@@ -410,18 +449,19 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
     else
       msg = "The update check failed.";
   }
-  set_busy(false, friendly_error(msg));
+  set_idle_status(friendly_error(msg));
   m_check.set_sensitive(true);
 }
 
 void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_status)
 {
   const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
-  if (result.status == SimulateResult::Success ||
+  if (result.status == SimulateResult::Success || result.status == SimulateResult::UpToDate ||
       (result.status != SimulateResult::Error && exit_code == 0)) {
     hide_package_list();
     m_install.set_sensitive(false);
-    set_busy(false, "Updates installed successfully. You can check again.");
+    /* Clear any prior error left from a failed check/install. */
+    set_idle_status("Updates installed successfully. You're up to date.");
     m_check.set_sensitive(true);
     return;
   }
@@ -432,7 +472,7 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
     else
       msg = "apt-get upgrade failed.";
   }
-  set_busy(false, friendly_error(msg));
+  set_idle_status(friendly_error(msg));
   m_check.set_sensitive(true);
   /* Offer Check again; keep Install if we still had a list. */
   if (!m_store->children().empty())
@@ -451,7 +491,7 @@ void UpdatesWindow::on_about()
   dialog.set_wrap_license(true);
   dialog.set_website("https://lunduke.com");
   dialog.set_website_label("lunduke.com");
-  dialog.set_logo_icon_name("org.lunduke.LcosUpdates");
+  dialog.set_logo_icon_name(lcos_updates::kAppId);
   dialog.run();
 }
 

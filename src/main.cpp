@@ -10,13 +10,19 @@
 #include <glib.h>
 #include <gtkmm.h>
 
+namespace {
+constexpr const char* kAppId = "org.lunduke.LcosUpdates";
+}
+
 int main(int argc, char* argv[])
 {
   if (g_getenv("GDK_BACKEND") == nullptr)
     g_setenv("GDK_BACKEND", "x11", FALSE);
   g_set_prgname("lcos-updates");
 
-  auto app = Gtk::Application::create("org.lunduke.LcosUpdates");
+  auto app = Gtk::Application::create(kAppId);
+  /* WM / title-bar icon (xfwm4 etc.): desktop Icon= alone is not enough. */
+  Gtk::Window::set_default_icon_name(kAppId);
 
   bool check_on_start = false;
   app->add_main_option_entry(Gio::Application::OPTION_TYPE_BOOL, "check", '\0',

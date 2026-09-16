@@ -1,0 +1,8 @@
+lcos-updates (0.6-1) unstable; urgency=medium
+
+  * Bump version to 0.6 / package 0.6-1 for the LCOS 0.6 track.
+  * Set default and window icon to org.lunduke.LcosUpdates (title-bar icon).
+  * Show spinner + pulsing progress bar while check/install is in progress.
+  * Clear prior error/status text on successful up-to-date / install complete.
+
+ -- Phil <phil@brushpad.local>  Tue, 15 Sep 2026 19:05:00 -0500

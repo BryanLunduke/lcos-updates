@@ -1,11 +1,11 @@
 #!/bin/sh
-# Build lcos-updates_0.5-1_amd64.deb and drop it in the LCOS overlay dirs.
+# Build lcos-updates_0.6-1_amd64.deb and drop it in the LCOS overlay dirs.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.5-1"
+VERSION="0.6-1"
 PKGNAME="lcos-updates_${VERSION}_amd64"
-OVERLAY="/workspace/lcos-live-05"
+OVERLAY="/workspace/lcos-live-06"
 BUILD="$ROOT/build"
 DEST="$OVERLAY/packaging/src/lcos-updates"
 DEB_DIR="$OVERLAY/packaging/debs"

@@ -13,8 +13,9 @@
 #include <string>
 
 namespace lcos_updates {
-constexpr const char* kVersion = "0.5";
+constexpr const char* kVersion = "0.6";
 constexpr const char* kProductName = "LCOS Updates";
+constexpr const char* kAppId = "org.lunduke.LcosUpdates";
 }  // namespace lcos_updates
 
 class UpdatesWindow : public Gtk::ApplicationWindow {
@@ -31,12 +32,14 @@ private:
   enum class Job { None, Check, Install };
 
   void set_busy(bool busy, const Glib::ustring& status);
+  void set_idle_status(const Glib::ustring& status);
   void start_helper(const char* helper_arg, Job job, int timeout_ms);
   void cancel_job();
   void finish_job();
   bool on_stdout(Glib::IOCondition cond);
   bool on_stderr(Glib::IOCondition cond);
   bool on_timeout();
+  bool on_pulse_tick();
   void on_child_exited(Glib::Pid pid, int wait_status);
   void apply_check_result(const SimulateResult& result, int wait_status);
   void apply_install_result(const SimulateResult& result, int wait_status);
@@ -48,13 +51,15 @@ private:
   Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 0};
   Gtk::MenuBar m_menubar;
   Gtk::Box m_content{Gtk::ORIENTATION_VERTICAL, 10};
+  Gtk::Box m_status_row{Gtk::ORIENTATION_HORIZONTAL, 8};
+  Gtk::Spinner m_spinner;
   Gtk::Label m_status;
+  Gtk::ProgressBar m_progress;
   Gtk::ScrolledWindow m_scroller;
   Gtk::TreeView m_view;
   Gtk::ButtonBox m_buttons{Gtk::ORIENTATION_HORIZONTAL};
   Gtk::Button m_check{"Check for updates"};
   Gtk::Button m_install{"Install updates"};
-  Gtk::Spinner m_spinner;
 
   class ModelColumns : public Gtk::TreeModel::ColumnRecord {
   public:
@@ -83,6 +88,7 @@ private:
   sigc::connection m_err_watch;
   sigc::connection m_child_watch;
   sigc::connection m_timeout;
+  sigc::connection m_pulse;
   std::string m_stdout;
   std::string m_stderr;
 };
