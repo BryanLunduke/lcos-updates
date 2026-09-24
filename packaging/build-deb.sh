@@ -1,15 +1,14 @@
 #!/bin/sh
-# Build lcos-updates_0.6-2_amd64.deb and drop it in the LCOS overlay dirs.
+# Build lcos-updates_0.7-1_amd64.deb into packaging/debs/ (repo-local).
+# Does NOT seed lcos-live-06 or lcos-live-07.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.6-2"
+VERSION="0.7-1"
 PKGNAME="lcos-updates_${VERSION}_amd64"
-OVERLAY="/workspace/lcos-live-06"
 BUILD="$ROOT/build"
-DEST="$OVERLAY/packaging/src/lcos-updates"
-DEB_DIR="$OVERLAY/packaging/debs"
-CHROOT_DIR="$OVERLAY/config/packages.chroot"
+DEST="$ROOT/packaging/src/lcos-updates"
+DEB_DIR="$ROOT/packaging/debs"
 
 cd "$ROOT"
 
@@ -70,10 +69,7 @@ chmod 0755 "$DEST/DEBIAN/postinst"
 
 rm -rf "$DEST/debian"
 
-mkdir -p "$DEB_DIR" "$CHROOT_DIR"
+mkdir -p "$DEB_DIR"
 fakeroot dpkg-deb --root-owner-group --build "$DEST" "$DEB_DIR/${PKGNAME}.deb"
-# Replace prior lcos-updates debs in packages.chroot only (keep history in packaging/debs).
-rm -f "$CHROOT_DIR"/lcos-updates_*.deb
-cp -f "$DEB_DIR/${PKGNAME}.deb" "$CHROOT_DIR/${PKGNAME}.deb"
 
 echo "built $DEB_DIR/${PKGNAME}.deb"

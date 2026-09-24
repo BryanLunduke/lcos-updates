@@ -1,3 +1,11 @@
+lcos-updates (0.7-1) unstable; urgency=medium
+
+  * Bump version to 0.7 / package 0.7-1 for the LCOS 0.7 track.
+  * Keep helper apt-get upgrade force-confdef/confold and
+    DEBIAN_FRONTEND=noninteractive.
+
+ -- Phil <phil@brushpad.local>  Wed, 23 Sep 2026 22:10:00 -0500
+
 lcos-updates (0.6-2) unstable; urgency=medium
 
   * Helper apt-get upgrade: -o Dpkg::Options::=--force-confdef/confold
