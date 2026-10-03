@@ -36,4 +36,9 @@ SimulateResult parse_apt_simulate(const std::string& text);
 std::string format_protocol(const SimulateResult& result);
 SimulateResult parse_protocol(const std::string& text);
 
+/* Check and install failures are worded separately. Network/fetch errors
+ * are not rewritten into the update-check timeout sentence. */
+enum class JobKind { Check, Install };
+std::string friendly_job_error(const std::string& msg, JobKind kind);
+
 #endif

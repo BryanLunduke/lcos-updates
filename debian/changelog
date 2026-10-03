@@ -1,3 +1,19 @@
+lcos-updates (0.7-2) unstable; urgency=medium
+
+  * Cancel or close waits until the helper and its apt/dpkg children are gone
+    before another check or install can start.
+  * Helper install deadline kills the apt-get/dpkg process group before
+    reporting the timeout.
+  * Network and fetch failures, and install timeouts, are no longer shown as
+    an update-check timeout.
+  * GUI check budget covers the helper's apt-get update plus simulation.
+  * A second launch raises the existing window. --check applies only to the
+    launch that passed it.
+  * Polkit asks to check for updates on simulate, and to install them on upgrade.
+  * Project version 0.7.1 (About / meson). Debian package revision 0.7-2.
+
+ -- Phil <phil@brushpad.local>  Sat, 03 Oct 2026 18:09:19 +0000
+
 lcos-updates (0.7-1) unstable; urgency=medium
 
   * Bump version to 0.7 / package 0.7-1 for the LCOS 0.7 track.

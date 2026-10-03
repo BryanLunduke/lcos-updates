@@ -5,6 +5,7 @@
  */
 
 #include "apt-parse.hpp"
+#include "timeouts.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -98,6 +99,38 @@ int main(int argc, char** argv)
            "Inst new only fields");
     expect(!parse_inst_line("Conf libc6 (1.0 Debian:12 [amd64])", pkg), "Conf is not Inst");
     expect(!parse_inst_line("Remv unused-pkg [0.1]", pkg), "Remv is not Inst");
+  }
+
+  {
+    static_assert(kCheckTimeoutSec >= kUpdateTimeoutSec + kSimulateTimeoutSec,
+                  "GUI check budget must cover helper update + simulate");
+    static_assert(kInstallTimeoutSec >= kUpgradeTimeoutSec,
+                  "GUI install budget must cover helper upgrade");
+    const char* check_timeout =
+        "Timed out waiting for the update check. Check your network and try again.";
+    const char* install_timeout = "Timed out while installing updates.";
+    const char* offline = "No network connection. Connect to the Internet and try again.";
+    expect(friendly_job_error("Timed out while running apt-get update", JobKind::Check) ==
+               check_timeout,
+           "check update timeout stays a check timeout");
+    expect(friendly_job_error("Timed out while simulating apt-get upgrade", JobKind::Check) ==
+               check_timeout,
+           "check simulate timeout stays a check timeout");
+    expect(friendly_job_error("Timed out while installing updates", JobKind::Install) ==
+               install_timeout,
+           "install timeout is not rewritten as a check timeout");
+    expect(friendly_job_error("Connection timed out", JobKind::Check) == offline,
+           "connection timed out is offline, not the check-timeout sentence");
+    expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease Connection timed out",
+                              JobKind::Install) == offline,
+           "failed to fetch during install is offline");
+    expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease", JobKind::Check) ==
+               offline,
+           "failed to fetch without the word timeout is offline");
+    expect(friendly_job_error("E: Unable to correct problems, you have held broken packages.",
+                              JobKind::Install) ==
+               "E: Unable to correct problems, you have held broken packages.",
+           "unrelated apt error is kept");
   }
 
   if (g_fails != 0) {

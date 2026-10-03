@@ -6,6 +6,7 @@
 
 #include "apt-parse.hpp"
 
+#include <cctype>
 #include <sstream>
 
 static std::string trim_cr(std::string line)
@@ -163,4 +164,36 @@ SimulateResult parse_protocol(const std::string& text)
       result.error_msg = "No STATUS from helper";
   }
   return result;
+}
+
+static std::string lower_copy(std::string text)
+{
+  for (char& ch : text)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return text;
+}
+
+static bool has(const std::string& text, const char* needle)
+{
+  return text.find(needle) != std::string::npos;
+}
+
+std::string friendly_job_error(const std::string& msg, JobKind kind)
+{
+  const std::string lower = lower_copy(msg);
+  /* "connection timed out" and "failed to fetch" must win over the generic
+   * "timed out" / "timeout" match, or apt's network errors become the
+   * update-check timeout sentence. */
+  if (has(lower, "temporary failure resolving") || has(lower, "could not resolve") ||
+      has(lower, "network is unreachable") || has(lower, "failed to fetch") ||
+      has(lower, "connection timed out") || has(lower, "unable to connect"))
+    return "No network connection. Connect to the Internet and try again.";
+  if (has(lower, "timeout") || has(lower, "timed out")) {
+    if (kind == JobKind::Install)
+      return "Timed out while installing updates.";
+    return "Timed out waiting for the update check. Check your network and try again.";
+  }
+  if (msg.empty())
+    return "The update helper failed.";
+  return msg;
 }
