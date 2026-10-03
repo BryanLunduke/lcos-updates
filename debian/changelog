@@ -1,3 +1,10 @@
+lcos-updates (0.9-1) unstable; urgency=medium
+
+  * Bump version to 0.9 / package 0.9-1 for the LCOS 0.9 release.
+  * About dialog and project version read 0.9.
+
+ -- Phil <phil@brushpad.local>  Sat, 03 Oct 2026 21:09:21 +0000
+
 lcos-updates (0.7-2) unstable; urgency=medium
 
   * Cancel or close waits until the helper and its apt/dpkg children are gone
