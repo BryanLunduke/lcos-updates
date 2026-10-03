@@ -13,7 +13,7 @@
 #include <string>
 
 namespace lcos_updates {
-constexpr const char* kVersion = "0.7";
+constexpr const char* kVersion = "0.7.1";
 constexpr const char* kProductName = "LCOS Updates";
 constexpr const char* kAppId = "org.lunduke.LcosUpdates";
 }  // namespace lcos_updates
@@ -22,6 +22,9 @@ class UpdatesWindow : public Gtk::ApplicationWindow {
 public:
   explicit UpdatesWindow(bool check_on_start);
   ~UpdatesWindow() override;
+
+  /* Start a check for this launch. A later call is not implied by an earlier one. */
+  void request_check();
 
 protected:
   void on_check_clicked();
@@ -34,11 +37,17 @@ private:
   void set_busy(bool busy, const Glib::ustring& status);
   void set_idle_status(const Glib::ustring& status);
   void start_helper(const char* helper_arg, Job job, int timeout_ms);
-  void cancel_job();
+  /* Returns true only after the helper and its apt/dpkg children are gone. */
+  bool cancel_job();
   void finish_job();
+  void release_job_io();
+  void maybe_rearm_check_timeout();
+  void show_timeout_message(Job job);
+  void on_check_idle();
   bool on_stdout(Glib::IOCondition cond);
   bool on_stderr(Glib::IOCondition cond);
   bool on_timeout();
+  bool on_stop_retry();
   bool on_pulse_tick();
   void on_child_exited(Glib::Pid pid, int wait_status);
   void apply_check_result(const SimulateResult& result, int wait_status);
@@ -46,7 +55,6 @@ private:
   void show_packages(const std::vector<PackageUpgrade>& packages);
   void show_package_list();
   void hide_package_list();
-  Glib::ustring friendly_error(const std::string& msg) const;
 
   Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 0};
   Gtk::MenuBar m_menubar;
@@ -89,8 +97,14 @@ private:
   sigc::connection m_child_watch;
   sigc::connection m_timeout;
   sigc::connection m_pulse;
+  sigc::connection m_retry;
   std::string m_stdout;
   std::string m_stderr;
+  int m_cancel_fd = -1;
+  bool m_helper_ready = false;
+  bool m_check_queued = false;
+  bool m_stop_was_timeout = false;
+  Job m_stopped_job = Job::None;
 };
 
 #endif

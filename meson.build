@@ -1,7 +1,7 @@
 project(
   'lcos-updates',
   'cpp',
-  version: '0.7',
+  version: '0.7.1',
   license: 'GPL-3.0-or-later',
   meson_version: '>=0.56',
   default_options: [
@@ -21,12 +21,19 @@ apt_parse = static_library(
   install: false,
 )
 
+proc_group = static_library(
+  'proc-group',
+  'src/proc-group.cpp',
+  include_directories: inc,
+  install: false,
+)
+
 executable(
   'lcos-updates',
   'src/main.cpp',
   'src/window.cpp',
   include_directories: inc,
-  link_with: apt_parse,
+  link_with: [apt_parse, proc_group],
   dependencies: gtkmm,
   install: true,
   install_dir: get_option('bindir'),
@@ -36,7 +43,7 @@ helper = executable(
   'lcos-updates-helper',
   'src/helper.cpp',
   include_directories: inc,
-  link_with: apt_parse,
+  link_with: [apt_parse, proc_group],
   install: true,
   install_dir: get_option('libexecdir'),
 )
@@ -85,4 +92,38 @@ test(
   helper,
   args: ['full-upgrade'],
   should_fail: true,
+)
+
+test_proc = executable(
+  'test-proc-group',
+  'tests/test-proc-group.cpp',
+  include_directories: inc,
+  link_with: proc_group,
+  install: false,
+)
+
+test(
+  'proc-group',
+  test_proc,
+)
+
+test_helper_kill = executable(
+  'test-helper-kill',
+  'tests/test-helper-kill.cpp',
+  include_directories: inc,
+  link_with: proc_group,
+  install: false,
+)
+
+test(
+  'helper-kills-apt-group',
+  test_helper_kill,
+  args: [helper.full_path()],
+  timeout: 40,
+)
+
+test(
+  'policy-actions',
+  find_program('python3'),
+  args: [files('tests/test-policy.py'), files('data/org.lunduke.lcos-updates.policy')],
 )

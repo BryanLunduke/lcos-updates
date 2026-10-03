@@ -6,6 +6,22 @@
   <vendor>LCOS</vendor>
   <vendor_url>https://lunduke.com</vendor_url>
   <icon_name>system-software-update</icon_name>
+
+  <!-- pkexec matches exec.path plus exec.argv1. A path-only action would
+       also match simulate and show the install prompt for a check. -->
+  <action id="org.lunduke.lcos-updates.check">
+    <description>Check for software updates</description>
+    <message>Authentication is required to check for software updates</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/lcos-updates-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">simulate</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
   <action id="org.lunduke.lcos-updates.pkexec">
     <description>Install software updates</description>
     <message>Authentication is required to install software updates</message>
@@ -15,6 +31,7 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/lcos-updates-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">upgrade</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

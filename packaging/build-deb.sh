@@ -1,10 +1,10 @@
 #!/bin/sh
-# Build lcos-updates_0.7-1_amd64.deb into packaging/debs/ (repo-local).
+# Build lcos-updates_0.7-2_amd64.deb into packaging/debs/ (repo-local).
 # Does NOT seed lcos-live-06 or lcos-live-07.
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.7-1"
+VERSION="0.7-2"
 PKGNAME="lcos-updates_${VERSION}_amd64"
 BUILD="$ROOT/build"
 DEST="$ROOT/packaging/src/lcos-updates"
