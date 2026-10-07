@@ -16,6 +16,28 @@ static std::string trim_cr(std::string line)
   return line;
 }
 
+static std::string lower_copy(std::string text)
+{
+  for (char& ch : text)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return text;
+}
+
+static bool has(const std::string& text, const char* needle)
+{
+  return text.find(needle) != std::string::npos;
+}
+
+static void append_tokens(const std::string& line, std::vector<std::string>& names)
+{
+  std::istringstream in(line);
+  std::string tok;
+  while (in >> tok) {
+    if (!tok.empty())
+      names.push_back(tok);
+  }
+}
+
 bool parse_inst_line(const std::string& raw, PackageUpgrade& out)
 {
   const std::string line = trim_cr(raw);
@@ -57,6 +79,47 @@ bool parse_inst_line(const std::string& raw, PackageUpgrade& out)
   return !out.name.empty() && !out.new_version.empty();
 }
 
+static int integer_before(const std::string& line, std::string::size_type word)
+{
+  std::string::size_type i = word;
+  while (i > 0 && line[i - 1] == ' ')
+    --i;
+  const std::string::size_type end = i;
+  while (i > 0 && std::isdigit(static_cast<unsigned char>(line[i - 1])))
+    --i;
+  if (i == end)
+    return -1;
+  int value = 0;
+  for (; i < end; ++i)
+    value = value * 10 + (line[i] - '0');
+  return value;
+}
+
+/* "N upgraded, ... and M not upgraded." The first " upgraded" is the
+ * upgraded count; " not upgraded" is the kept-back count. */
+static bool parse_summary_counts(const std::string& line, int& upgraded, int& not_upgraded)
+{
+  const std::string::size_type not_pos = line.find(" not upgraded");
+  if (not_pos == std::string::npos)
+    return false;
+  const std::string::size_type up_pos = line.find(" upgraded");
+  if (up_pos == std::string::npos || up_pos >= not_pos)
+    return false;
+  const int up = integer_before(line, up_pos);
+  const int kept = integer_before(line, not_pos);
+  if (up < 0 || kept < 0)
+    return false;
+  upgraded = up;
+  not_upgraded = kept;
+  return true;
+}
+
+static bool is_kept_back_header(const std::string& line)
+{
+  const std::string header = "The following packages have been kept back:";
+  return line.compare(0, header.size(), header) == 0;
+}
+
 SimulateResult parse_apt_simulate(const std::string& text)
 {
   SimulateResult result;
@@ -64,12 +127,34 @@ SimulateResult parse_apt_simulate(const std::string& text)
 
   std::istringstream in(text);
   std::string line;
+  bool in_kept = false;
   while (std::getline(in, line)) {
     line = trim_cr(line);
+    if (in_kept) {
+      if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
+        append_tokens(line, result.kept_back);
+        continue;
+      }
+      in_kept = false;
+    }
     if (line.compare(0, 2, "E:") == 0) {
       result.status = SimulateResult::Error;
       if (result.error_msg.empty())
         result.error_msg = line;
+      continue;
+    }
+    if (is_kept_back_header(line)) {
+      in_kept = true;
+      const std::string::size_type colon = line.find(':');
+      if (colon != std::string::npos)
+        append_tokens(line.substr(colon + 1), result.kept_back);
+      continue;
+    }
+    int upgraded = -1;
+    int not_upgraded = -1;
+    if (parse_summary_counts(line, upgraded, not_upgraded)) {
+      result.upgraded_count = upgraded;
+      result.not_upgraded_count = not_upgraded;
       continue;
     }
     PackageUpgrade pkg;
@@ -79,11 +164,62 @@ SimulateResult parse_apt_simulate(const std::string& text)
 
   if (result.status == SimulateResult::Error)
     return result;
-  if (result.packages.empty())
-    result.status = SimulateResult::UpToDate;
-  else
+  const bool kept = !result.kept_back.empty() || result.not_upgraded_count > 0;
+  if (!result.packages.empty())
     result.status = SimulateResult::Upgrades;
+  else if (kept)
+    result.status = SimulateResult::KeptBack;
+  else
+    result.status = SimulateResult::UpToDate;
   return result;
+}
+
+bool apt_index_failure_is_partial(const std::string& text)
+{
+  const std::string lower = lower_copy(text);
+  return has(lower, "some index files failed to download") ||
+         has(lower, "old ones used instead");
+}
+
+static bool is_index_warning_line(const std::string& line)
+{
+  if (line.compare(0, 2, "E:") == 0)
+    return true;
+  const std::string lower = lower_copy(line);
+  return has(lower, "no_pubkey") || has(lower, "hash sum mismatch");
+}
+
+std::string apt_index_warning(const std::string& text)
+{
+  std::istringstream in(text);
+  std::string line;
+  std::string warning;
+  while (std::getline(in, line)) {
+    line = trim_cr(line);
+    if (!is_index_warning_line(line))
+      continue;
+    if (!warning.empty())
+      warning += "\n";
+    warning += line;
+  }
+  return warning;
+}
+
+static void emit_extra(std::ostringstream& out, const SimulateResult& result)
+{
+  if (result.not_upgraded_count > 0)
+    out << "NOT_UPGRADED " << result.not_upgraded_count << "\n";
+  for (const auto& name : result.kept_back)
+    out << "KEPT " << name << "\n";
+  if (result.warning.empty())
+    return;
+  std::istringstream lines(result.warning);
+  std::string line;
+  while (std::getline(lines, line)) {
+    line = trim_cr(line);
+    if (!line.empty())
+      out << "WARN " << line << "\n";
+  }
 }
 
 std::string format_protocol(const SimulateResult& result)
@@ -103,6 +239,9 @@ std::string format_protocol(const SimulateResult& result)
   case SimulateResult::Success:
     out << "STATUS success\n";
     break;
+  case SimulateResult::KeptBack:
+    out << "STATUS kept-back\n";
+    break;
   case SimulateResult::Error:
     out << "STATUS error\n";
     if (!result.error_msg.empty())
@@ -111,6 +250,7 @@ std::string format_protocol(const SimulateResult& result)
       out << "MSG unknown error\n";
     break;
   }
+  emit_extra(out, result);
   return out.str();
 }
 
@@ -137,6 +277,9 @@ SimulateResult parse_protocol(const std::string& text)
       } else if (st == "success") {
         result.status = SimulateResult::Success;
         result.error_msg.clear();
+      } else if (st == "kept-back") {
+        result.status = SimulateResult::KeptBack;
+        result.error_msg.clear();
       } else if (st == "error") {
         result.status = SimulateResult::Error;
         result.error_msg.clear();
@@ -150,6 +293,27 @@ SimulateResult parse_protocol(const std::string& text)
         result.error_msg = msg;
       else
         result.error_msg += "\n" + msg;
+    } else if (line.compare(0, 5, "WARN ") == 0) {
+      const std::string msg = line.substr(5);
+      if (result.warning.empty())
+        result.warning = msg;
+      else
+        result.warning += "\n" + msg;
+    } else if (line.compare(0, 5, "KEPT ") == 0) {
+      const std::string name = line.substr(5);
+      if (!name.empty())
+        result.kept_back.push_back(name);
+    } else if (line.compare(0, 13, "NOT_UPGRADED ") == 0) {
+      int value = 0;
+      const std::string digits = line.substr(13);
+      if (!digits.empty()) {
+        for (char ch : digits) {
+          if (!std::isdigit(static_cast<unsigned char>(ch)))
+            break;
+          value = value * 10 + (ch - '0');
+        }
+        result.not_upgraded_count = value;
+      }
     } else if (line.compare(0, 4, "PKG ") == 0) {
       std::istringstream ps(line.substr(4));
       PackageUpgrade pkg;
@@ -166,26 +330,15 @@ SimulateResult parse_protocol(const std::string& text)
   return result;
 }
 
-static std::string lower_copy(std::string text)
-{
-  for (char& ch : text)
-    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-  return text;
-}
-
-static bool has(const std::string& text, const char* needle)
-{
-  return text.find(needle) != std::string::npos;
-}
-
 std::string friendly_job_error(const std::string& msg, JobKind kind)
 {
   const std::string lower = lower_copy(msg);
-  /* "connection timed out" and "failed to fetch" must win over the generic
-   * "timed out" / "timeout" match, or apt's network errors become the
-   * update-check timeout sentence. */
+  /* Offline wording is reserved for failures that mean the network itself
+   * is unusable. "Failed to fetch" alone is not enough: a 404, a hash
+   * mismatch, or a missing key must stay the apt line. "Connection timed
+   * out" still matches below when apt includes it on a fetch line. */
   if (has(lower, "temporary failure resolving") || has(lower, "could not resolve") ||
-      has(lower, "network is unreachable") || has(lower, "failed to fetch") ||
+      has(lower, "name or service not known") || has(lower, "network is unreachable") ||
       has(lower, "connection timed out") || has(lower, "unable to connect"))
     return "No network connection. Connect to the Internet and try again.";
   if (has(lower, "timeout") || has(lower, "timed out")) {

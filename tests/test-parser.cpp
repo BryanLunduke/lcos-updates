@@ -104,8 +104,8 @@ int main(int argc, char** argv)
   {
     static_assert(kCheckTimeoutSec >= kUpdateTimeoutSec + kSimulateTimeoutSec,
                   "GUI check budget must cover helper update + simulate");
-    static_assert(kInstallTimeoutSec >= kUpgradeTimeoutSec,
-                  "GUI install budget must cover helper upgrade");
+    static_assert(kInstallTimeoutSec >= kUpdateTimeoutSec + kUpgradeTimeoutSec,
+                  "GUI install budget must cover helper update + upgrade");
     const char* check_timeout =
         "Timed out waiting for the update check. Check your network and try again.";
     const char* install_timeout = "Timed out while installing updates.";
@@ -123,14 +123,97 @@ int main(int argc, char** argv)
            "connection timed out is offline, not the check-timeout sentence");
     expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease Connection timed out",
                               JobKind::Install) == offline,
-           "failed to fetch during install is offline");
+           "connection timed out on a fetch line is offline");
     expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease", JobKind::Check) ==
-               offline,
-           "failed to fetch without the word timeout is offline");
+               "E: Failed to fetch http://deb.example/InRelease",
+           "failed to fetch without a network failure stays the apt line");
+    expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease 404 Not Found",
+                              JobKind::Check) ==
+               "E: Failed to fetch http://deb.example/InRelease 404 Not Found",
+           "404 stays the apt line");
+    expect(friendly_job_error("E: Failed to fetch http://deb.example/Packages.gz Hash Sum mismatch",
+                              JobKind::Install) ==
+               "E: Failed to fetch http://deb.example/Packages.gz Hash Sum mismatch",
+           "hash sum mismatch stays the apt line");
+    expect(friendly_job_error("NO_PUBKEY 1234567890ABCDEF", JobKind::Check) ==
+               "NO_PUBKEY 1234567890ABCDEF",
+           "NO_PUBKEY stays the apt line");
+    expect(friendly_job_error("Temporary failure resolving 'deb.example'", JobKind::Check) == offline,
+           "resolve failure is offline");
+    expect(friendly_job_error("Network is unreachable", JobKind::Install) == offline,
+           "unreachable network is offline");
+    expect(friendly_job_error("E: Unable to connect to deb.example:80", JobKind::Check) == offline,
+           "unable to connect is offline");
     expect(friendly_job_error("E: Unable to correct problems, you have held broken packages.",
                               JobKind::Install) ==
                "E: Unable to correct problems, you have held broken packages.",
            "unrelated apt error is kept");
+  }
+
+  {
+    const char* text =
+        "Reading package lists...\n"
+        "The following packages have been kept back:\n"
+        "  linux-image-amd64 linux-headers-amd64\n"
+        "0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.\n";
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.status == SimulateResult::KeptBack, "kept-back only is not up to date");
+    expect(r.packages.empty(), "kept-back only has no Inst packages");
+    expect(r.kept_back.size() == 2, "kept-back names both packages");
+    expect(r.not_upgraded_count == 2, "kept-back summary count");
+    if (r.kept_back.size() >= 2) {
+      expect(r.kept_back[0] == "linux-image-amd64", "kept-back pkg0");
+      expect(r.kept_back[1] == "linux-headers-amd64", "kept-back pkg1");
+    }
+    const std::string proto = format_protocol(r);
+    expect(proto.find("STATUS kept-back\n") == 0, "kept-back protocol status");
+    expect(proto.find("KEPT linux-image-amd64\n") != std::string::npos, "kept-back protocol name");
+    expect(proto.find("NOT_UPGRADED 2\n") != std::string::npos, "kept-back protocol count");
+    const SimulateResult p = parse_protocol(proto);
+    expect(p.status == SimulateResult::KeptBack, "kept-back protocol roundtrip");
+    expect(p.kept_back.size() == 2, "kept-back protocol names roundtrip");
+    expect(p.not_upgraded_count == 2, "kept-back protocol count roundtrip");
+  }
+
+  {
+    const char* text =
+        "The following packages have been kept back:\n"
+        "  linux-image-amd64\n"
+        "Inst libc6 [1] (2 Debian:12 [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n";
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.status == SimulateResult::Upgrades, "inst plus kept-back is upgrades");
+    expect(r.packages.size() == 1 && r.packages[0].name == "libc6", "inst package kept");
+    expect(r.kept_back.size() == 1 && r.kept_back[0] == "linux-image-amd64",
+           "kept-back package named beside inst");
+    expect(r.not_upgraded_count == 1, "mixed summary not-upgraded");
+    expect(r.upgraded_count == 1, "mixed summary upgraded");
+  }
+
+  {
+    const SimulateResult r = parse_apt_simulate(
+        "Calculating upgrade...\n"
+        "0 upgraded, 0 newly installed, 0 to remove and 3 not upgraded.\n");
+    expect(r.status == SimulateResult::KeptBack, "non-zero not upgraded is not up to date");
+    expect(r.kept_back.empty(), "summary-only kept-back has no names");
+    expect(r.not_upgraded_count == 3, "summary-only not-upgraded count");
+  }
+
+  {
+    const char* partial =
+        "E: Failed to fetch http://deb.example/dists/stable/InRelease 404 Not Found\n"
+        "E: Some index files failed to download. They have been ignored, or old ones used instead.\n";
+    expect(apt_index_failure_is_partial(partial), "404 with some index files is partial");
+    const std::string warning = apt_index_warning(partial);
+    expect(warning.find("404 Not Found") != std::string::npos, "partial warning keeps the 404");
+    expect(warning.find("Some index files failed") != std::string::npos,
+           "partial warning keeps the apt summary");
+    expect(!apt_index_failure_is_partial("E: Could not get lock /var/lib/apt/lists/lock\n"),
+           "lock failure is not a partial index update");
+    expect(apt_index_failure_is_partial(
+               "W: GPG error: http://deb.example stable InRelease: NO_PUBKEY 1234ABCD\n"
+               "E: Some index files failed to download. They have been ignored, or old ones used instead.\n"),
+           "missing key with old indexes is partial");
   }
 
   if (g_fails != 0) {

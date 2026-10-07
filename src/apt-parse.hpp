@@ -20,24 +20,40 @@ struct PackageUpgrade {
 };
 
 struct SimulateResult {
-  enum Status { UpToDate, Upgrades, Error, Success };
+  enum Status { UpToDate, Upgrades, Error, Success, KeptBack };
   Status status = UpToDate;
   std::string error_msg;
+  std::string warning;
   std::vector<PackageUpgrade> packages;
+  /* Packages apt will not upgrade because they need extra packages. */
+  std::vector<std::string> kept_back;
+  /* From the apt summary line. -1 when that line was not present. */
+  int upgraded_count = -1;
+  int not_upgraded_count = -1;
 };
 
 /* Parse one apt-get -s "Inst name [old] (new ...)" or "Inst name (new ...)" line. */
 bool parse_inst_line(const std::string& line, PackageUpgrade& out);
 
-/* Parse full apt-get -s upgrade text. E: lines become Error. */
+/* Parse full apt-get -s upgrade text. E: lines become Error.
+ * A kept-back section or a non-zero "not upgraded" summary is not up to date. */
 SimulateResult parse_apt_simulate(const std::string& text);
+
+/* apt-get update exits non-zero for "some index files failed to download"
+ * even when other indexes were refreshed. That is a partial failure. */
+bool apt_index_failure_is_partial(const std::string& text);
+
+/* E: lines (and key-signing / hash lines) to show for a partial index failure. */
+std::string apt_index_warning(const std::string& text);
 
 /* Stable helper stdout protocol. */
 std::string format_protocol(const SimulateResult& result);
 SimulateResult parse_protocol(const std::string& text);
 
-/* Check and install failures are worded separately. Network/fetch errors
- * are not rewritten into the update-check timeout sentence. */
+/* Check and install failures are worded separately. The offline sentence is
+ * only for resolve failures, an unreachable network, "unable to connect",
+ * and "connection timed out". Other apt lines (404, hash mismatch, NO_PUBKEY)
+ * are left as apt wrote them. */
 enum class JobKind { Check, Install };
 std::string friendly_job_error(const std::string& msg, JobKind kind);
 

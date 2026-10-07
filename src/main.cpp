@@ -6,6 +6,7 @@
 
 #include "window.hpp"
 
+#include <cerrno>
 #include <cstdlib>
 #include <glib.h>
 #include <gtkmm.h>
@@ -23,9 +24,43 @@ UpdatesWindow* existing_window(const Glib::RefPtr<Gtk::Application>& app)
   return nullptr;
 }
 
+/* Startup-notification ids end in _TIME<x11 timestamp>. Passing that to
+ * present() is what lets a second launch raise the window under X11 focus
+ * stealing prevention. Timestamp 0 is refused. */
+guint32 timestamp_from_command_line(const Glib::RefPtr<Gio::ApplicationCommandLine>& cmdline)
+{
+  constexpr guint32 kCurrentTime = 0;
+  if (!cmdline)
+    return kCurrentTime;
+  try {
+    const Glib::RefPtr<Glib::VariantDict> dict =
+        Glib::VariantDict::create(cmdline->get_platform_data());
+    if (!dict)
+      return kCurrentTime;
+    Glib::ustring startup_id;
+    if (!dict->lookup_value("desktop-startup-id", startup_id))
+      return kCurrentTime;
+    const Glib::ustring::size_type pos = startup_id.rfind("_TIME");
+    if (pos == Glib::ustring::npos)
+      return kCurrentTime;
+    const char* timestr = startup_id.c_str() + pos + 5;
+    if (*timestr == '\0')
+      return kCurrentTime;
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(timestr, &end, 0);
+    if (end == timestr || errno != 0)
+      return kCurrentTime;
+    return static_cast<guint32>(value);
+  } catch (const Glib::Error&) {
+    return kCurrentTime;
+  }
+}
+
 /* One window per process. --check is taken from this launch's options, not
  * remembered from the process that first opened the window. */
-void present_updates(const Glib::RefPtr<Gtk::Application>& app, bool check)
+void present_updates(const Glib::RefPtr<Gtk::Application>& app,
+                     const Glib::RefPtr<Gio::ApplicationCommandLine>& cmdline, bool check)
 {
   UpdatesWindow* window = existing_window(app);
   if (window == nullptr) {
@@ -35,7 +70,7 @@ void present_updates(const Glib::RefPtr<Gtk::Application>& app, bool check)
   } else if (check) {
     window->request_check();
   }
-  window->present();
+  window->present(timestamp_from_command_line(cmdline));
 }
 } // namespace
 
@@ -47,7 +82,7 @@ int main(int argc, char* argv[])
 
   auto app = Gtk::Application::create(kAppId, Gio::APPLICATION_HANDLES_COMMAND_LINE);
   /* WM / title-bar icon (xfwm4 etc.): desktop Icon= alone is not enough. */
-  Gtk::Window::set_default_icon_name(kAppId);
+  Gtk::Window::set_default_icon_name(lcos_updates::kIconName);
 
   app->add_main_option_entry(Gio::Application::OPTION_TYPE_BOOL, "check", '\0',
                              "Check for updates immediately after opening");
@@ -62,13 +97,13 @@ int main(int argc, char* argv[])
           if (options)
             options->lookup_value("check", check);
         }
-        present_updates(app, check);
+        present_updates(app, cmdline, check);
         return 0;
       },
       false);
 
   /* Activation without a command line (no --check) must not open a second window. */
-  app->signal_activate().connect([app]() { present_updates(app, false); });
+  app->signal_activate().connect([app]() { present_updates(app, {}, false); });
 
   return app->run(argc, argv);
 }

@@ -182,6 +182,28 @@ bool any_alive(const std::vector<pid_t>& members, const std::vector<pid_t>& grou
   return false;
 }
 
+bool pid_is_dpkg(pid_t pid)
+{
+  char path[64];
+  std::snprintf(path, sizeof path, "/proc/%d/comm", static_cast<int>(pid));
+  FILE* file = std::fopen(path, "r");
+  if (file == nullptr)
+    return false;
+  char buf[64];
+  if (std::fgets(buf, sizeof buf, file) == nullptr) {
+    std::fclose(file);
+    return false;
+  }
+  std::fclose(file);
+  std::size_t n = std::strlen(buf);
+  while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+    buf[--n] = '\0';
+  /* comm is the short name. dpkg owns the database; dpkg-* are its tools. */
+  if (std::strcmp(buf, "dpkg") == 0)
+    return true;
+  return std::strncmp(buf, "dpkg-", 5) == 0;
+}
+
 bool reap_leader(pid_t leader, bool block)
 {
   if (leader <= 1 || leader == getpid())
@@ -201,10 +223,28 @@ bool reap_leader(pid_t leader, bool block)
 
 } // namespace
 
+bool process_tree_contains_dpkg(pid_t leader)
+{
+  if (leader <= 1)
+    return false;
+  std::vector<pid_t> members;
+  std::vector<pid_t> groups;
+  collect_descendants(leader, members, groups);
+  for (pid_t pid : members) {
+    if (pid_is_dpkg(pid))
+      return true;
+  }
+  return false;
+}
+
 bool terminate_process_tree(pid_t leader, int term_grace_ms)
 {
   if (leader <= 1 || leader == getpid())
     return true;
+
+  /* Configuring packages. Do not signal apt-get, dpkg, or maintainer scripts. */
+  if (process_tree_contains_dpkg(leader))
+    return false;
 
   std::vector<pid_t> members;
   std::vector<pid_t> groups;
@@ -218,6 +258,9 @@ bool terminate_process_tree(pid_t leader, int term_grace_ms)
       reaped = reap_leader(leader, false);
     if (leader > 1 && process_alive(leader))
       collect_descendants(leader, members, groups);
+    /* dpkg appeared after SIGTERM. Do not follow it with SIGKILL. */
+    if (process_tree_contains_dpkg(leader))
+      return false;
     if (reaped && !any_alive(members, groups))
       return true;
     if (waited == term_grace_ms)
@@ -229,16 +272,27 @@ bool terminate_process_tree(pid_t leader, int term_grace_ms)
     waited += step;
   }
 
+  if (process_tree_contains_dpkg(leader))
+    return false;
+
   if (process_alive(leader))
     collect_descendants(leader, members, groups);
   signal_targets(SIGKILL, members, groups);
 
-  /* WNOHANG only: a root child we are not allowed to signal must not block
-   * forever in waitpid. The GUI keeps the job busy until this returns true. */
+  /* A zero grace is the non-blocking path: one SIGKILL, no sleep. */
+  if (term_grace_ms == 0) {
+    reap_leader(leader, false);
+    return !any_alive(members, groups);
+  }
+
+  /* WNOHANG only: a child we are not allowed to signal must not block
+   * forever in waitpid. */
   for (int i = 0; i < 20; ++i) {
     reap_leader(leader, false);
     if (!any_alive(members, groups))
       return true;
+    if (process_tree_contains_dpkg(leader))
+      return false;
     signal_targets(SIGKILL, members, groups);
     sleep_ms(50);
   }
