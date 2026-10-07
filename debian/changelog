@@ -1,3 +1,31 @@
+lcos-updates (0.9-3) unstable; urgency=medium
+
+  * Only a live dpkg --unpack/--configure/--install/--remove/--triggers-only
+    counts as package configuration. Architecture queries, dpkg-query, and
+    zombies no longer disable cancel or the deadline, and apt-get update
+    never latches. The window keeps its timer, and says "Configuring
+    packages…", only while that dpkg is still running.
+  * If configuration is already in the tree, the helper waits for apt to exit
+    instead of returning while apt and dpkg are still running.
+  * Helper errors are one protocol line per line, so a partial index warning
+    does not hide the later failure.
+  * A stale authentication SIGKILL cannot hit the next pkexec. Closing the
+    window cancels a queued check and does not run a nested dialog over the
+    helper's child watch.
+  * Install upgrades the reviewed package=version list, or shows the new list
+    and installs nothing if the post-update simulation differs.
+  * Polkit denies inactive and non-local subjects. Install does not keep a
+    cached authorization. The window runs /usr/bin/pkexec with no PATH search.
+  * Stopping apt records process start times and signals only those pids.
+  * The apt child starts from a cleared environment.
+  * Kept conffiles are named. The window does not claim the system is up to
+    date when an old conffile was kept.
+  * dpkg scans are throttled and apt output is capped. Cancel is a button.
+    The progress bar stays hidden until the helper is ready. A spawn failure
+    is not reported as a missing pkexec, and startup timestamp 0 is rejected.
+
+ -- LCOS <lcos@lunduke.com>  Wed, 07 Oct 2026 19:10:00 +0000
+
 lcos-updates (0.9-2) unstable; urgency=medium
 
   * Do not signal dpkg once package configuration has started. Cancel still
