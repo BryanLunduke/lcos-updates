@@ -6,8 +6,9 @@
  * The helper clocks apt-get update and the simulation separately. The GUI
  * must wait at least as long as those two limits added together, or it will
  * kill a check that is still inside the helper's own budget and show it as
- * timed out. Install refreshes package lists and then upgrades, so its
- * budget is update plus upgrade plus the same 30s slack.
+ * timed out. Install refreshes package lists, simulates again to confirm the
+ * reviewed set, then upgrades, so its budget is update plus simulate plus
+ * upgrade plus the same 30s slack.
  *
  * Both budgets start when the helper announces HELPER_READY, not when the
  * password dialog opens.
@@ -24,10 +25,10 @@ constexpr int kGuiTimeoutMarginSec = 30;
 constexpr int kCheckTimeoutSec =
     kUpdateTimeoutSec + kSimulateTimeoutSec + kGuiTimeoutMarginSec;
 constexpr int kInstallTimeoutSec =
-    kUpdateTimeoutSec + kUpgradeTimeoutSec + kGuiTimeoutMarginSec;
+    kUpdateTimeoutSec + kSimulateTimeoutSec + kUpgradeTimeoutSec + kGuiTimeoutMarginSec;
 
-/* Polite SIGTERM window before SIGKILL of an apt process group.
- * Not used once dpkg is in the tree. A grace of 0 must not sleep. */
+/* Polite SIGTERM window before SIGKILL of apt and its descendants.
+ * Not used once a configuring dpkg is in the tree. A grace of 0 must not sleep. */
 constexpr int kTermGraceMs = 2000;
 
 #endif

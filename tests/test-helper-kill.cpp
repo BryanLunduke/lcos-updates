@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <string>
 #include <sys/prctl.h>
+#include <vector>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -53,6 +54,118 @@ static sig_atomic_t g_got_term = 0;
 static void on_stub_term(int /*sig*/)
 {
   g_got_term = 1;
+}
+
+static std::string self_exe()
+{
+  char buf[4096];
+  const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+  if (n <= 0)
+    return {};
+  buf[n] = '\0';
+  return buf;
+}
+
+static int hold_mode(int argc, char** argv)
+{
+  prctl(PR_SET_NAME, "dpkg", 0, 0, 0);
+  bool exit_now = false;
+  int ready_fd = -1;
+  for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--exit-now") == 0)
+      exit_now = true;
+    if (std::strcmp(argv[i], "--ready-fd") == 0 && i + 1 < argc) {
+      ready_fd = 0;
+      for (const char* p = argv[++i]; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+          ready_fd = -1;
+          break;
+        }
+        ready_fd = ready_fd * 10 + (*p - '0');
+      }
+    }
+  }
+  if (exit_now)
+    _exit(0);
+  if (ready_fd >= 0) {
+    char ok = 1;
+    if (write(ready_fd, &ok, 1) < 0)
+      _exit(1);
+    close(ready_fd);
+  }
+  /* Do not hold the apt pipes open, or the helper never sees EOF. */
+  detach_stdio();
+  signal(SIGTERM, SIG_IGN);
+  signal(SIGINT, SIG_IGN);
+  for (;;)
+    pause();
+  return 0;
+}
+
+/* Exec this binary so cmdline contains the dpkg arguments under test. */
+static pid_t spawn_hold(const std::vector<const char*>& args, bool wait_ready)
+{
+  const std::string self = self_exe();
+  int ready[2] = {-1, -1};
+  if (wait_ready && pipe(ready) != 0)
+    return -1;
+  const pid_t child = fork();
+  if (child < 0)
+    return -1;
+  if (child == 0) {
+    char fdnum[16];
+    fdnum[0] = '\0';
+    if (wait_ready) {
+      fcntl(ready[1], F_SETFD, 0);
+      std::snprintf(fdnum, sizeof fdnum, "%d", ready[1]);
+      close(ready[0]);
+    }
+    std::vector<char*> av;
+    av.push_back(const_cast<char*>("dpkg"));
+    av.push_back(const_cast<char*>("--hold"));
+    if (wait_ready) {
+      av.push_back(const_cast<char*>("--ready-fd"));
+      av.push_back(fdnum);
+    }
+    for (const char* arg : args)
+      av.push_back(const_cast<char*>(arg));
+    av.push_back(nullptr);
+    execv(self.c_str(), av.data());
+    _exit(127);
+  }
+  if (wait_ready) {
+    close(ready[1]);
+    char ok = 0;
+    if (read(ready[0], &ok, 1) != 1) {
+      close(ready[0]);
+      return -1;
+    }
+    close(ready[0]);
+  }
+  return child;
+}
+
+static void record_argv(int argc, char** argv)
+{
+  const char* path = std::getenv("LCOS_STUB_ARGVFILE");
+  if (path == nullptr || path[0] == '\0')
+    return;
+  FILE* file = std::fopen(path, "a");
+  if (file == nullptr)
+    return;
+  for (int i = 0; i < argc; ++i) {
+    if (argv[i] == nullptr)
+      break;
+    for (const char* p = argv[i]; *p != '\0'; ++p) {
+      if (*p == '\n' || *p == '\r')
+        std::fputc(' ', file);
+      else
+        std::fputc(*p, file);
+    }
+    std::fputc('\n', file);
+  }
+  std::fputs("---\n", file);
+  std::fclose(file);
 }
 
 static int count_and_mark(const char* count_path)
@@ -98,39 +211,13 @@ static int apt_script(const char* script)
   }
   if (std::strcmp(script, "count-only") == 0)
     return 0;
-  if (std::strcmp(script, "kept-back-upgrade") == 0) {
-    if (n == 1)
-      return 0;
-    std::fputs("The following packages have been kept back:\n"
-               "  linux-image-amd64\n"
-               "0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
-               stdout);
-    return 0;
-  }
   if (std::strcmp(script, "keep-dpkg") == 0) {
     signal(SIGTERM, SIG_IGN);
     setpgid(0, 0);
-    int ready[2];
-    if (pipe(ready) != 0)
+    const pid_t child = spawn_hold({"--configure", "pkg"}, true);
+    if (child <= 1)
       return 1;
-    const pid_t child = fork();
-    if (child == 0) {
-      prctl(PR_SET_NAME, "dpkg", 0, 0, 0);
-      setpgid(0, 0);
-      signal(SIGTERM, SIG_IGN);
-      char ok = 1;
-      if (write(ready[1], &ok, 1) < 0)
-        _exit(1);
-      detach_stdio();
-      for (;;)
-        pause();
-    }
     setpgid(child, child);
-    char ok = 0;
-    if (read(ready[0], &ok, 1) != 1)
-      _exit(1);
-    close(ready[0]);
-    close(ready[1]);
     const char* path = std::getenv("LCOS_STUB_PIDFILE");
     if (path != nullptr) {
       FILE* file = std::fopen(path, "w");
@@ -156,25 +243,9 @@ static int apt_script(const char* script)
     }
     while (!g_got_term)
       pause();
-    int ready[2];
-    if (pipe(ready) != 0)
+    const pid_t child = spawn_hold({"--configure", "pkg"}, true);
+    if (child <= 1)
       _exit(1);
-    const pid_t child = fork();
-    if (child == 0) {
-      prctl(PR_SET_NAME, "dpkg", 0, 0, 0);
-      signal(SIGTERM, SIG_IGN);
-      char ok = 1;
-      if (write(ready[1], &ok, 1) < 0)
-        _exit(1);
-      detach_stdio();
-      for (;;)
-        pause();
-    }
-    char ok = 0;
-    if (read(ready[0], &ok, 1) != 1)
-      _exit(1);
-    close(ready[0]);
-    close(ready[1]);
     if (path != nullptr) {
       FILE* file = std::fopen(path, "w");
       if (file != nullptr) {
@@ -183,15 +254,142 @@ static int apt_script(const char* script)
       }
     }
     signal(SIGTERM, SIG_IGN);
+    /* Stay alive long enough that an early helper return is visible, then
+     * exit so the helper can waitpid and report recovery. */
+    poll(nullptr, 0, 1500);
+    _exit(0);
+  }
+  if (std::strncmp(script, "print-dpkg:", 11) == 0) {
+    signal(SIGTERM, SIG_IGN);
+    setpgid(0, 0);
+    const char* flag = script + 11;
+    const pid_t child = spawn_hold({flag}, true);
+    if (child <= 1)
+      return 1;
+    setpgid(child, child);
+    const char* path = std::getenv("LCOS_STUB_PIDFILE");
+    if (path != nullptr) {
+      FILE* file = std::fopen(path, "w");
+      if (file != nullptr) {
+        std::fprintf(file, "%d %d\n", static_cast<int>(getpid()), static_cast<int>(child));
+        std::fclose(file);
+      }
+    }
     for (;;)
       pause();
+  }
+  if (std::strcmp(script, "zombie-dpkg") == 0) {
+    signal(SIGTERM, SIG_IGN);
+    setpgid(0, 0);
+    const pid_t child = spawn_hold({"--configure", "--exit-now"}, false);
+    if (child <= 1)
+      return 1;
+    poll(nullptr, 0, 150);
+    const char* path = std::getenv("LCOS_STUB_PIDFILE");
+    if (path != nullptr) {
+      FILE* file = std::fopen(path, "w");
+      if (file != nullptr) {
+        std::fprintf(file, "%d %d\n", static_cast<int>(getpid()), static_cast<int>(child));
+        std::fclose(file);
+      }
+    }
+    for (;;)
+      pause();
+  }
+  if (std::strcmp(script, "env-check") == 0) {
+    const char* path = std::getenv("LCOS_STUB_ENVFILE");
+    FILE* file = path != nullptr ? std::fopen(path, "a") : nullptr;
+    if (file == nullptr)
+      return 1;
+    auto dump = [&](const char* key) {
+      const char* value = std::getenv(key);
+      std::fprintf(file, "%s=[%s]\n", key, value != nullptr ? value : "");
+    };
+    dump("APT_CONFIG");
+    dump("LCOS_CANARY");
+    dump("PATH");
+    dump("LANG");
+    dump("LC_ALL");
+    dump("DEBIAN_FRONTEND");
+    dump("HOME");
+    dump("http_proxy");
+    dump("DPKG_FORCE");
+    std::fputs("---\n", file);
+    std::fclose(file);
+    return 0;
+  }
+  if (std::strcmp(script, "partial-then-lock") == 0) {
+    if (n == 1) {
+      std::fputs(
+          "E: Failed to fetch http://deb.example/InRelease 404 Not Found\n"
+          "E: Some index files failed to download. They have been ignored, or old ones used instead.\n",
+          stderr);
+      return 100;
+    }
+    std::fputs("E: Could not get lock /var/lib/apt/lists/lock\n", stderr);
+    return 100;
+  }
+  if (std::strcmp(script, "pin-upgrade") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "changed-set") == 0) {
+    if (n == 1)
+      return 0;
+    std::fputs("Inst libc6 [1] (9 Debian:12 [amd64])\n"
+               "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+               stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "conffile-upgrade") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("Configuration file '/etc/ssh/sshd_config'\n"
+               " ==> Modified (by you or by a script) since installation.\n"
+               " ==> Package distributor has shipped an updated version.\n"
+               " ==> Keeping old config file as default.\n"
+               "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+               stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "kept-back-upgrade") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  linux-image-amd64\n"
+                 "Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("The following packages have been kept back:\n"
+               "  linux-image-amd64\n"
+               "0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+               stdout);
+    return 0;
   }
   return 2;
 }
 
 /* Exec'd as fake-apt-get. Ignores SIGTERM and leaves a grandchild that does too. */
-static int apt_stub()
+static int apt_stub(int argc, char** argv)
 {
+  record_argv(argc, argv);
   const char* script = std::getenv("LCOS_STUB_SCRIPT");
   if (script != nullptr && script[0] != '\0')
     return apt_script(script);
@@ -201,6 +399,7 @@ static int apt_stub()
   if (child == 0) {
     setpgid(0, 0);
     signal(SIGTERM, SIG_IGN);
+    detach_stdio();
     for (;;)
       pause();
   }
@@ -267,7 +466,9 @@ static bool wait_for_leader(const std::string& path, pid_t& leader, int ms)
 static int run_helper(const char* helper, const std::string& apt, const std::string& pidfile,
                       const char* timeout_sec, int* cancel_write, pid_t& helper_pid,
                       const char* script = nullptr, const char* countfile = nullptr,
-                      int* stdout_read = nullptr, const char* command = "simulate")
+                      int* stdout_read = nullptr, const char* command = "simulate",
+                      const std::vector<std::string>* extra = nullptr, int* stderr_read = nullptr,
+                      const char* argvfile = nullptr, const char* envfile = nullptr)
 {
   int fds[2] = {-1, -1};
   if (cancel_write != nullptr) {
@@ -279,12 +480,21 @@ static int run_helper(const char* helper, const std::string& apt, const std::str
     if (pipe(out_pipe) != 0)
       return -1;
   }
+  int err_pipe[2] = {-1, -1};
+  if (stderr_read != nullptr) {
+    if (pipe(err_pipe) != 0)
+      return -1;
+  }
   const pid_t pid = fork();
   if (pid < 0)
     return -1;
   if (pid == 0) {
     setenv("LCOS_UPDATES_APT_GET", apt.c_str(), 1);
     setenv("LCOS_STUB_PIDFILE", pidfile.c_str(), 1);
+    setenv("APT_CONFIG", "/no/such/apt.conf", 1);
+    setenv("LCOS_CANARY", "should-not-leak", 1);
+    setenv("http_proxy", "http://127.0.0.1:9", 1);
+    setenv("DPKG_FORCE", "confnew", 1);
     if (script != nullptr)
       setenv("LCOS_STUB_SCRIPT", script, 1);
     else
@@ -293,6 +503,14 @@ static int run_helper(const char* helper, const std::string& apt, const std::str
       setenv("LCOS_STUB_COUNTFILE", countfile, 1);
     else
       unsetenv("LCOS_STUB_COUNTFILE");
+    if (argvfile != nullptr)
+      setenv("LCOS_STUB_ARGVFILE", argvfile, 1);
+    else
+      unsetenv("LCOS_STUB_ARGVFILE");
+    if (envfile != nullptr)
+      setenv("LCOS_STUB_ENVFILE", envfile, 1);
+    else
+      unsetenv("LCOS_STUB_ENVFILE");
     if (timeout_sec != nullptr)
       setenv("LCOS_UPDATES_TIMEOUT_SEC", timeout_sec, 1);
     else
@@ -301,6 +519,11 @@ static int run_helper(const char* helper, const std::string& apt, const std::str
       dup2(out_pipe[1], STDOUT_FILENO);
       close(out_pipe[0]);
       close(out_pipe[1]);
+    }
+    if (stderr_read != nullptr) {
+      dup2(err_pipe[1], STDERR_FILENO);
+      close(err_pipe[0]);
+      close(err_pipe[1]);
     }
     if (cancel_write != nullptr) {
       dup2(fds[0], STDIN_FILENO);
@@ -313,7 +536,15 @@ static int run_helper(const char* helper, const std::string& apt, const std::str
         close(devnull);
       }
     }
-    execl(helper, helper, command, static_cast<char*>(nullptr));
+    std::vector<char*> av;
+    av.push_back(const_cast<char*>(helper));
+    av.push_back(const_cast<char*>(command));
+    if (extra != nullptr) {
+      for (const std::string& arg : *extra)
+        av.push_back(const_cast<char*>(arg.c_str()));
+    }
+    av.push_back(nullptr);
+    execv(helper, av.data());
     _exit(127);
   }
   if (cancel_write != nullptr) {
@@ -324,8 +555,26 @@ static int run_helper(const char* helper, const std::string& apt, const std::str
     close(out_pipe[1]);
     *stdout_read = out_pipe[0];
   }
+  if (stderr_read != nullptr) {
+    close(err_pipe[1]);
+    *stderr_read = err_pipe[0];
+  }
   helper_pid = pid;
   return 0;
+}
+
+static std::string read_file_all(const std::string& path)
+{
+  FILE* file = std::fopen(path.c_str(), "r");
+  if (file == nullptr)
+    return {};
+  std::string out;
+  char buf[1024];
+  std::size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof buf, file)) > 0)
+    out.append(buf, n);
+  std::fclose(file);
+  return out;
 }
 
 static std::string read_all_fd(int fd)
@@ -388,8 +637,10 @@ static bool wait_pid(pid_t pid, int ms, int& status)
 
 int main(int argc, char** argv)
 {
+  if (argc >= 2 && std::strcmp(argv[1], "--hold") == 0)
+    return hold_mode(argc, argv);
   if (argc >= 1 && basename_of(argv[0]) == "fake-apt-get")
-    return apt_stub();
+    return apt_stub(argc, argv);
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s /path/to/lcos-updates-helper\n", argv[0]);
     return 2;
@@ -510,17 +761,20 @@ int main(int argc, char** argv)
       close(cancel_write);
       cancel_write = -1;
     }
+    pid_t dpkg = 0;
+    expect(wait_for_pids(pidfile, leader, dpkg, 4000), "dpkg pid was recorded after SIGTERM");
+    poll(nullptr, 0, 200);
+    expect(!dead(helper_pid), "helper stays up while apt is still running");
+    expect(!dead(leader), "apt was not SIGKILLed after dpkg appeared");
+    expect(!dead(dpkg), "dpkg survived the kill");
     int status = 0;
     const bool exited = wait_pid(helper_pid, 10000, status);
-    pid_t dpkg = 0;
-    const bool have = read_pids(pidfile, leader, dpkg);
     const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
     if (stdout_read >= 0)
       close(stdout_read);
-    expect(exited, "helper exits when a kill already hit a tree that grew dpkg");
-    expect(have && dpkg > 1, "dpkg pid was recorded after SIGTERM");
-    expect(!dead(dpkg), "dpkg survived the kill");
-    expect(!dead(leader), "apt was not SIGKILLed after dpkg appeared");
+    expect(exited, "helper exits only after apt has exited");
+    expect(dead(leader), "apt has exited before the helper returns");
+    expect(!dead(dpkg), "dpkg is still alive after the helper exits");
     expect(out.find("dpkg --configure -a") != std::string::npos,
            "interrupted dpkg tells the user to run dpkg --configure -a");
     if (!dead(dpkg))
@@ -578,10 +832,13 @@ int main(int argc, char** argv)
 
   {
     const std::string countfile = std::string(dir) + "/upgrade.count";
+    const std::string argvfile = std::string(dir) + "/upgrade.argv";
+    const std::vector<std::string> pins = {"libc6=2"};
     pid_t helper_pid = 0;
     int stdout_read = -1;
     if (run_helper(helper, apt, std::string(dir) + "/upgrade.pids", nullptr, nullptr, helper_pid,
-                   "count-only", countfile.c_str(), &stdout_read, "upgrade") != 0) {
+                   "pin-upgrade", countfile.c_str(), &stdout_read, "upgrade", &pins, nullptr,
+                   argvfile.c_str()) != 0) {
       std::fprintf(stderr, "failed to spawn helper for upgrade update\n");
       return 1;
     }
@@ -590,19 +847,63 @@ int main(int argc, char** argv)
     const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
     if (stdout_read >= 0)
       close(stdout_read);
+    const std::string argv_text = read_file_all(argvfile);
     expect(exited, "helper exits after upgrade");
-    expect(read_count(countfile) == 2, "upgrade refreshes package lists before installing");
+    expect(read_count(countfile) == 3, "upgrade refreshes, re-simulates, then installs the pins");
     expect(out.find("STATUS success\n") != std::string::npos, "clean upgrade reports success");
+    expect(argv_text.find("\nupdate\n") != std::string::npos, "upgrade argv includes update");
+    expect(argv_text.find("\n-s\n") != std::string::npos && argv_text.find("\nupgrade\n") != std::string::npos,
+           "upgrade re-simulates with upgrade");
+    expect(argv_text.find("\n-y\n") != std::string::npos, "install argv includes -y");
+    expect(argv_text.find("\ninstall\n") != std::string::npos, "install uses install");
+    expect(argv_text.find("\n--only-upgrade\n") != std::string::npos, "install is only-upgrade");
+    expect(argv_text.find("\nlibc6=2\n") != std::string::npos, "install argv includes the reviewed pin");
+    expect(argv_text.find("Dpkg::Options::=--force-confdef") != std::string::npos,
+           "install keeps --force-confdef");
+    expect(argv_text.find("Dpkg::Options::=--force-confold") != std::string::npos,
+           "install keeps --force-confold");
+    expect(argv_text.find("dist-upgrade") == std::string::npos, "install argv has no dist-upgrade");
+    expect(argv_text.find("full-upgrade") == std::string::npos, "install argv has no full-upgrade");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/changed.count";
+    const std::string argvfile = std::string(dir) + "/changed.argv";
+    const std::vector<std::string> pins = {"libc6=2"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/changed.pids", nullptr, nullptr, helper_pid,
+                   "changed-set", countfile.c_str(), &stdout_read, "upgrade", &pins, nullptr,
+                   argvfile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for changed set\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    const std::string argv_text = read_file_all(argvfile);
+    expect(exited, "helper exits when the reviewed set changed");
+    expect(read_count(countfile) == 2, "a changed set does not run install");
+    expect(out.find("SKIPPED\n") != std::string::npos, "changed set sets SKIPPED");
+    expect(out.find("PKG libc6 1 9\n") != std::string::npos, "changed set returns the new package");
+    expect(out.find("Nothing was installed") != std::string::npos, "changed set says nothing was installed");
+    expect(argv_text.find("\ninstall\n") == std::string::npos, "changed set does not exec install");
+    expect(argv_text.find("dist-upgrade") == std::string::npos, "changed set has no dist-upgrade");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
   }
 
   {
     const std::string countfile = std::string(dir) + "/kept.count";
+    const std::vector<std::string> pins = {"libc6=2"};
     pid_t helper_pid = 0;
     int stdout_read = -1;
     if (run_helper(helper, apt, std::string(dir) + "/kept.pids", nullptr, nullptr, helper_pid,
-                   "kept-back-upgrade", countfile.c_str(), &stdout_read, "upgrade") != 0) {
+                   "kept-back-upgrade", countfile.c_str(), &stdout_read, "upgrade", &pins) != 0) {
       std::fprintf(stderr, "failed to spawn helper for kept-back upgrade\n");
       return 1;
     }
@@ -617,6 +918,180 @@ int main(int argc, char** argv)
     expect(out.find("KEPT linux-image-amd64\n") != std::string::npos, "kept-back upgrade names the package");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/conf.count";
+    const std::vector<std::string> pins = {"libc6=2"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/conf.pids", nullptr, nullptr, helper_pid,
+                   "conffile-upgrade", countfile.c_str(), &stdout_read, "upgrade", &pins) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for conffile upgrade\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a kept conffile");
+    expect(out.find("STATUS success\n") != std::string::npos, "kept conffile is still a finished install");
+    expect(out.find("CONFKEPT /etc/ssh/sshd_config\n") != std::string::npos, "kept conffile is named");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/lockmsg.count";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/lockmsg.pids", nullptr, nullptr, helper_pid,
+                   "partial-then-lock", countfile.c_str(), &stdout_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for partial-then-lock\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after partial update plus a later failure");
+    expect(out.find("MSG E: Failed to fetch http://deb.example/InRelease 404 Not Found\n") !=
+               std::string::npos,
+           "partial warning is an MSG line");
+    expect(out.find("MSG E: Could not get lock /var/lib/apt/lists/lock\n") != std::string::npos,
+           "later lock failure is its own MSG line");
+    expect(out.find("\nE: Could not get lock") == std::string::npos,
+           "lock failure is not dropped as a raw continuation");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  for (const char* flag : {"--print-foreign-architectures", "--print-architecture"}) {
+    const std::string script = std::string("print-dpkg:") + flag;
+    const std::string pidfile = std::string(dir) + "/print-" + flag + ".pids";
+    pid_t helper_pid = 0;
+    int stderr_read = -1;
+    if (run_helper(helper, apt, pidfile, "2", nullptr, helper_pid, script.c_str(), nullptr, nullptr,
+                   "simulate", nullptr, &stderr_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for %s\n", flag);
+      return 1;
+    }
+    pid_t leader = 0;
+    pid_t dpkg = 0;
+    expect(wait_for_pids(pidfile, leader, dpkg, 2000), "print-architecture stub started dpkg");
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 12000, status);
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits on the deadline when dpkg is only a query");
+    expect(err.find("DPKG_STARTED") == std::string::npos, "query dpkg does not emit DPKG_STARTED");
+    expect(dead(leader), "query apt parent is dead after the deadline");
+    expect(dead(dpkg), "query dpkg is dead after the deadline");
+    if (!dead(dpkg))
+      kill(dpkg, SIGKILL);
+    if (!dead(leader))
+      kill(leader, SIGKILL);
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string pidfile = std::string(dir) + "/zombie.pids";
+    pid_t helper_pid = 0;
+    int stderr_read = -1;
+    if (run_helper(helper, apt, pidfile, "2", nullptr, helper_pid, "zombie-dpkg", nullptr, nullptr,
+                   "simulate", nullptr, &stderr_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for zombie dpkg\n");
+      return 1;
+    }
+    pid_t leader = 0;
+    pid_t zombie = 0;
+    expect(wait_for_pids(pidfile, leader, zombie, 2000), "zombie dpkg stub started");
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 12000, status);
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits on the deadline when dpkg is a zombie");
+    expect(err.find("DPKG_STARTED") == std::string::npos, "zombie dpkg does not emit DPKG_STARTED");
+    expect(dead(leader), "parent of a dpkg zombie is dead after the deadline");
+    if (!dead(leader))
+      kill(leader, SIGKILL);
+    if (!dead(zombie))
+      kill(zombie, SIGKILL);
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string envfile = std::string(dir) + "/apt.env";
+    pid_t helper_pid = 0;
+    if (run_helper(helper, apt, std::string(dir) + "/env.pids", nullptr, nullptr, helper_pid,
+                   "env-check", nullptr, nullptr, "simulate", nullptr, nullptr, nullptr,
+                   envfile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for env check\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string text = read_file_all(envfile);
+    expect(exited, "helper exits after the env check");
+    expect(text.find("should-not-leak") == std::string::npos, "apt child does not inherit LCOS_CANARY");
+    expect(text.find("APT_CONFIG=[]") != std::string::npos, "apt child does not inherit APT_CONFIG");
+    expect(text.find("/no/such/apt.conf") == std::string::npos, "APT_CONFIG path is not visible to apt");
+    expect(text.find("http_proxy=[]") != std::string::npos, "apt child does not inherit http_proxy");
+    expect(text.find("DPKG_FORCE=[]") != std::string::npos, "apt child does not inherit DPKG_FORCE");
+    expect(text.find("PATH=[/usr/sbin:/usr/bin:/sbin:/bin]") != std::string::npos,
+           "apt child PATH is the safe path");
+    expect(text.find("LANG=[C.UTF-8]") != std::string::npos, "apt child LANG is C.UTF-8");
+    expect(text.find("LC_ALL=[C.UTF-8]") != std::string::npos, "apt child LC_ALL is C.UTF-8");
+    expect(text.find("DEBIAN_FRONTEND=[noninteractive]") != std::string::npos,
+           "apt child stays noninteractive");
+    expect(text.find("HOME=[]") != std::string::npos, "non-root apt child does not keep HOME");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    auto refuse = [&](const std::vector<std::string>& args, const char* what) {
+      int out_pipe[2];
+      if (pipe(out_pipe) != 0)
+        return;
+      const pid_t pid = fork();
+      if (pid == 0) {
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        const int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+          dup2(devnull, STDIN_FILENO);
+          close(devnull);
+        }
+        std::vector<char*> av;
+        av.push_back(const_cast<char*>(helper));
+        for (const auto& arg : args)
+          av.push_back(const_cast<char*>(arg.c_str()));
+        av.push_back(nullptr);
+        execv(helper, av.data());
+        _exit(127);
+      }
+      close(out_pipe[1]);
+      int status = 0;
+      const bool exited = wait_pid(pid, 5000, status);
+      const std::string out = read_all_fd(out_pipe[0]);
+      close(out_pipe[0]);
+      expect(exited && WIFEXITED(status) && WEXITSTATUS(status) != 0, what);
+      expect(out.find("STATUS error\n") != std::string::npos, what);
+      expect(out.find("refused:") != std::string::npos, what);
+    };
+    refuse({}, "missing command is refused");
+    refuse({"upgrade"}, "upgrade without pins is refused");
+    refuse({"upgrade", "not a pin"}, "invalid pin is refused");
+    refuse({"upgrade", "-y"}, "option pin is refused");
+    refuse({"simulate", "extra"}, "simulate with an extra argument is refused");
   }
 
   if (g_fails != 0) {

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Polkit wording: simulate checks, upgrade installs, and argv1 keeps them apart."""
+"""Polkit wording and subject defaults.
+
+simulate checks, upgrade installs, argv1 keeps them apart.
+allow_any and allow_inactive are no. Upgrade does not use auth_admin_keep.
+"""
 
 import sys
 import xml.etree.ElementTree as ET
@@ -20,6 +24,12 @@ def main() -> int:
             ann[node.get("key")] = (node.text or "").strip()
         if ann.get(PATH_KEY) != HELPER:
             continue
+        defaults = action.find("defaults")
+        allow = {}
+        if defaults is not None:
+            for key in ("allow_any", "allow_inactive", "allow_active"):
+                node = defaults.find(key)
+                allow[key] = (node.text or "").strip() if node is not None else ""
         matched.append(
             {
                 "id": action.get("id"),
@@ -27,6 +37,9 @@ def main() -> int:
                 "message": (action.findtext("message") or "").strip(),
                 "argv1": ann.get(ARGV_KEY),
                 "allow_gui": ann.get(GUI_KEY),
+                "allow_any": allow.get("allow_any", ""),
+                "allow_inactive": allow.get("allow_inactive", ""),
+                "allow_active": allow.get("allow_active", ""),
             }
         )
 
@@ -55,7 +68,32 @@ def main() -> int:
         print("install message should stay the authentication sentence", file=sys.stderr)
         return 1
 
-    print("ok: simulate asks to check, upgrade asks to install")
+    for action in (simulate, upgrade):
+        if action["allow_any"] != "no" or action["allow_inactive"] != "no":
+            print(
+                f"{action['id']} must deny inactive and non-local subjects "
+                f"(allow_any={action['allow_any']} allow_inactive={action['allow_inactive']})",
+                file=sys.stderr,
+            )
+            return 1
+
+    if simulate["allow_active"] != "auth_admin_keep":
+        print(
+            f"check allow_active should be auth_admin_keep, got {simulate['allow_active']}",
+            file=sys.stderr,
+        )
+        return 1
+    if upgrade["allow_active"] != "auth_admin":
+        print(
+            f"upgrade allow_active should be auth_admin, got {upgrade['allow_active']}",
+            file=sys.stderr,
+        )
+        return 1
+    if "keep" in upgrade["allow_active"]:
+        print("upgrade must not use auth_admin_keep", file=sys.stderr)
+        return 1
+
+    print("ok: simulate asks to check, upgrade asks to install, subjects are pinned")
     return 0
 
 

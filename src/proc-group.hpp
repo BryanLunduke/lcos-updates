@@ -1,4 +1,4 @@
-/* Stop a process and every descendant, including separate process groups.
+/* Stop a process and its descendants.
  * Copyright (C) 2026 LCOS
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -9,20 +9,26 @@
 
 #include <sys/types.h>
 
-/* True when leader or any descendant is dpkg (or dpkg-*). Once package
- * configuration has started, callers must not signal that tree. */
+/* True when a non-zombie descendant is configuring packages.
+ * That is a cmdline containing --unpack, --configure, --install, --remove,
+ * or --triggers-only. dpkg-query and dpkg queries (--print-architecture,
+ * --print-foreign-architectures, --assert-multi-arch, --compare-versions)
+ * do not count. Zombies do not count. comm alone is not enough. */
 bool process_tree_contains_dpkg(pid_t leader);
 
+/* Clock-tick start time from /proc/pid/stat, or 0 if it cannot be read. */
+unsigned long long proc_starttime(pid_t pid);
+
 /* SIGTERM leader and its descendants, wait term_grace_ms, then SIGKILL.
- * Waits until the leader is reaped (when it is our child) and tracked
- * members are gone. Returns false if any tracked process is still alive
- * (for example a root child this process is not allowed to signal), or if
- * dpkg is in the tree. dpkg is never signaled: if it is already present,
- * nothing in the tree is signaled; if it appears after SIGTERM, SIGKILL
- * is not sent.
- * term_grace_ms == 0 does not sleep (no grace wait, no post-SIGKILL poll).
- * Never signals this process or its own process group.
+ * Each signal is sent to a descendant pid only when its start time still
+ * matches the snapshot. Process groups are not signalled: kill(-pgid) would
+ * hit processes that merely share a group.
+ * Returns false if a configuring dpkg is in the tree. If it is already
+ * present, nothing is signalled. If it appears after SIGTERM, SIGKILL is
+ * not sent. When signaled is non-null it is set true if a signal was sent.
+ * term_grace_ms == 0 does not sleep.
+ * Never signals this process.
  */
-bool terminate_process_tree(pid_t leader, int term_grace_ms);
+bool terminate_process_tree(pid_t leader, int term_grace_ms, bool* signaled = nullptr);
 
 #endif

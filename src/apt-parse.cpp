@@ -120,6 +120,17 @@ static bool is_kept_back_header(const std::string& line)
   return line.compare(0, header.size(), header) == 0;
 }
 
+static std::string quoted_path(const std::string& line)
+{
+  const std::string::size_type open = line.find('\'');
+  if (open == std::string::npos)
+    return {};
+  const std::string::size_type close = line.find('\'', open + 1);
+  if (close == std::string::npos || close == open + 1)
+    return {};
+  return line.substr(open + 1, close - open - 1);
+}
+
 SimulateResult parse_apt_simulate(const std::string& text)
 {
   SimulateResult result;
@@ -128,6 +139,7 @@ SimulateResult parse_apt_simulate(const std::string& text)
   std::istringstream in(text);
   std::string line;
   bool in_kept = false;
+  std::string current_conffile;
   while (std::getline(in, line)) {
     line = trim_cr(line);
     if (in_kept) {
@@ -136,6 +148,27 @@ SimulateResult parse_apt_simulate(const std::string& text)
         continue;
       }
       in_kept = false;
+    }
+    if (line.compare(0, 19, "Configuration file ") == 0) {
+      const std::string path = quoted_path(line);
+      if (!path.empty())
+        current_conffile = path;
+      continue;
+    }
+    if (line.find("Keeping old config file") != std::string::npos) {
+      std::string path = quoted_path(line);
+      if (path.empty())
+        path = current_conffile;
+      if (!path.empty()) {
+        bool seen = false;
+        for (const auto& have : result.conffiles_kept) {
+          if (have == path)
+            seen = true;
+        }
+        if (!seen)
+          result.conffiles_kept.push_back(path);
+      }
+      continue;
     }
     if (line.compare(0, 2, "E:") == 0) {
       result.status = SimulateResult::Error;
@@ -205,12 +238,32 @@ std::string apt_index_warning(const std::string& text)
   return warning;
 }
 
+static void emit_lines(std::ostringstream& out, const char* tag, const std::string& text)
+{
+  std::istringstream lines(text);
+  std::string line;
+  bool any = false;
+  while (std::getline(lines, line)) {
+    line = trim_cr(line);
+    if (line.empty())
+      continue;
+    any = true;
+    out << tag << " " << line << "\n";
+  }
+  if (!any)
+    out << tag << " unknown error\n";
+}
+
 static void emit_extra(std::ostringstream& out, const SimulateResult& result)
 {
   if (result.not_upgraded_count > 0)
     out << "NOT_UPGRADED " << result.not_upgraded_count << "\n";
   for (const auto& name : result.kept_back)
     out << "KEPT " << name << "\n";
+  for (const auto& path : result.conffiles_kept)
+    out << "CONFKEPT " << path << "\n";
+  if (result.install_skipped)
+    out << "SKIPPED\n";
   if (result.warning.empty())
     return;
   std::istringstream lines(result.warning);
@@ -244,10 +297,7 @@ std::string format_protocol(const SimulateResult& result)
     break;
   case SimulateResult::Error:
     out << "STATUS error\n";
-    if (!result.error_msg.empty())
-      out << "MSG " << result.error_msg << "\n";
-    else
-      out << "MSG unknown error\n";
+    emit_lines(out, "MSG", result.error_msg);
     break;
   }
   emit_extra(out, result);
@@ -293,6 +343,12 @@ SimulateResult parse_protocol(const std::string& text)
         result.error_msg = msg;
       else
         result.error_msg += "\n" + msg;
+    } else if (line.compare(0, 9, "CONFKEPT ") == 0) {
+      const std::string path = line.substr(9);
+      if (!path.empty())
+        result.conffiles_kept.push_back(path);
+    } else if (line == "SKIPPED") {
+      result.install_skipped = true;
     } else if (line.compare(0, 5, "WARN ") == 0) {
       const std::string msg = line.substr(5);
       if (result.warning.empty())
@@ -330,7 +386,7 @@ SimulateResult parse_protocol(const std::string& text)
   return result;
 }
 
-std::string friendly_job_error(const std::string& msg, JobKind kind)
+static std::string friendly_one_line(const std::string& msg, JobKind kind)
 {
   const std::string lower = lower_copy(msg);
   /* Offline wording is reserved for failures that mean the network itself
@@ -349,4 +405,88 @@ std::string friendly_job_error(const std::string& msg, JobKind kind)
   if (msg.empty())
     return "The update helper failed.";
   return msg;
+}
+
+std::string friendly_job_error(const std::string& msg, JobKind kind)
+{
+  if (msg.find('\n') == std::string::npos)
+    return friendly_one_line(msg, kind);
+  std::istringstream in(msg);
+  std::string line;
+  std::string out;
+  while (std::getline(in, line)) {
+    line = trim_cr(line);
+    if (line.empty())
+      continue;
+    const std::string one = friendly_one_line(line, kind);
+    if (one.empty())
+      continue;
+    if (!out.empty())
+      out += "\n";
+    out += one;
+  }
+  if (out.empty())
+    return friendly_one_line(msg, kind);
+  return out;
+}
+
+static void note_error_line(CaptureBuf& cap, const std::string& line_in)
+{
+  if (!cap.first_error.empty())
+    return;
+  std::string line = trim_cr(line_in);
+  if (line.compare(0, 2, "E:") == 0) {
+    if (line.size() > 2048)
+      line.resize(2048);
+    cap.first_error = line;
+  }
+}
+
+void capture_append(CaptureBuf& cap, const char* data, std::size_t n)
+{
+  if (data == nullptr || n == 0)
+    return;
+  std::size_t off = 0;
+  while (off < n) {
+    if (cap.pending.size() >= 8192) {
+      note_error_line(cap, cap.pending);
+      cap.pending.clear();
+    }
+    std::size_t take = n - off;
+    const std::size_t room = 8192 - cap.pending.size();
+    if (take > room)
+      take = room;
+    cap.pending.append(data + off, take);
+    off += take;
+    std::string::size_type pos = 0;
+    while ((pos = cap.pending.find('\n')) != std::string::npos) {
+      note_error_line(cap, cap.pending.substr(0, pos));
+      cap.pending.erase(0, pos + 1);
+    }
+  }
+
+  if (cap.data.size() + n <= kAptCaptureCap) {
+    cap.data.append(data, n);
+    return;
+  }
+  if (n >= kAptCaptureCap) {
+    cap.data.assign(data + (n - kAptCaptureCap), kAptCaptureCap);
+    return;
+  }
+  cap.data.append(data, n);
+  cap.data.erase(0, cap.data.size() - kAptCaptureCap);
+}
+
+std::string capture_text(const CaptureBuf& cap)
+{
+  std::string first = cap.first_error;
+  if (first.empty() && cap.pending.compare(0, 2, "E:") == 0) {
+    first = trim_cr(cap.pending);
+    if (first.size() > 2048)
+      first.resize(2048);
+  }
+  if (first.empty() || cap.data.find(first) != std::string::npos)
+    return cap.data;
+  /* Tail of the capture, plus the first E: line the cap would otherwise drop. */
+  return first + "\n" + cap.data;
 }

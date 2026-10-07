@@ -28,7 +28,7 @@ proc_group = static_library(
   install: false,
 )
 
-executable(
+lcos_updates = executable(
   'lcos-updates',
   'src/main.cpp',
   'src/window.cpp',
@@ -126,11 +126,41 @@ test(
   'helper-kills-apt-group',
   test_helper_kill,
   args: [helper.full_path()],
-  timeout: 40,
+  timeout: 120,
+)
+
+test_window = executable(
+  'test-window',
+  'tests/test-window.cpp',
+  'src/window.cpp',
+  include_directories: inc,
+  link_with: apt_parse,
+  dependencies: gtkmm,
+  cpp_args: ['-DLCOS_UPDATES_TEST'],
+  install: false,
+)
+
+xvfb = find_program('xvfb-run', required: true)
+test(
+  'window',
+  xvfb,
+  args: ['-a', test_window.full_path()],
+  timeout: 90,
 )
 
 test(
   'policy-actions',
   find_program('python3'),
   args: [files('tests/test-policy.py'), files('data/org.lunduke.lcos-updates.policy')],
+)
+
+# The production GUI must not contain the test-only pkexec override.
+test(
+  'production-pkexec-has-no-test-override',
+  find_program('python3'),
+  args: [
+    '-c',
+    'import pathlib,sys; d=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(0 if b"LCOS_UPDATES_TEST_PKEXEC" not in d else 1)',
+    lcos_updates.full_path(),
+  ],
 )

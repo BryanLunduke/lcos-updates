@@ -5,6 +5,7 @@
  */
 
 #include "apt-parse.hpp"
+#include "startup-id.hpp"
 #include "timeouts.hpp"
 
 #include <fstream>
@@ -104,8 +105,9 @@ int main(int argc, char** argv)
   {
     static_assert(kCheckTimeoutSec >= kUpdateTimeoutSec + kSimulateTimeoutSec,
                   "GUI check budget must cover helper update + simulate");
-    static_assert(kInstallTimeoutSec >= kUpdateTimeoutSec + kUpgradeTimeoutSec,
-                  "GUI install budget must cover helper update + upgrade");
+    static_assert(kInstallTimeoutSec >=
+                      kUpdateTimeoutSec + kSimulateTimeoutSec + kUpgradeTimeoutSec,
+                  "GUI install budget must cover helper update + resimulate + upgrade");
     const char* check_timeout =
         "Timed out waiting for the update check. Check your network and try again.";
     const char* install_timeout = "Timed out while installing updates.";
@@ -214,6 +216,83 @@ int main(int argc, char** argv)
                "W: GPG error: http://deb.example stable InRelease: NO_PUBKEY 1234ABCD\n"
                "E: Some index files failed to download. They have been ignored, or old ones used instead.\n"),
            "missing key with old indexes is partial");
+  }
+
+  {
+    SimulateResult r;
+    r.status = SimulateResult::Error;
+    r.error_msg = "E: Failed to fetch http://deb.example/InRelease 404 Not Found\n"
+                  "E: Could not get lock /var/lib/apt/lists/lock";
+    const std::string proto = format_protocol(r);
+    expect(proto.find("MSG E: Failed to fetch http://deb.example/InRelease 404 Not Found\n") !=
+               std::string::npos,
+           "newline in error_msg is its own MSG line");
+    expect(proto.find("MSG E: Could not get lock /var/lib/apt/lists/lock\n") != std::string::npos,
+           "second error line is its own MSG line");
+    expect(proto.find("\nE: Could not get lock") == std::string::npos,
+           "error continuation is not a raw line");
+    const SimulateResult p = parse_protocol(proto);
+    expect(p.status == SimulateResult::Error, "multi-line MSG round trip status");
+    expect(p.error_msg.find("404 Not Found") != std::string::npos, "round trip keeps the 404");
+    expect(p.error_msg.find("Could not get lock") != std::string::npos, "round trip keeps the lock line");
+    expect(p.error_msg.find('\n') != std::string::npos, "round trip keeps the newline inside error_msg");
+  }
+
+  {
+    const std::string blob =
+        "E: Failed to fetch http://deb.example/InRelease 404 Not Found\n"
+        "E: Connection timed out";
+    const std::string got = friendly_job_error(blob, JobKind::Check);
+    expect(got.find("404 Not Found") != std::string::npos,
+           "a timeout on a later line does not discard the 404");
+    expect(got.find("No network connection") != std::string::npos,
+           "the timeout line is still mapped on its own");
+  }
+
+  {
+    const char* text =
+        "Configuration file '/etc/ssh/sshd_config'\n"
+        " ==> Modified (by you or by a script) since installation.\n"
+        " ==> Package distributor has shipped an updated version.\n"
+        " ==> Keeping old config file as default.\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.conffiles_kept.size() == 1, "kept conffile is parsed");
+    if (!r.conffiles_kept.empty())
+      expect(r.conffiles_kept[0] == "/etc/ssh/sshd_config", "kept conffile path");
+    const std::string proto = format_protocol(r);
+    expect(proto.find("CONFKEPT /etc/ssh/sshd_config\n") != std::string::npos, "CONFKEPT protocol line");
+    const SimulateResult p = parse_protocol(proto);
+    expect(p.conffiles_kept.size() == 1 && p.conffiles_kept[0] == "/etc/ssh/sshd_config",
+           "CONFKEPT round trip");
+  }
+
+  {
+    CaptureBuf cap;
+    const std::string early = "E: unique-early-error\n";
+    capture_append(cap, early.data(), early.size());
+    const std::string junk(2 * kAptCaptureCap, 'x');
+    capture_append(cap, junk.data(), junk.size());
+    const std::string text = capture_text(cap);
+    expect(text.find("unique-early-error") != std::string::npos, "cap keeps the first E: line");
+    expect(text.size() < junk.size(), "cap drops the unbounded apt capture");
+    expect(text.size() <= kAptCaptureCap + early.size() + 8, "cap stays near 1 MiB");
+    CaptureBuf split;
+    const std::string a = "E: split-";
+    const std::string b = "line\n";
+    capture_append(split, a.data(), a.size());
+    capture_append(split, b.data(), b.size());
+    expect(capture_text(split).find("E: split-line") != std::string::npos,
+           "first E: line split across reads is kept");
+  }
+
+  {
+    unsigned long ts = 99;
+    expect(!startup_timestamp_from_id("desktop_TIME0", ts), "timestamp 0 is rejected");
+    expect(!startup_timestamp_from_id("desktop_TIME", ts), "empty timestamp is rejected");
+    expect(!startup_timestamp_from_id("no-time-here", ts), "missing timestamp is rejected");
+    expect(startup_timestamp_from_id("app_TIME42", ts) && ts == 42, "non-zero timestamp is kept");
+    expect(startup_timestamp_from_id("app_TIME000", ts) == false, "zero-padded zero is rejected");
   }
 
   if (g_fails != 0) {

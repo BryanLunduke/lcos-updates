@@ -4,10 +4,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include "startup-id.hpp"
 #include "window.hpp"
 
-#include <cerrno>
-#include <cstdlib>
 #include <glib.h>
 #include <gtkmm.h>
 
@@ -26,34 +25,23 @@ UpdatesWindow* existing_window(const Glib::RefPtr<Gtk::Application>& app)
 
 /* Startup-notification ids end in _TIME<x11 timestamp>. Passing that to
  * present() is what lets a second launch raise the window under X11 focus
- * stealing prevention. Timestamp 0 is refused. */
-guint32 timestamp_from_command_line(const Glib::RefPtr<Gio::ApplicationCommandLine>& cmdline)
+ * stealing prevention. A parsed timestamp of 0 is refused. */
+bool timestamp_from_command_line(const Glib::RefPtr<Gio::ApplicationCommandLine>& cmdline,
+                                 unsigned long& timestamp)
 {
-  constexpr guint32 kCurrentTime = 0;
   if (!cmdline)
-    return kCurrentTime;
+    return false;
   try {
     const Glib::RefPtr<Glib::VariantDict> dict =
         Glib::VariantDict::create(cmdline->get_platform_data());
     if (!dict)
-      return kCurrentTime;
+      return false;
     Glib::ustring startup_id;
     if (!dict->lookup_value("desktop-startup-id", startup_id))
-      return kCurrentTime;
-    const Glib::ustring::size_type pos = startup_id.rfind("_TIME");
-    if (pos == Glib::ustring::npos)
-      return kCurrentTime;
-    const char* timestr = startup_id.c_str() + pos + 5;
-    if (*timestr == '\0')
-      return kCurrentTime;
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long value = std::strtoul(timestr, &end, 0);
-    if (end == timestr || errno != 0)
-      return kCurrentTime;
-    return static_cast<guint32>(value);
+      return false;
+    return startup_timestamp_from_id(static_cast<std::string>(startup_id), timestamp);
   } catch (const Glib::Error&) {
-    return kCurrentTime;
+    return false;
   }
 }
 
@@ -66,11 +54,25 @@ void present_updates(const Glib::RefPtr<Gtk::Application>& app,
   if (window == nullptr) {
     window = new UpdatesWindow(check);
     app->add_window(*window);
-    window->signal_hide().connect([window]() { delete window; });
+    /* Delete from an idle callback so hide() is not re-entered by the delete. */
+    auto* alive = new bool(true);
+    window->signal_hide().connect([window, alive]() {
+      if (!*alive)
+        return;
+      *alive = false;
+      Glib::signal_idle().connect_once([window, alive]() {
+        delete window;
+        delete alive;
+      });
+    });
   } else if (check) {
     window->request_check();
   }
-  window->present(timestamp_from_command_line(cmdline));
+  unsigned long timestamp = 0;
+  if (timestamp_from_command_line(cmdline, timestamp))
+    window->present(static_cast<guint32>(timestamp));
+  else
+    window->present();
 }
 } // namespace
 
