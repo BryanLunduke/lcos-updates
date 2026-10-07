@@ -30,6 +30,9 @@ namespace {
 const char kAptGet[] = "/usr/bin/apt-get";
 const char kSimNoteOpt[] = "-o";
 const char kSimNoteVal[] = "APT::Get::Show-User-Simulation-Note=false";
+const char kDpkgRecovery[] =
+    "The package installer was interrupted or is still running. "
+    "Run dpkg --configure -a to finish configuring packages.";
 
 volatile sig_atomic_t g_stop = 0;
 int g_cancel_fd = -1;
@@ -183,9 +186,20 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
   bool err_open = true;
   bool timed_out = false;
   bool cancelled = false;
+  bool dpkg_protected = false;
   char buf[4096];
   struct timespec start {};
   clock_gettime(CLOCK_MONOTONIC, &start);
+
+  auto note_dpkg = [&]() {
+    if (dpkg_protected)
+      return;
+    if (!process_tree_contains_dpkg(pid))
+      return;
+    dpkg_protected = true;
+    /* The GUI stops its kill timer and warns on close once it sees this. */
+    write_all_fd(STDERR_FILENO, "DPKG_STARTED\n");
+  };
 
   auto remaining_ms = [&]() -> int {
     struct timespec now {};
@@ -200,82 +214,112 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
     return static_cast<int>(remain);
   };
 
-  while (out_open || err_open) {
-    if (stop_requested()) {
-      cancelled = true;
-      break;
-    }
-    const int remain = remaining_ms();
-    if (remain <= 0) {
-      timed_out = true;
-      break;
-    }
-    pollfd fds[3];
-    nfds_t nfd = 0;
-    int out_i = -1;
-    int err_i = -1;
-    int cancel_i = -1;
-    if (out_open) {
-      out_i = static_cast<int>(nfd);
-      fds[nfd].fd = out_pipe[0];
-      fds[nfd].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfd].revents = 0;
-      nfd++;
-    }
-    if (err_open) {
-      err_i = static_cast<int>(nfd);
-      fds[nfd].fd = err_pipe[0];
-      fds[nfd].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfd].revents = 0;
-      nfd++;
-    }
-    if (g_cancel_fd >= 0) {
-      cancel_i = static_cast<int>(nfd);
-      fds[nfd].fd = g_cancel_fd;
-      fds[nfd].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfd].revents = 0;
-      nfd++;
-    }
-    const int slice = remain > 200 ? 200 : remain;
-    const int pr = poll(fds, nfd, slice);
-    if (pr < 0) {
-      if (errno == EINTR)
-        continue;
-      break;
-    }
-    if (cancel_i >= 0 && (fds[cancel_i].revents & (POLLIN | POLLHUP | POLLERR))) {
-      if (stop_requested()) {
-        cancelled = true;
-        break;
-      }
-    }
-    auto drain = [&](int idx, int fd, bool& open_flag, std::string& dest) {
-      if (idx < 0)
-        return;
-      if (fds[idx].revents & (POLLIN | POLLHUP | POLLERR)) {
-        for (;;) {
-          const ssize_t n = read(fd, buf, sizeof buf);
-          if (n > 0) {
-            dest.append(buf, static_cast<size_t>(n));
-            continue;
-          }
-          if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
-            open_flag = false;
+  for (;;) {
+    while (out_open || err_open) {
+      note_dpkg();
+      /* Download may be cancelled or timed out. Configuration may not:
+       * once dpkg is in the tree, keep waiting and do not signal it. */
+      if (!dpkg_protected) {
+        if (stop_requested()) {
+          cancelled = true;
+          break;
+        }
+        if (remaining_ms() <= 0) {
+          timed_out = true;
           break;
         }
       }
-    };
-    drain(out_i, out_pipe[0], out_open, out);
-    drain(err_i, err_pipe[0], err_open, err);
-  }
+      pollfd fds[3];
+      nfds_t nfd = 0;
+      int out_i = -1;
+      int err_i = -1;
+      int cancel_i = -1;
+      if (out_open) {
+        out_i = static_cast<int>(nfd);
+        fds[nfd].fd = out_pipe[0];
+        fds[nfd].events = POLLIN | POLLHUP | POLLERR;
+        fds[nfd].revents = 0;
+        nfd++;
+      }
+      if (err_open) {
+        err_i = static_cast<int>(nfd);
+        fds[nfd].fd = err_pipe[0];
+        fds[nfd].events = POLLIN | POLLHUP | POLLERR;
+        fds[nfd].revents = 0;
+        nfd++;
+      }
+      /* An already-closed cancel fd is always readable. Leave it out once
+       * dpkg is running or this loop would spin. */
+      if (!dpkg_protected && g_cancel_fd >= 0) {
+        cancel_i = static_cast<int>(nfd);
+        fds[nfd].fd = g_cancel_fd;
+        fds[nfd].events = POLLIN | POLLHUP | POLLERR;
+        fds[nfd].revents = 0;
+        nfd++;
+      }
+      int slice = 200;
+      if (!dpkg_protected) {
+        const int remain = remaining_ms();
+        if (remain <= 0) {
+          timed_out = true;
+          break;
+        }
+        slice = remain > 200 ? 200 : remain;
+      }
+      const int pr = poll(fds, nfd, slice);
+      if (pr < 0) {
+        if (errno == EINTR)
+          continue;
+        break;
+      }
+      if (cancel_i >= 0 && (fds[cancel_i].revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (stop_requested()) {
+          note_dpkg();
+          if (!dpkg_protected) {
+            cancelled = true;
+            break;
+          }
+        }
+      }
+      auto drain = [&](int idx, int fd, bool& open_flag, std::string& dest) {
+        if (idx < 0)
+          return;
+        if (fds[idx].revents & (POLLIN | POLLHUP | POLLERR)) {
+          for (;;) {
+            const ssize_t n = read(fd, buf, sizeof buf);
+            if (n > 0) {
+              dest.append(buf, static_cast<size_t>(n));
+              continue;
+            }
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+              open_flag = false;
+            break;
+          }
+        }
+      };
+      drain(out_i, out_pipe[0], out_open, out);
+      drain(err_i, err_pipe[0], err_open, err);
+    }
 
-  if (timed_out || cancelled || stop_requested()) {
+    if (dpkg_protected || !(timed_out || cancelled || stop_requested()))
+      break;
     if (stop_requested())
       cancelled = true;
-    /* Apt-get and dpkg are gone before the caller reports failure. */
-    terminate_process_tree(pid, kTermGraceMs);
+    /* dpkg may have started between the poll and this check. If it has,
+     * do not signal the tree; resume reading until apt exits. */
+    note_dpkg();
+    if (dpkg_protected) {
+      timed_out = false;
+      cancelled = false;
+      continue;
+    }
+    /* Download only. terminate_process_tree never signals dpkg. False
+     * means a kill already happened and dpkg is still in the tree. */
+    const bool gone = terminate_process_tree(pid, kTermGraceMs);
     close(out_pipe[0]);
     close(err_pipe[0]);
+    if (!gone)
+      return -4;
     if (timed_out && !cancelled)
       return -2;
     return -3;
@@ -289,9 +333,14 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
     if (got == pid)
       break;
     if (got < 0 && errno == EINTR) {
-      if (stop_requested()) {
-        terminate_process_tree(pid, kTermGraceMs);
-        return -3;
+      if (!dpkg_protected && stop_requested()) {
+        note_dpkg();
+        if (!dpkg_protected) {
+          const bool gone = terminate_process_tree(pid, kTermGraceMs);
+          if (!gone)
+            return -4;
+          return -3;
+        }
       }
       continue;
     }
@@ -330,6 +379,42 @@ std::string first_error_line(const std::string& out, const std::string& err)
   return "apt-get failed";
 }
 
+/* Returns false when the caller should already have emitted an error and
+ * should return 1. A partial index failure sets warning and returns true
+ * so the caller still simulates or upgrades. */
+bool refresh_package_lists(const char* cancel_msg, const char* timeout_msg, std::string& warning)
+{
+  const char* apt = apt_get_path();
+  const std::vector<const char*> update_argv = {apt, kSimNoteOpt, kSimNoteVal, "update"};
+  std::string out;
+  std::string err;
+  const int rc = run_apt(update_argv, effective_timeout(kUpdateTimeoutSec), out, err);
+  if (rc == -4) {
+    emit_error(kDpkgRecovery);
+    return false;
+  }
+  if (rc == -3) {
+    emit_error(cancel_msg);
+    return false;
+  }
+  if (rc == -2) {
+    emit_error(timeout_msg);
+    return false;
+  }
+  if (rc != 0) {
+    const std::string blob = err + "\n" + out;
+    if (apt_index_failure_is_partial(blob)) {
+      warning = apt_index_warning(blob);
+      if (warning.empty())
+        warning = first_error_line(out, err);
+      return true;
+    }
+    emit_error(first_error_line(out, err));
+    return false;
+  }
+  return true;
+}
+
 int do_simulate()
 {
   if (stop_requested()) {
@@ -338,29 +423,25 @@ int do_simulate()
   }
   announce_ready();
 
-  const char* apt = apt_get_path();
-  const std::vector<const char*> update_argv = {apt, kSimNoteOpt, kSimNoteVal, "update"};
-  std::string out;
-  std::string err;
-  int rc = run_apt(update_argv, effective_timeout(kUpdateTimeoutSec), out, err);
-  if (rc == -3 || stop_requested()) {
+  std::string update_warning;
+  if (!refresh_package_lists("Update check was cancelled",
+                             "Timed out while running apt-get update", update_warning))
+    return 1;
+  if (stop_requested()) {
     emit_error("Update check was cancelled");
     return 1;
   }
-  if (rc == -2) {
-    emit_error("Timed out while running apt-get update");
-    return 1;
-  }
-  if (rc != 0) {
-    emit_error(first_error_line(out, err));
-    return 1;
-  }
 
-  out.clear();
-  err.clear();
+  const char* apt = apt_get_path();
+  std::string out;
+  std::string err;
   const std::vector<const char*> sim_argv = {apt, kSimNoteOpt, kSimNoteVal, "-s", "-q", "upgrade"};
-  rc = run_apt(sim_argv, effective_timeout(kSimulateTimeoutSec), out, err);
-  if (rc == -3 || stop_requested()) {
+  const int rc = run_apt(sim_argv, effective_timeout(kSimulateTimeoutSec), out, err);
+  if (rc == -4) {
+    emit_error(kDpkgRecovery);
+    return 1;
+  }
+  if (rc == -3) {
     emit_error("Update check was cancelled");
     return 1;
   }
@@ -369,11 +450,16 @@ int do_simulate()
     return 1;
   }
   if (rc != 0) {
-    emit_error(first_error_line(out, err));
+    std::string msg = first_error_line(out, err);
+    if (!update_warning.empty())
+      msg = update_warning + "\n" + msg;
+    emit_error(msg);
     return 1;
   }
 
   SimulateResult result = parse_apt_simulate(out + "\n" + err);
+  if (!update_warning.empty())
+    result.warning = update_warning;
   emit(result);
   return result.status == SimulateResult::Error ? 1 : 0;
 }
@@ -386,7 +472,17 @@ int do_upgrade()
   }
   announce_ready();
 
-  /* Keep existing conffiles; never block on TTY conffile prompts (Plymouth policy). */
+  std::string update_warning;
+  if (!refresh_package_lists("Install was cancelled",
+                             "Timed out while refreshing package lists", update_warning))
+    return 1;
+  if (stop_requested()) {
+    emit_error("Install was cancelled");
+    return 1;
+  }
+
+  /* Keep existing conffiles; never block on TTY conffile prompts (Plymouth policy).
+   * Plain upgrade only: not dist-upgrade and not --with-new-pkgs. */
   const char* apt = apt_get_path();
   const std::vector<const char*> up_argv = {
       apt, kSimNoteOpt, kSimNoteVal, "-y",
@@ -396,7 +492,11 @@ int do_upgrade()
   std::string out;
   std::string err;
   const int rc = run_apt(up_argv, effective_timeout(kUpgradeTimeoutSec), out, err);
-  if (rc == -3 || stop_requested()) {
+  if (rc == -4) {
+    emit_error(kDpkgRecovery);
+    return 1;
+  }
+  if (rc == -3) {
     emit_error("Install was cancelled");
     return 1;
   }
@@ -405,11 +505,24 @@ int do_upgrade()
     return 1;
   }
   if (rc != 0) {
-    emit_error(first_error_line(out, err));
+    std::string msg = first_error_line(out, err);
+    if (!update_warning.empty())
+      msg = update_warning + "\n" + msg;
+    emit_error(msg);
     return 1;
   }
+
+  /* Exit 0 can still leave kept-back packages. Do not report up to date. */
+  const SimulateResult parsed = parse_apt_simulate(out + "\n" + err);
   SimulateResult result;
-  result.status = SimulateResult::Success;
+  const bool kept = !parsed.kept_back.empty() || parsed.not_upgraded_count > 0;
+  if (kept && parsed.upgraded_count <= 0 && parsed.packages.empty())
+    result.status = SimulateResult::KeptBack;
+  else
+    result.status = SimulateResult::Success;
+  result.kept_back = parsed.kept_back;
+  result.not_upgraded_count = parsed.not_upgraded_count;
+  result.warning = update_warning;
   emit(result);
   return 0;
 }

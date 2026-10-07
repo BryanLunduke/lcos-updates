@@ -10,6 +10,8 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <poll.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -101,6 +103,76 @@ int main()
     expect(elapsed < 1500, "do not wait out the grace after the process is gone");
     int status = 0;
     waitpid(child, &status, WNOHANG);
+  }
+
+  {
+    /* term_grace_ms == 0 must not spend the 20x50ms SIGKILL sleeps. */
+    const pid_t child = fork();
+    if (child == 0) {
+      setpgid(0, 0);
+      signal(SIGTERM, SIG_IGN);
+      for (;;)
+        pause();
+    }
+    setpgid(child, child);
+    const long start = mono_ms();
+    const bool gone = terminate_process_tree(child, 0);
+    const long elapsed = mono_ms() - start;
+    expect(elapsed < 400, "zero grace does not sleep");
+    for (int i = 0; i < 25 && !dead(child); ++i)
+      poll(nullptr, 0, 20);
+    int status = 0;
+    /* A zombie still answers kill(pid, 0). Reaping it counts as dead. */
+    const pid_t reaped = waitpid(child, &status, WNOHANG);
+    expect(gone || reaped == child || dead(child), "zero grace still SIGKILLs");
+    if (!dead(child))
+      kill(child, SIGKILL);
+  }
+
+  {
+    /* dpkg in the tree is not signaled, and a long grace is not spent. */
+    int fds[2];
+    if (pipe(fds) != 0) {
+      std::perror("pipe");
+      return 1;
+    }
+    const pid_t child = fork();
+    if (child == 0) {
+      setpgid(0, 0);
+      signal(SIGTERM, SIG_IGN);
+      const pid_t dpkg = fork();
+      if (dpkg == 0) {
+        prctl(PR_SET_NAME, "dpkg", 0, 0, 0);
+        setpgid(0, 0);
+        signal(SIGTERM, SIG_IGN);
+        for (;;)
+          pause();
+      }
+      setpgid(dpkg, dpkg);
+      if (write(fds[1], &dpkg, sizeof dpkg) < 0)
+        _exit(1);
+      for (;;)
+        pause();
+    }
+    setpgid(child, child);
+    close(fds[1]);
+    pid_t dpkg = 0;
+    if (read(fds[0], &dpkg, sizeof dpkg) != static_cast<ssize_t>(sizeof dpkg)) {
+      std::fprintf(stderr, "did not receive dpkg pid\n");
+      return 1;
+    }
+    close(fds[0]);
+    const long start = mono_ms();
+    const bool gone = terminate_process_tree(child, 5000);
+    const long elapsed = mono_ms() - start;
+    expect(!gone, "dpkg tree is not reported gone");
+    expect(elapsed < 1500, "dpkg tree does not wait out the grace");
+    expect(!dead(child), "apt parent was not signaled");
+    expect(!dead(dpkg), "dpkg was not signaled");
+    kill(dpkg, SIGKILL);
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
   }
 
   if (g_fails != 0) {

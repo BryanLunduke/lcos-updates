@@ -6,14 +6,10 @@
 
 #include "window.hpp"
 
-#include "proc-group.hpp"
 #include "timeouts.hpp"
 
-#include <cerrno>
 #include <csignal>
-#include <cstring>
 #include <fcntl.h>
-#include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -27,16 +23,65 @@ const int kCheckTimeoutMs = kCheckTimeoutSec * 1000;
 const int kInstallTimeoutMs = kInstallTimeoutSec * 1000;
 const int kPulseIntervalMs = 100;
 
-std::string strip_helper_ready(std::string err)
+std::string strip_helper_marker(std::string err, const char* tag)
 {
-  const std::string tag = "HELPER_READY\n";
+  const std::string needle = tag;
   for (;;) {
-    const std::string::size_type pos = err.find(tag);
+    const std::string::size_type pos = err.find(needle);
     if (pos == std::string::npos)
       break;
-    err.erase(pos, tag.size());
+    err.erase(pos, needle.size());
   }
   return err;
+}
+
+std::string strip_helper_markers(std::string err)
+{
+  err = strip_helper_marker(std::move(err), "HELPER_READY\n");
+  return strip_helper_marker(std::move(err), "DPKG_STARTED\n");
+}
+
+std::string join_names(const std::vector<std::string>& names)
+{
+  std::string out;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    if (i != 0)
+      out += ", ";
+    out += names[i];
+  }
+  return out;
+}
+
+Glib::ustring kept_sentence(const SimulateResult& result)
+{
+  if (!result.kept_back.empty()) {
+    Glib::ustring sentence("This tool will not install updates that need extra packages: ");
+    sentence += join_names(result.kept_back);
+    sentence += ".";
+    return sentence;
+  }
+  if (result.not_upgraded_count > 0)
+    return "This tool will not install updates that need extra packages.";
+  return {};
+}
+
+bool result_has_kept(const SimulateResult& result)
+{
+  return result.status == SimulateResult::KeptBack || !result.kept_back.empty() ||
+         result.not_upgraded_count > 0;
+}
+
+Glib::ustring append_warning(Glib::ustring status, const std::string& warning, JobKind kind)
+{
+  if (warning.empty())
+    return status;
+  const std::string shown = friendly_job_error(warning, kind);
+  if (shown.empty())
+    return status;
+  if (!status.empty())
+    status += "\n";
+  status += shown;
+  return status;
 }
 }
 
@@ -49,7 +94,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   set_border_width(0);
   /* Window-manager chrome only: do not call set_titlebar / HeaderBar. */
   /* Reinforce default icon for WMs that ignore gtk_window_set_default_icon_name. */
-  set_icon_name(lcos_updates::kAppId);
+  set_icon_name(lcos_updates::kIconName);
 
   auto* help_menu = Gtk::manage(new Gtk::Menu());
   auto* about_item = Gtk::manage(new Gtk::MenuItem("_About…", true));
@@ -93,6 +138,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_buttons.set_layout(Gtk::BUTTONBOX_END);
   m_buttons.set_spacing(8);
   m_install.set_sensitive(false);
+  m_install.set_can_default(true);
   m_check.set_can_default(true);
   m_buttons.pack_start(m_install, Gtk::PACK_SHRINK);
   m_buttons.pack_start(m_check, Gtk::PACK_SHRINK);
@@ -121,12 +167,45 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 UpdatesWindow::~UpdatesWindow()
 {
   m_retry.disconnect();
-  cancel_job();
+  m_timeout.disconnect();
+  m_pulse.disconnect();
+  /* dpkg is already configuring. Closing the window must not signal it.
+   * The helper ignores cancel once it has announced DPKG_STARTED. */
+  if (m_leave_helper_running || m_dpkg_started) {
+    release_job_io();
+    if (m_cancel_fd >= 0) {
+      ::close(m_cancel_fd);
+      m_cancel_fd = -1;
+    }
+    m_have_pid = false;
+    m_pid = 0;
+    m_job = Job::None;
+    return;
+  }
+  if (m_cancel_fd >= 0) {
+    ::close(m_cancel_fd);
+    m_cancel_fd = -1;
+  }
+  /* pkexec is still this user during the password dialog. Signal that one
+   * pid. After HELPER_READY the child is root; the closed pipe is the cancel. */
+  if (m_have_pid && !m_helper_ready) {
+    const pid_t child = static_cast<pid_t>(m_pid);
+    if (child > 1)
+      ::kill(child, SIGTERM);
+  }
+  release_job_io();
+  m_have_pid = false;
+  m_pid = 0;
+  m_job = Job::None;
 }
 
 void UpdatesWindow::request_check()
 {
-  if (m_check_queued || m_job != Job::None || m_have_pid)
+  if (m_job != Job::None || m_have_pid) {
+    m_check_after_job = true;
+    return;
+  }
+  if (m_check_queued)
     return;
   m_check_queued = true;
   Glib::signal_idle().connect_once(sigc::mem_fun(*this, &UpdatesWindow::on_check_idle));
@@ -197,6 +276,7 @@ void UpdatesWindow::show_package_list()
   gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), TRUE, TRUE, 0,
                             GTK_PACK_START);
   resize(560, 420);
+  use_install_as_default();
 }
 
 void UpdatesWindow::hide_package_list()
@@ -216,6 +296,21 @@ void UpdatesWindow::hide_package_list()
   int nat_h = 0;
   get_preferred_height(min_h, nat_h);
   resize(width, nat_h > 0 ? nat_h : 1);
+  use_check_as_default();
+}
+
+void UpdatesWindow::use_check_as_default()
+{
+  m_check.set_can_default(true);
+  set_default(m_check);
+  m_check.grab_default();
+}
+
+void UpdatesWindow::use_install_as_default()
+{
+  m_install.set_can_default(true);
+  set_default(m_install);
+  m_install.grab_default();
 }
 
 void UpdatesWindow::release_job_io()
@@ -237,32 +332,26 @@ void UpdatesWindow::release_job_io()
   }
 }
 
-bool UpdatesWindow::cancel_job()
+void UpdatesWindow::request_stop()
 {
-  release_job_io();
-  /* The helper runs as root after pkexec, so SIGTERM from this process is
-   * not enough. Closing the stdin pipe is what the helper waits on; it then
-   * SIGTERMs and SIGKILLs the apt/dpkg process group itself. Signals below
-   * still stop pkexec during the authentication dialog, before it is root. */
+  m_timeout.disconnect();
+  /* Closing the pipe is the cancel. The helper stops apt-get during
+   * download. It will not signal dpkg. Do not walk /proc from here. */
   if (m_cancel_fd >= 0) {
     ::close(m_cancel_fd);
     m_cancel_fd = -1;
   }
-  if (!m_have_pid) {
-    m_job = Job::None;
-    return true;
-  }
-
+  const Job job = m_stopped_job != Job::None ? m_stopped_job : m_job;
+  m_check.set_sensitive(false);
+  m_install.set_sensitive(false);
+  m_status.set_text(job == Job::Install ? "Stopping the update…" : "Stopping the update check…");
+  if (m_helper_ready || !m_have_pid)
+    return;
   const pid_t child = static_cast<pid_t>(m_pid);
-  const bool gone = terminate_process_tree(child, kGuiCancelGraceMs);
-  if (!gone)
-    return false;
-
-  Glib::spawn_close_pid(m_pid);
-  m_have_pid = false;
-  m_pid = 0;
-  m_job = Job::None;
-  return true;
+  if (child > 1)
+    ::kill(child, SIGTERM);
+  m_retry.disconnect();
+  m_retry = Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::on_stop_retry), 250);
 }
 
 void UpdatesWindow::finish_job()
@@ -279,6 +368,8 @@ void UpdatesWindow::finish_job()
   }
   m_job = Job::None;
   m_helper_ready = false;
+  m_dpkg_started = false;
+  m_stop_was_timeout = false;
 }
 
 void UpdatesWindow::start_helper(const char* helper_arg, Job job, int timeout_ms)
@@ -289,6 +380,7 @@ void UpdatesWindow::start_helper(const char* helper_arg, Job job, int timeout_ms
   m_stdout.clear();
   m_stderr.clear();
   m_helper_ready = false;
+  m_dpkg_started = false;
   m_stop_was_timeout = false;
   m_job = job;
 
@@ -296,7 +388,7 @@ void UpdatesWindow::start_helper(const char* helper_arg, Job job, int timeout_ms
   if (pipe(cancel_pipe) != 0) {
     m_job = Job::None;
     set_idle_status("Could not run pkexec. Install policykit-1 and try again.");
-    m_install.set_sensitive(false);
+    m_install.set_sensitive(!m_store->children().empty());
     return;
   }
   const int cancel_read = cancel_pipe[0];
@@ -335,7 +427,7 @@ void UpdatesWindow::start_helper(const char* helper_arg, Job job, int timeout_ms
     ::close(cancel_write);
     m_job = Job::None;
     set_idle_status("Could not run pkexec. Install policykit-1 and try again.");
-    m_install.set_sensitive(false);
+    m_install.set_sensitive(!m_store->children().empty());
     return;
   }
 
@@ -401,8 +493,10 @@ bool UpdatesWindow::on_stderr(Glib::IOCondition cond)
     const Glib::IOStatus st = m_err_ch->read(buf, sizeof buf, n);
     if (n > 0)
       m_stderr.append(buf, n);
-    if (n > 0)
-      maybe_rearm_check_timeout();
+    if (n > 0) {
+      maybe_rearm_job_timeout();
+      maybe_note_dpkg();
+    }
     if (st == Glib::IO_STATUS_AGAIN)
       return true;
     if (st == Glib::IO_STATUS_EOF || (cond & (Glib::IO_HUP | Glib::IO_ERR)))
@@ -411,69 +505,75 @@ bool UpdatesWindow::on_stderr(Glib::IOCondition cond)
   return true;
 }
 
-void UpdatesWindow::maybe_rearm_check_timeout()
+void UpdatesWindow::maybe_rearm_job_timeout()
 {
-  if (m_helper_ready || m_job != Job::Check)
+  if (m_helper_ready || (m_job != Job::Check && m_job != Job::Install))
     return;
   if (m_stderr.find("HELPER_READY\n") == std::string::npos)
     return;
   m_helper_ready = true;
+  if (m_dpkg_started)
+    return;
+  const int ms = m_job == Job::Install ? kInstallTimeoutMs : kCheckTimeoutMs;
   m_timeout.disconnect();
-  m_timeout = Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::on_timeout),
-                                             kCheckTimeoutMs);
+  m_timeout = Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::on_timeout), ms);
 }
 
-void UpdatesWindow::show_timeout_message(Job job)
+void UpdatesWindow::maybe_note_dpkg()
 {
-  if (job == Job::Check) {
-    hide_package_list();
-    m_install.set_sensitive(false);
+  if (m_dpkg_started)
+    return;
+  if (m_stderr.find("DPKG_STARTED\n") == std::string::npos)
+    return;
+  m_dpkg_started = true;
+  /* Configuration has started. The deadline must not close the cancel pipe. */
+  m_timeout.disconnect();
+  m_retry.disconnect();
+  m_stop_was_timeout = false;
+  m_status.set_text("Configuring packages…");
+}
+
+void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
+{
+  const bool keep = !m_store->children().empty();
+  if (!helper_ready) {
+    if (!keep)
+      hide_package_list();
+    set_idle_status("Timed out waiting for authentication. Try again.");
+  } else if (job == Job::Check) {
+    if (!keep)
+      hide_package_list();
     set_idle_status("Timed out waiting for the update check. Check your network and try again.");
   } else {
     set_idle_status("Timed out while installing updates.");
-    if (!m_store->children().empty())
-      m_install.set_sensitive(true);
   }
   m_check.set_sensitive(true);
+  m_install.set_sensitive(keep);
 }
 
 bool UpdatesWindow::on_timeout()
 {
   if (m_job == Job::None && !m_have_pid)
     return false;
-  m_stopped_job = m_job == Job::None ? m_stopped_job : m_job;
-  m_stop_was_timeout = true;
-  const Job job = m_stopped_job;
-  const bool gone = cancel_job();
-  if (!gone) {
-    m_check.set_sensitive(false);
-    m_install.set_sensitive(false);
-    m_status.set_text(job == Job::Install ? "Stopping the update…" : "Stopping the update check…");
-    m_retry = Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::on_stop_retry), 250);
+  if (m_dpkg_started) {
+    m_status.set_text(
+        "Packages are being configured. Closing this window will not stop the installer.");
     return false;
   }
-  show_timeout_message(job);
+  m_stopped_job = m_job == Job::None ? m_stopped_job : m_job;
+  m_stop_was_timeout = true;
+  request_stop();
   return false;
 }
 
 bool UpdatesWindow::on_stop_retry()
 {
-  if (!m_have_pid) {
-    m_job = Job::None;
-    if (m_stop_was_timeout)
-      show_timeout_message(m_stopped_job);
-    m_stop_was_timeout = false;
+  /* One signal to the pkexec pid. No /proc walk and no sleep. */
+  if (!m_have_pid || m_helper_ready || m_dpkg_started)
     return false;
-  }
-  if (!terminate_process_tree(static_cast<pid_t>(m_pid), 0))
-    return true;
-  Glib::spawn_close_pid(m_pid);
-  m_have_pid = false;
-  m_pid = 0;
-  m_job = Job::None;
-  if (m_stop_was_timeout)
-    show_timeout_message(m_stopped_job);
-  m_stop_was_timeout = false;
+  const pid_t child = static_cast<pid_t>(m_pid);
+  if (child > 1)
+    ::kill(child, SIGKILL);
   return false;
 }
 
@@ -505,10 +605,26 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
     }
   }
 
+  /* The last chunk can carry HELPER_READY or DPKG_STARTED after the watches
+   * have stopped. Honor it before deciding this was an auth or apt timeout. */
+  maybe_rearm_job_timeout();
+  maybe_note_dpkg();
+
   const Job job = m_job;
+  const bool timed_out = m_stop_was_timeout;
+  const bool helper_ready = m_helper_ready;
+  const bool check_again = m_check_after_job;
+  m_check_after_job = false;
   const std::string out = m_stdout;
-  const std::string err = strip_helper_ready(m_stderr);
+  const std::string err = strip_helper_markers(m_stderr);
   finish_job();
+
+  if (timed_out) {
+    show_timeout_message(job, helper_ready);
+    if (check_again)
+      request_check();
+    return;
+  }
 
   SimulateResult parsed = parse_protocol(out);
   if (parsed.status == SimulateResult::Error && parsed.error_msg == "No STATUS from helper") {
@@ -528,29 +644,48 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
     apply_install_result(parsed, wait_status);
   else
     set_idle_status(m_status.get_text());
+
+  if (check_again)
+    request_check();
 }
 
 void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_status)
 {
   const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
-  if (result.status == SimulateResult::UpToDate || result.status == SimulateResult::Success) {
+  if ((result.status == SimulateResult::UpToDate || result.status == SimulateResult::Success) &&
+      !result_has_kept(result)) {
     hide_package_list();
     m_install.set_sensitive(false);
     /* Clear any prior error; show a definite idle/success string. */
-    set_idle_status("You're up to date.");
+    set_idle_status(append_warning("You're up to date.", result.warning, JobKind::Check));
     m_check.set_sensitive(true);
     return;
   }
   if (result.status == SimulateResult::Upgrades && !result.packages.empty()) {
     show_packages(result.packages);
     m_install.set_sensitive(true);
-    set_idle_status("Updates are available.");
+    Glib::ustring status = "Updates are available.";
+    const Glib::ustring kept = kept_sentence(result);
+    if (!kept.empty())
+      status += " " + kept;
+    set_idle_status(append_warning(status, result.warning, JobKind::Check));
+    m_check.set_sensitive(true);
+    return;
+  }
+  if (result.status == SimulateResult::KeptBack ||
+      (result.packages.empty() && result_has_kept(result))) {
+    hide_package_list();
+    m_install.set_sensitive(false);
+    Glib::ustring status = "Some updates were kept back. " + kept_sentence(result);
+    set_idle_status(append_warning(status, result.warning, JobKind::Check));
     m_check.set_sensitive(true);
     return;
   }
 
-  hide_package_list();
-  m_install.set_sensitive(false);
+  /* Not a definitive result: leave the previous rows in place. */
+  const bool keep = !m_store->children().empty();
+  if (!keep)
+    hide_package_list();
   std::string msg = result.error_msg;
   if (msg.empty() || msg == "No STATUS from helper") {
     if (exit_code == 127 || exit_code == 126)
@@ -560,17 +695,30 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
   }
   set_idle_status(friendly_job_error(msg, JobKind::Check));
   m_check.set_sensitive(true);
+  m_install.set_sensitive(keep);
 }
 
 void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_status)
 {
   const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+  if (result.status != SimulateResult::Error && result_has_kept(result)) {
+    hide_package_list();
+    m_install.set_sensitive(false);
+    Glib::ustring status = result.status == SimulateResult::Success
+                               ? "Updates installed. "
+                               : "Some updates were kept back. ";
+    status += kept_sentence(result);
+    set_idle_status(append_warning(status, result.warning, JobKind::Install));
+    m_check.set_sensitive(true);
+    return;
+  }
   if (result.status == SimulateResult::Success || result.status == SimulateResult::UpToDate ||
       (result.status != SimulateResult::Error && exit_code == 0)) {
     hide_package_list();
     m_install.set_sensitive(false);
     /* Clear any prior error left from a failed check/install. */
-    set_idle_status("Updates installed successfully. You're up to date.");
+    set_idle_status(append_warning("Updates installed successfully. You're up to date.",
+                                   result.warning, JobKind::Install));
     m_check.set_sensitive(true);
     return;
   }
@@ -600,16 +748,33 @@ void UpdatesWindow::on_about()
   dialog.set_wrap_license(true);
   dialog.set_website("https://lunduke.com");
   dialog.set_website_label("lunduke.com");
-  dialog.set_logo_icon_name(lcos_updates::kAppId);
+  dialog.set_logo_icon_name(lcos_updates::kIconName);
   dialog.run();
+}
+
+bool UpdatesWindow::on_delete_event(GdkEventAny* event)
+{
+  if (m_dpkg_started && m_have_pid && !m_leave_helper_running) {
+    Gtk::MessageDialog dialog(*this, "Packages are being configured.", false, Gtk::MESSAGE_WARNING,
+                              Gtk::BUTTONS_NONE, true);
+    dialog.set_secondary_text(
+        "Closing this window will not stop the installer. "
+        "If the install is interrupted, run dpkg --configure -a.");
+    dialog.add_button("_Keep open", Gtk::RESPONSE_CANCEL);
+    dialog.add_button("_Close", Gtk::RESPONSE_CLOSE);
+    dialog.set_default_response(Gtk::RESPONSE_CANCEL);
+    if (dialog.run() != Gtk::RESPONSE_CLOSE)
+      return true;
+    m_leave_helper_running = true;
+  }
+  return Gtk::ApplicationWindow::on_delete_event(event);
 }
 
 void UpdatesWindow::on_check_clicked()
 {
   if (m_job != Job::None || m_have_pid)
     return;
-  hide_package_list();
-  m_install.set_sensitive(false);
+  /* Keep the current rows until this check returns a definitive result. */
   set_busy(true, "Checking for updates…");
   start_helper("simulate", Job::Check, kCheckTimeoutMs);
 }

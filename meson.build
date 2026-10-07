@@ -33,7 +33,7 @@ executable(
   'src/main.cpp',
   'src/window.cpp',
   include_directories: inc,
-  link_with: [apt_parse, proc_group],
+  link_with: apt_parse,
   dependencies: gtkmm,
   install: true,
   install_dir: get_option('bindir'),
@@ -54,11 +54,18 @@ install_data(
 )
 
 
+# The tree has no real hicolor PNGs (the SVG only references a missing file).
+# Skip absent paths so a clean meson setup succeeds. The desktop file and
+# window use system-software-update until artwork is added.
+fs = import('fs')
 foreach size : ['32x32', '48x48', '128x128', '256x256']
-  install_data(
-    'data/icons/hicolor' / size / 'apps' / 'org.lunduke.LcosUpdates.png',
-    install_dir: get_option('datadir') / 'icons' / 'hicolor' / size / 'apps',
-  )
+  png = 'data/icons/hicolor' / size / 'apps' / 'org.lunduke.LcosUpdates.png'
+  if fs.exists(png)
+    install_data(
+      png,
+      install_dir: get_option('datadir') / 'icons' / 'hicolor' / size / 'apps',
+    )
+  endif
 endforeach
 
 install_data(

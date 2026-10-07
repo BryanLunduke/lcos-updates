@@ -6,8 +6,11 @@
  * The helper clocks apt-get update and the simulation separately. The GUI
  * must wait at least as long as those two limits added together, or it will
  * kill a check that is still inside the helper's own budget and show it as
- * timed out. Install uses the same 30s slack the 0.7-1 window already used
- * (600s helper, 630s GUI).
+ * timed out. Install refreshes package lists and then upgrades, so its
+ * budget is update plus upgrade plus the same 30s slack.
+ *
+ * Both budgets start when the helper announces HELPER_READY, not when the
+ * password dialog opens.
  */
 
 #ifndef LCOS_UPDATES_TIMEOUTS_HPP
@@ -20,14 +23,11 @@ constexpr int kGuiTimeoutMarginSec = 30;
 
 constexpr int kCheckTimeoutSec =
     kUpdateTimeoutSec + kSimulateTimeoutSec + kGuiTimeoutMarginSec;
-constexpr int kInstallTimeoutSec = kUpgradeTimeoutSec + kGuiTimeoutMarginSec;
+constexpr int kInstallTimeoutSec =
+    kUpdateTimeoutSec + kUpgradeTimeoutSec + kGuiTimeoutMarginSec;
 
-/* Polite SIGTERM window before SIGKILL of an apt/dpkg process group. */
+/* Polite SIGTERM window before SIGKILL of an apt process group.
+ * Not used once dpkg is in the tree. A grace of 0 must not sleep. */
 constexpr int kTermGraceMs = 2000;
-
-/* How long the GUI waits for the helper to reap apt after a cancel.
- * Longer than kTermGraceMs plus the helper's post-SIGKILL wait, so a root
- * helper can finish killing dpkg before the GUI gives up on it. */
-constexpr int kGuiCancelGraceMs = 6000;
 
 #endif

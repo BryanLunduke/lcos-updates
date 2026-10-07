@@ -1,3 +1,33 @@
+lcos-updates (0.9-2) unstable; urgency=medium
+
+  * Do not signal dpkg once package configuration has started. Cancel still
+    stops apt-get during download. Closing the window while dpkg is running
+    warns and leaves the helper running. If a kill already happened, report
+    dpkg --configure -a instead of treating that as a clean stop.
+  * Kept-back packages and a non-zero "not upgraded" count are not reported
+    as up to date. Those packages are named. This tool still will not install
+    updates that need extra packages (apt-get upgrade only, not dist-upgrade).
+  * A partial apt-get update still runs the upgrade simulation and shows the
+    apt warning. Offline wording is only for resolve failures, unreachable
+    networks, unable to connect, and connection timeouts.
+  * Check and install time limits restart when the helper is ready, so the
+    password dialog is not part of the apt budget. Authentication timeouts
+    say so.
+  * Cancel closes the helper pipe and waits for the child watch. The window
+    no longer walks /proc on the UI thread. A zero stop grace does not sleep.
+  * Checking again keeps the package list until the new check returns a
+    definitive result. Cancel or error puts the rows back and re-enables
+    Install.
+  * A second launch presents the window with the startup-notification
+    timestamp. --check during a job runs when that job finishes.
+  * Use the system-software-update icon until hicolor artwork exists. Meson
+    skips missing PNG paths.
+  * Enter activates Install when the package list is showing, and Check when
+    it is hidden.
+  * Install runs apt-get update before apt-get upgrade.
+
+ -- LCOS <lcos@lunduke.com>  Wed, 07 Oct 2026 05:42:00 +0000
+
 lcos-updates (0.9-1) unstable; urgency=medium
 
   * Bump version to 0.9 / package 0.9-1 for the LCOS 0.9 release.

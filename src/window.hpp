@@ -16,6 +16,9 @@ namespace lcos_updates {
 constexpr const char* kVersion = "0.9";
 constexpr const char* kProductName = "LCOS Updates";
 constexpr const char* kAppId = "org.lunduke.LcosUpdates";
+/* Real hicolor artwork is not in the tree. The SVG only references a missing
+ * PNG, so the menu and window use the stock software-update icon. */
+constexpr const char* kIconName = "system-software-update";
 }  // namespace lcos_updates
 
 class UpdatesWindow : public Gtk::ApplicationWindow {
@@ -30,6 +33,7 @@ protected:
   void on_check_clicked();
   void on_install_clicked();
   void on_about();
+  bool on_delete_event(GdkEventAny* event) override;
 
 private:
   enum class Job { None, Check, Install };
@@ -37,12 +41,16 @@ private:
   void set_busy(bool busy, const Glib::ustring& status);
   void set_idle_status(const Glib::ustring& status);
   void start_helper(const char* helper_arg, Job job, int timeout_ms);
-  /* Returns true only after the helper and its apt/dpkg children are gone. */
-  bool cancel_job();
+  /* Close the cancel pipe and, before authentication, signal pkexec.
+   * Does not walk /proc and does not sleep. The child watch finishes the job. */
+  void request_stop();
   void finish_job();
   void release_job_io();
-  void maybe_rearm_check_timeout();
-  void show_timeout_message(Job job);
+  void maybe_rearm_job_timeout();
+  void maybe_note_dpkg();
+  void show_timeout_message(Job job, bool helper_ready);
+  void use_check_as_default();
+  void use_install_as_default();
   void on_check_idle();
   bool on_stdout(Glib::IOCondition cond);
   bool on_stderr(Glib::IOCondition cond);
@@ -102,7 +110,10 @@ private:
   std::string m_stderr;
   int m_cancel_fd = -1;
   bool m_helper_ready = false;
+  bool m_dpkg_started = false;
+  bool m_leave_helper_running = false;
   bool m_check_queued = false;
+  bool m_check_after_job = false;
   bool m_stop_was_timeout = false;
   Job m_stopped_job = Job::None;
 };
