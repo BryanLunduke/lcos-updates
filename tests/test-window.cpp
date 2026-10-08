@@ -418,6 +418,51 @@ case "$mode" in
     echo HELPER_READY >&2
     printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\nNEED Need to get 0 B/478 B of archives.\n'
     ;;
+  blank-progress)
+    echo HELPER_READY >&2
+    echo 'PHASE download' >&2
+    echo 'PROGRESS 28% [1 xz-utils 80.0 kB/267 kB 30%]' >&2
+    while [ ! -e "$release.1" ]; do wait_sec 0.05; done
+    printf 'PROGRESS %s\n' '                                        '
+    while [ ! -e "$release.2" ]; do wait_sec 0.05; done
+    echo 'PROGRESS Inst gzip [1.12-1ubuntu3.1] (1.12-1ubuntu3.2 Debian:12 [amd64])' >&2
+    while [ ! -e "$release.3" ]; do wait_sec 0.05; done
+    echo 'PROGRESS Reading package lists... 59%' >&2
+    while [ ! -e "$release.4" ]; do wait_sec 0.05; done
+    printf 'STATUS up-to-date\n'
+    ;;
+  kept-timer)
+    echo HELPER_READY >&2
+    echo 'PHASE simulate' >&2
+    echo 'PROGRESS Checking kept-back packages… (3 of 12)' >&2
+    wait_sec 2.5
+    printf 'STATUS kept-back\nUNCLASSIFIED foo\n'
+    ;;
+  wide-list)
+    echo HELPER_READY >&2
+    printf 'STATUS upgrades\nCOUNT 9\n'
+    printf 'PKG verylongpackagename-that-should-ellipsize 1.0 2.0\n'
+    printf 'PKG openjdk-17-jre-headless 21.0.11+9-1 21.0.12.1+1-1~24.04.4\n'
+    printf 'PKG bash 5.2.15-2 5.2.21-2\n'
+    printf 'SEC openjdk-17-jre-headless\n'
+    printf 'SIZE openjdk-17-jre-headless 12.4 MB\n'
+    printf 'SIZE bash 1.1 kB\n'
+    printf 'NEED Need to get 387 MB of archives.\n'
+    printf 'DISK After this operation, 37.5 MB of additional disk space will be used.\n'
+    ;;
+  download-hold)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      echo 'PHASE download' >&2
+      echo 'PROGRESS 28% [1 xz-utils 80.0 kB/267 kB 30%]' >&2
+      while [ ! -e "$release" ]; do
+        wait_sec 0.05
+      done
+      printf 'STATUS success\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG xz-utils 1 2\n'
+    fi
+    ;;
   *)
     echo HELPER_READY >&2
     printf 'STATUS up-to-date\n'
@@ -470,6 +515,11 @@ int main()
     UpdatesWindow* window = new_window();
     expect(!window->cancel_sensitive_for_test(), "cancel starts insensitive");
     expect(!window->progress_visible_for_test(), "progress starts hidden");
+    expect(window->status_text_for_test() == "Check for updates.",
+           "the window opens with Check for updates.");
+    expect(window->check_x_for_test() > window->install_x_for_test(),
+           "Check is the trailing button before updates are listed");
+    expect(!window->restart_visible_for_test(), "Restart is hidden until a reboot is required");
     destroy_window(window, pidfile);
   }
 
@@ -615,9 +665,14 @@ int main()
     UpdatesWindow* window = new_window();
     window->test_click_check();
     const bool listed = pump_until(2000, [&]() {
-      return contains(window->status_text_for_test(), "Updates are available.");
+      return contains(window->status_text_for_test(), "1 update.");
     });
     expect(listed, "a simulate with packages offers updates");
+    const bool install_trailing = pump_until(1000, [&]() {
+      return window->install_x_for_test() > window->check_x_for_test();
+    });
+    expect(install_trailing, "Install is the trailing button once it is the next step");
+    expect(window->install_is_default_for_test(), "Install is the default once updates are listed");
     expect(window->install_sensitive_for_test(), "install is available for the reviewed list");
     window->test_click_install();
     const bool installed = pump_until(2000, [&]() {
@@ -1404,13 +1459,14 @@ int main()
     UpdatesWindow* window = new_window();
     window->test_click_check();
     const bool shown = pump_until(2000, [&]() {
-      return contains(window->status_text_for_test(), "12%") &&
-             contains(window->status_text_for_test(), "linux-image-amd64") &&
+      return contains(window->status_text_for_test(), "Downloading linux-image-amd64") &&
              window->progress_fraction_for_test() > 0.11 &&
              window->progress_fraction_for_test() < 0.13;
     });
-    expect(shown, "a download percent reaches the status and the bar");
+    expect(shown, "a download percent names the package and fills the bar");
     expect(window->progress_text_for_test() == "12%", "the bar shows the leading percent");
+    expect(window->status_text_for_test().find("12% [") == std::string::npos,
+           "the raw apt percent line is not the status");
     destroy_window(window, pidfile);
   }
 
@@ -1421,12 +1477,277 @@ int main()
     UpdatesWindow* window = new_window();
     window->test_click_check();
     const bool sized = pump_until(2000, [&]() {
-      return contains(window->status_text_for_test(), "Updates are available.") &&
-             contains(window->status_text_for_test(), "Need to get 0 B/478 B of archives.");
+      return contains(window->status_text_for_test(), "1 update.") &&
+             contains(window->status_text_for_test(), "The packages are already downloaded (478 B).");
     });
-    expect(sized, "a check shows how much will be downloaded");
+    expect(sized, "a cached download names the package size instead of 0 B");
+    expect(!contains(window->status_text_for_test(), "Need to get 0 B"),
+           "the raw 0 B line is not shown");
     expect(window->install_sensitive_for_test(), "a sized check still offers Install");
     destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("blank-progress");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool percent = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Downloading xz-utils") &&
+             window->progress_fraction_for_test() > 0.27 &&
+             window->progress_fraction_for_test() < 0.29;
+    });
+    expect(percent, "the download sentence keeps the package and the percent");
+    {
+      std::ofstream out(release + ".1");
+      out << "go\n";
+    }
+    pump_for(200);
+    expect(contains(window->status_text_for_test(), "Downloading xz-utils"),
+           "a spaces-only progress line does not blank the status");
+    expect(window->progress_fraction_for_test() > 0.27 && window->progress_fraction_for_test() < 0.29,
+           "a spaces-only progress line does not clear the bar");
+    expect(window->status_text_for_test().find_first_not_of(" \t") != std::string::npos,
+           "the status is not whitespace");
+    {
+      std::ofstream out(release + ".2");
+      out << "go\n";
+    }
+    pump_for(200);
+    expect(window->status_text_for_test().find("Inst gzip") == std::string::npos,
+           "an Inst line is not the status");
+    expect(contains(window->status_text_for_test(), "Downloading xz-utils"),
+           "an Inst line leaves the download sentence in place");
+    {
+      std::ofstream out(release + ".3");
+      out << "go\n";
+    }
+    const bool reading = pump_until(1500, [&]() {
+      return contains(window->status_text_for_test(), "Reading package lists") &&
+             window->progress_fraction_for_test() > 0.58 &&
+             window->progress_fraction_for_test() < 0.60;
+    });
+    expect(reading, "a trailing percent moves the bar");
+    {
+      std::ofstream out(release + ".4");
+      out << "go\n";
+    }
+    pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("kept-timer");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool counting = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Checking kept-back packages") &&
+             contains(window->status_text_for_test(), "(3 of 12)");
+    });
+    expect(counting, "the kept-back counter is the status");
+    pump_for(1100);
+    expect(contains(window->status_text_for_test(), "(3 of 12)"),
+           "the kept-back counter stays while the phase runs");
+    expect(window->status_text_for_test().find("second") == std::string::npos,
+           "the kept-back counter does not grow a second timer");
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("wide-list");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() {
+      return window->package_rows_for_test() == 3 && window->columns_fit_for_test();
+    });
+    expect(listed, "name, version, and size columns fit in the window");
+    expect(window->allocated_height_for_test() > 420, "the list uses more than the old 420px window");
+    const std::string status = window->status_text_for_test();
+    expect(status.find("3 updates.") != std::string::npos, "the count matches the rows, not COUNT");
+    expect(status.find("9 updates.") == std::string::npos, "a stale COUNT is not the row count");
+    expect(status.find("Need to get 387 MB of archives.") != std::string::npos,
+           "the download size stays in the summary");
+    expect(status.find("After this operation, 37.5 MB of additional disk space will be used.") !=
+               std::string::npos,
+           "the disk-space sentence is in the summary");
+    expect(status.find("1 of these is a security update.") != std::string::npos,
+           "security updates are counted in the summary");
+    expect(window->package_at_row_for_test(0) == "openjdk-17-jre-headless",
+           "security updates sort first");
+    expect(window->security_at_row_for_test(0) == "Yes", "a security row is marked");
+    expect(window->security_at_row_for_test(1).empty(), "a normal row is not marked security");
+    expect(window->size_at_row_for_test(0) == "12.4 MB", "the size column shows the archive size");
+    expect(window->package_at_row_for_test(0).find("21.0.12.1+1-1~24.04.4") == std::string::npos,
+           "the version stays in its own column");
+    expect(window->install_x_for_test() > window->check_x_for_test(),
+           "Install stays at the trailing edge of a long list");
+    expect(window->column_count_for_test() == 5, "package, versions, size, and security are columns");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("download-hold");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "download cancel listed a package");
+    window->test_click_install();
+    const bool downloading = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Downloading xz-utils");
+    });
+    expect(downloading, "install reaches the download");
+    const pid_t pid = read_pid(pidfile);
+    expect(alive(pid), "the helper is running during the download");
+    window->test_click_cancel();
+    pump_for(80);
+    expect(window->get_visible(), "Cancel during download asks first");
+    expect(contains(window->close_primary_for_test(), "Stop downloading?"),
+           "Cancel during download asks to stop downloading");
+    expect(window->ask_default_is_cancel_for_test(), "Keep installing is the default");
+    expect(alive(pid), "the question does not stop the download");
+    window->test_keep_open();
+    pump_for(80);
+    expect(alive(pid), "Keep installing leaves the download running");
+    expect(contains(window->status_text_for_test(), "Downloading xz-utils"),
+           "Keep installing leaves the download sentence");
+    window->test_quit();
+    pump_for(80);
+    expect(contains(window->close_primary_for_test(), "Stop downloading?"),
+           "closing during download asks the same question");
+    expect(window->ask_default_is_cancel_for_test(), "closing during download defaults to Keep installing");
+    window->test_keep_open();
+    pump_for(40);
+    expect(window->get_visible(), "Keep installing does not hide the window");
+    expect(alive(pid), "declining the close leaves the helper running");
+    window->test_click_cancel();
+    pump_for(40);
+    window->test_confirm_close();
+    const bool cancelled = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Install was cancelled");
+    });
+    expect(cancelled, "confirming Stop downloading says the install was cancelled");
+    expect(!alive(pid), "confirming Stop downloading stops the helper");
+    expect(window->check_sensitive_for_test(), "Check is enabled after a cancelled download");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("download-hold");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    ensure_app(app);
+    app->add_window(*window);
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "close-during-download listed a package");
+    window->test_click_install();
+    const bool downloading = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Downloading");
+    });
+    expect(downloading, "close-during-download reaches the download");
+    const pid_t pid = read_pid(pidfile);
+    window->test_quit();
+    pump_for(40);
+    window->test_confirm_close();
+    const bool noted = pump_until(2000, [&]() {
+      return contains(window->notification_text_for_test(), "Install was cancelled");
+    });
+    expect(noted, "closing during download notifies that the install was cancelled");
+    expect(!alive(pid), "closing during download stops the helper");
+    pump_until(1000, [&]() { return !window->background_for_test(); });
+    app->remove_window(*window);
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("list-then-reboot");
+    set_timeout_ms(5000);
+    const std::string loginctl = dir + "/loginctl";
+    const std::string loginctl_log = dir + "/loginctl.log";
+    {
+      std::ofstream out(loginctl);
+      out << "#!/bin/sh\n"
+             "printf '%s\\n' \"$@\" >> \"$LCOS_LOGINCTL_LOG\"\n"
+             "if [ -n \"$LCOS_LOGINCTL_FAIL\" ]; then\n"
+             "  exit 1\n"
+             "fi\n"
+             "exit 0\n";
+    }
+    chmod(loginctl.c_str(), 0755);
+    setenv("LCOS_UPDATES_TEST_LOGINCTL", loginctl.c_str(), 1);
+    setenv("LCOS_LOGINCTL_LOG", loginctl_log.c_str(), 1);
+    unsetenv("LCOS_LOGINCTL_FAIL");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "restart test listed a package");
+    window->test_click_install();
+    const bool done = pump_until(2000, [&]() {
+      return window->restart_visible_for_test() &&
+             contains(window->status_text_for_test(), "Restart to finish installing updates.");
+    });
+    expect(done, "a reboot flag shows a Restart button");
+    expect(contains(window->status_text_for_test(), "linux-image-amd64"),
+           "the restart sentence still names the package");
+    expect(window->restart_sensitive_for_test(), "Restart can be clicked");
+    const bool trailing = pump_until(1000, [&]() {
+      return window->restart_x_for_test() > window->check_x_for_test() &&
+             window->restart_x_for_test() > window->install_x_for_test();
+    });
+    expect(trailing, "Restart is the trailing button when a reboot is required");
+    expect(window->restart_is_default_for_test(), "Restart is the default after an install that needs it");
+    window->test_click_restart();
+    pump_for(40);
+    expect(contains(window->status_text_for_test(), "Restart to finish installing updates."),
+           "opening the question does not restart yet");
+    expect(window->restart_default_is_cancel_for_test(), "the restart question defaults to Cancel");
+    window->test_cancel_restart();
+    pump_for(80);
+    expect(slurp(loginctl_log).empty(), "Cancel does not run loginctl");
+    expect(contains(window->status_text_for_test(), "Restart to finish installing updates."),
+           "Cancel leaves the restart sentence");
+    window->test_click_restart();
+    pump_for(40);
+    window->test_confirm_restart();
+    const bool ran = pump_until(1500, [&]() { return slurp(loginctl_log).find("reboot") != std::string::npos; });
+    expect(ran, "Restart runs loginctl reboot");
+    expect(slurp(loginctl_log).find("reboot\n") != std::string::npos, "the only loginctl verb is reboot");
+    expect(window->status_text_for_test().find("Could not restart") == std::string::npos,
+           "a successful loginctl is not an error");
+    destroy_window(window, pidfile);
+    unlink(loginctl_log.c_str());
+    setenv("LCOS_LOGINCTL_FAIL", "1", 1);
+    window = new_window();
+    window->test_click_check();
+    const bool listed_again = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed_again, "a failed restart still listed a package");
+    window->test_click_install();
+    const bool again = pump_until(2000, [&]() { return window->restart_visible_for_test(); });
+    expect(again, "Restart is offered again");
+    window->test_click_restart();
+    pump_for(40);
+    window->test_confirm_restart();
+    const bool failed = pump_until(1500, [&]() {
+      return contains(window->status_text_for_test(), "Could not restart this computer.");
+    });
+    expect(failed, "a failed loginctl shows an error");
+    expect(window->restart_sensitive_for_test(), "Restart can be tried again after a failure");
+    destroy_window(window, pidfile);
+    unsetenv("LCOS_LOGINCTL_FAIL");
+    unsetenv("LCOS_UPDATES_TEST_LOGINCTL");
+    unsetenv("LCOS_LOGINCTL_LOG");
   }
 
   if (g_fails != 0) {

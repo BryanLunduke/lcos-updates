@@ -738,13 +738,24 @@ int main(int argc, char** argv)
     expect(r.status != SimulateResult::Error, "quiet=0 print-uris is not an error");
     SimulateResult shown;
     shown.status = SimulateResult::Upgrades;
-    shown.packages.push_back(PackageUpgrade{"lcos-fixture-pkg", "1.0", "2.0"});
+    PackageUpgrade pkg;
+    pkg.name = "lcos-fixture-pkg";
+    pkg.old_version = "1.0";
+    pkg.new_version = "2.0";
+    shown.packages.push_back(pkg);
     shown.download_need = parse_download_need(text);
+    apply_download_details(shown, text);
     const JobOutcome outcome = outcome_check(shown, 0, true);
-    expect(outcome.status.find("Updates are available.") != std::string::npos,
-           "a sized check still says updates are available");
-    expect(outcome.status.find("Need to get 0 B/478 B of archives.") != std::string::npos,
-           "a sized check shows the download size");
+    expect(outcome.status.find("1 update.") != std::string::npos,
+           "a sized check says how many updates there are");
+    expect(outcome.status.find("The packages are already downloaded (478 B).") != std::string::npos,
+           "a cached download is not shown as 0 B");
+    expect(outcome.status.find("Need to get 0 B/") == std::string::npos,
+           "the raw 0 B/N line is not the status");
+    expect(outcome.status.find("After this operation, 0 B of additional disk space will be used.") !=
+               std::string::npos,
+           "the disk-space sentence is kept");
+    expect(shown.packages[0].size == "478 B", "print-uris size is attached to the package");
     const std::string proto = format_protocol(shown);
     expect(proto.find("NEED Need to get 0 B/478 B of archives.\n") != std::string::npos,
            "NEED protocol line");
@@ -825,19 +836,112 @@ int main(int argc, char** argv)
     unseen.unclassified.push_back("pkg01");
     unseen.unclassified.push_back("pkg40");
     const std::string sentence = describe_remaining(unseen);
-    expect(sentence.find("Some kept-back packages were not classified: pkg01, pkg40.") !=
+    expect(sentence.find(
+               "These updates were not included and will be offered on a later check: pkg01, pkg40.") !=
                std::string::npos,
-           "unclassified kept-back packages are named as unclassified");
+           "unclassified kept-back packages are left for a later check");
+    expect(sentence.find("not classified") == std::string::npos,
+           "unclassified packages are not described as classified");
     expect(sentence.find("need extra packages") == std::string::npos,
            "unclassified packages are not extra packages");
     const JobOutcome outcome = outcome_check(unseen, 0, false);
-    expect(outcome.status.find("not classified: pkg01, pkg40.") != std::string::npos,
-           "a check says which kept-back packages were not classified");
+    expect(outcome.status.find(
+               "These updates were not included and will be offered on a later check: pkg01, pkg40.") !=
+               std::string::npos,
+           "a check says those updates will be offered later");
     expect(!outcome.install_enabled, "unclassified kept-back packages are not an install");
     const std::string proto = format_protocol(unseen);
     expect(proto.find("UNCLASSIFIED pkg01\n") != std::string::npos, "UNCLASSIFIED protocol line");
     const SimulateResult back = parse_protocol(proto);
     expect(back.unclassified.size() == 2 && back.kept_back.empty(), "UNCLASSIFIED round trip");
+  }
+
+  {
+    expect(!progress_line_visible(""), "an empty progress segment is dropped");
+    expect(!progress_line_visible(" "), "a single space is apt's clear-line");
+    expect(!progress_line_visible("   \t  "), "whitespace-only progress is dropped");
+    expect(!progress_line_visible("\r"), "a bare carriage return is dropped");
+    expect(!progress_line_visible("\n"), "a blank newline is dropped");
+    expect(progress_line_visible("28% [1 xz-utils 80.0 kB/267 kB 30%]"),
+           "a real percent line is kept");
+    expect(progress_percent("28% [1 xz-utils 80.0 kB/267 kB 30%]") == 28,
+           "the leading percent is the download percent");
+    expect(progress_percent("Reading package lists... 59%") == 59,
+           "a trailing percent on Reading package lists is read");
+    expect(progress_percent("Calculating upgrade... 50%") == 50,
+           "a trailing percent on Calculating upgrade is read");
+    expect(progress_percent("Hit:1 http://deb.example stable InRelease") == -1,
+           "a hit line has no percent");
+    const std::string burst =
+        "28% [1 xz-utils 80.0 kB/267 kB 30%]\r"
+        "                                        \r"
+        "\r"
+        "Inst bash [5.1] (5.2 Debian:12/stable [amd64])\n"
+        "Inst openssl [1] (2 Debian-Security:12/stable-security [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "Need to get 387 MB of archives.\n"
+        "After this operation, 37.5 MB of additional disk space will be used.\n";
+    const SimulateResult parsed = parse_apt_simulate(burst);
+    expect(parsed.packages.size() == 2, "whitespace clear-lines are not packages");
+    expect(parsed.packages[0].name == "bash" && !parsed.packages[0].security,
+           "a stable archive is not a security update");
+    expect(parsed.packages[1].name == "openssl" && parsed.packages[1].security,
+           "a Debian-Security archive is a security update");
+    expect(parsed.packages[1].archive.find("stable-security") != std::string::npos,
+           "the security suite is kept from the Inst line");
+    SimulateResult shown = parsed;
+    shown.status = SimulateResult::Upgrades;
+    apply_download_details(shown, burst);
+    const JobOutcome outcome = outcome_check(shown, 0, true);
+    expect(outcome.status.find("2 updates.") != std::string::npos, "the count matches the Inst rows");
+    expect(outcome.status.find("1 of these is a security update.") != std::string::npos,
+           "security updates are counted");
+    expect(outcome.status.find("Need to get 387 MB of archives.") != std::string::npos,
+           "a real download size is kept");
+    expect(outcome.status.find("After this operation, 37.5 MB of additional disk space will be used.") !=
+               std::string::npos,
+           "a non-zero disk sentence is kept");
+    const std::string noble =
+        "Inst openjdk-17-jre-headless [21.0.11] (21.0.12.1+1-1~24.04.4 Ubuntu:24.04/noble-security [amd64])\n";
+    PackageUpgrade noble_pkg;
+    expect(parse_inst_line(noble, noble_pkg) && noble_pkg.security,
+           "a suite ending in -security is a security update");
+    const std::string release =
+        "Origin: Debian-Security\nLabel: Debian-Security\nSuite: stable-security\nCodename: bookworm-security\n";
+    expect(release_text_is_security(release), "a Debian-Security Release file is security");
+    expect(!release_text_is_security("Origin: Debian\nLabel: Debian\nSuite: stable\nCodename: bookworm\n"),
+           "a stable Release file is not security");
+    expect(release_text_is_security("Origin: Ubuntu\nLabel: Ubuntu\nSuite: noble-security\nCodename: noble\n"),
+           "a suite ending in -security marks the Release file");
+    expect(release_text_is_security("Origin: Example\nLabel: Example-Security\nSuite: updates\n"),
+           "a label ending in -security marks the Release file");
+    std::vector<std::string> ids;
+    collect_security_ids(release, ids);
+    expect(!ids.empty(), "security ids are collected from the Release file");
+    PackageUpgrade plain;
+    plain.name = "libssl3";
+    plain.archive = "Debian-Security:12/stable-security";
+    std::vector<PackageUpgrade> rows = {plain};
+    apply_security_ids(rows, ids);
+    expect(rows[0].security, "a package is marked from the Release ids");
+    SimulateResult reboot;
+    reboot.status = SimulateResult::Success;
+    reboot.reboot_required = true;
+    reboot.reboot_pkgs.push_back("linux-image-amd64");
+    const JobOutcome installed = outcome_install(reboot, 0, false);
+    expect(installed.offer_restart, "a reboot flag offers Restart");
+    expect(!outcome_install(SimulateResult{}, 0, false).offer_restart,
+           "an install without a reboot flag does not offer Restart");
+    const std::string proto = format_protocol(shown);
+    expect(proto.find("SEC openssl\n") != std::string::npos, "SEC protocol line");
+    expect(proto.find("DISK After this operation, 37.5 MB of additional disk space will be used.\n") !=
+               std::string::npos,
+           "DISK protocol line");
+    const SimulateResult back = parse_protocol(proto);
+    expect(back.packages.size() == 2 && back.packages[1].security && !back.packages[0].security,
+           "SEC round trip marks only the security package");
+    expect(back.disk_use.find("37.5 MB") != std::string::npos, "DISK round trip");
+    expect(back.download_need.find("387 MB") != std::string::npos, "NEED round trip keeps apt's line");
   }
 
   if (g_fails != 0) {

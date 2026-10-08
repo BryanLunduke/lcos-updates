@@ -154,13 +154,14 @@ test(
   args: [files('tests/test-policy.py'), files('data/org.lunduke.lcos-updates.policy')],
 )
 
-# The production GUI must not contain the test-only pkexec override.
+# The production GUI must not contain the test-only pkexec or loginctl
+# overrides, and it must not name systemctl.
 test(
   'production-pkexec-has-no-test-override',
   find_program('python3'),
   args: [
     '-c',
-    'import pathlib,sys; d=pathlib.Path(sys.argv[1]).read_bytes(); sys.exit(0 if b"LCOS_UPDATES_TEST_PKEXEC" not in d else 1)',
+    'import pathlib,sys; d=pathlib.Path(sys.argv[1]).read_bytes(); bad=(b"LCOS_UPDATES_TEST_PKEXEC", b"LCOS_UPDATES_TEST_LOGINCTL", b"systemctl"); sys.exit(0 if not any(x in d for x in bad) else 1)',
     lcos_updates.full_path(),
   ],
 )

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sstream>
@@ -382,9 +383,16 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     }
     return clean;
   };
+  /* Apt's clear-line is spaces or a bare carriage return. Inst and Conf lines
+   * are the simulator's plan, not a status. Neither replaces a real percent. */
+  auto drop_progress = [](const std::string& clean) {
+    if (!progress_line_visible(clean))
+      return true;
+    return clean.compare(0, 5, "Inst ") == 0 || clean.compare(0, 5, "Conf ") == 0;
+  };
   /* By value: flush passes progress_pending, and this clears that string. */
   auto publish_progress = [&](std::string clean) {
-    if (!forward_progress || clean.empty())
+    if (!forward_progress || drop_progress(clean))
       return;
     struct timespec now {};
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -394,7 +402,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     write_all_fd(STDERR_FILENO, "PROGRESS " + clean + "\n");
   };
   auto emit_progress = [&](const std::string& clean) {
-    if (!forward_progress || clean.empty())
+    if (!forward_progress || drop_progress(clean))
       return;
     if (did_progress && elapsed_ms(last_progress) < 200) {
       progress_pending = clean;
@@ -408,7 +416,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (force && !progress_hold.empty()) {
       const std::string clean = clean_progress(progress_hold);
       progress_hold.clear();
-      if (!clean.empty())
+      if (!drop_progress(clean))
         progress_pending = clean;
     }
     if (progress_pending.empty())
@@ -1311,7 +1319,339 @@ bool note_download_size(SimulateResult& result)
   g_dpkg_committed = saved_commit;
   if (rc == -3 || stop_requested())
     return false;
-  result.download_need = parse_download_need(out + "\n" + err);
+  apply_download_details(result, out + "\n" + err);
+  return true;
+}
+
+const char* lists_directory()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_LISTS_DIR");
+    if (env != nullptr && env[0] == '/')
+      return env;
+  }
+  return "/var/lib/apt/lists";
+}
+
+/* Non-root tests set this. Root always uses the system directory, so a
+ * caller cannot point the helper at another tree. */
+const char* check_state_directory()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_STATE_DIR");
+    if (env != nullptr && env[0] == '/')
+      return env;
+    return nullptr;
+  }
+  return "/var/lib/lcos-updates";
+}
+
+void mix_hash(unsigned long long& hash, const std::string& text)
+{
+  for (unsigned char ch : text) {
+    hash ^= ch;
+    hash *= 1099511628211ull;
+  }
+}
+
+std::string fingerprint_hex(unsigned long long hash)
+{
+  static const char* digits = "0123456789abcdef";
+  std::string out(16, '0');
+  for (int i = 15; i >= 0; --i) {
+    out[static_cast<std::size_t>(i)] = digits[hash & 0xfull];
+    hash >>= 4;
+  }
+  return out;
+}
+
+bool release_filename(const char* name)
+{
+  const std::size_t n = std::strlen(name);
+  return n >= 7 && std::strcmp(name + (n - 7), "Release") == 0;
+}
+
+/* Path, mtime, and size of each list file, plus the text of Release files.
+ * Empty when the directory is missing or has no list files: the install
+ * then takes the full apt-get update path. */
+std::string lists_fingerprint()
+{
+  const char* dir = lists_directory();
+  DIR* listing = opendir(dir);
+  if (listing == nullptr)
+    return {};
+  std::vector<std::string> rows;
+  std::vector<std::string> releases;
+  while (const dirent* ent = readdir(listing)) {
+    if (ent->d_name[0] == '\0' || ent->d_name[0] == '.')
+      continue;
+    if (std::strcmp(ent->d_name, "lock") == 0 || std::strcmp(ent->d_name, "partial") == 0)
+      continue;
+    const std::string path = std::string(dir) + "/" + ent->d_name;
+    struct stat st {};
+    if (lstat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+      continue;
+    std::ostringstream row;
+    row << ent->d_name << "\t" << static_cast<long long>(st.st_mtim.tv_sec) << "\t"
+        << static_cast<long long>(st.st_mtim.tv_nsec) << "\t" << static_cast<long long>(st.st_size)
+        << "\n";
+    rows.push_back(row.str());
+    if (release_filename(ent->d_name))
+      releases.push_back(read_limited(path.c_str(), 256 * 1024));
+  }
+  closedir(listing);
+  if (rows.empty())
+    return {};
+  std::sort(rows.begin(), rows.end());
+  std::sort(releases.begin(), releases.end());
+  unsigned long long hash = 14695981039346656037ull;
+  for (const auto& row : rows)
+    mix_hash(hash, row);
+  for (const auto& body : releases)
+    mix_hash(hash, body);
+  return fingerprint_hex(hash);
+}
+
+void mark_security(SimulateResult& result)
+{
+  const char* dir = lists_directory();
+  DIR* listing = opendir(dir);
+  std::vector<std::string> ids;
+  if (listing != nullptr) {
+    while (const dirent* ent = readdir(listing)) {
+      if (ent->d_name[0] == '\0' || ent->d_name[0] == '.')
+        continue;
+      if (!release_filename(ent->d_name))
+        continue;
+      const std::string path = std::string(dir) + "/" + ent->d_name;
+      struct stat st {};
+      if (lstat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+        continue;
+      collect_security_ids(read_limited(path.c_str(), 256 * 1024), ids);
+    }
+    closedir(listing);
+  }
+  apply_security_ids(result.packages, ids);
+}
+
+struct CheckSnap {
+  std::string fingerprint;
+  std::vector<std::string> kept;
+  std::vector<std::string> unclassified;
+  std::vector<std::string> phased;
+  std::vector<std::string> held;
+  std::vector<SimulateResult::KeptRemoval> removals;
+};
+
+bool good_snap_name(const std::string& name)
+{
+  return valid_pin(name + "=1");
+}
+
+std::string check_state_path()
+{
+  const char* dir = check_state_directory();
+  if (dir == nullptr)
+    return {};
+  return std::string(dir) + "/last-check";
+}
+
+void save_check_snap(const SimulateResult& result)
+{
+  const char* dir = check_state_directory();
+  const std::string fingerprint = lists_fingerprint();
+  if (dir == nullptr || fingerprint.empty())
+    return;
+  if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+    return;
+  const std::string path = std::string(dir) + "/last-check";
+  const std::string tmp = path + ".tmp";
+  const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+  if (fd < 0)
+    return;
+  std::ostringstream body;
+  body << "FINGERPRINT " << fingerprint << "\n";
+  for (const auto& name : result.kept_back) {
+    if (good_snap_name(name))
+      body << "KEPT " << name << "\n";
+  }
+  for (const auto& name : result.unclassified) {
+    if (good_snap_name(name))
+      body << "UNCLASSIFIED " << name << "\n";
+  }
+  for (const auto& name : result.phased) {
+    if (good_snap_name(name))
+      body << "PHASED " << name << "\n";
+  }
+  for (const auto& name : result.held) {
+    if (good_snap_name(name))
+      body << "HELD " << name << "\n";
+  }
+  for (const auto& removal : result.kept_removals) {
+    if (!good_snap_name(removal.package))
+      continue;
+    body << "REMOVE " << removal.package;
+    for (const auto& victim : removal.removes) {
+      if (good_snap_name(victim))
+        body << " " << victim;
+    }
+    body << "\n";
+  }
+  const std::string text = body.str();
+  const char* p = text.data();
+  std::size_t left = text.size();
+  bool ok = true;
+  while (left > 0) {
+    const ssize_t n = write(fd, p, left);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      ok = false;
+      break;
+    }
+    p += n;
+    left -= static_cast<std::size_t>(n);
+  }
+  if (ok && fchmod(fd, 0600) != 0)
+    ok = false;
+  if (close(fd) != 0)
+    ok = false;
+  if (!ok || rename(tmp.c_str(), path.c_str()) != 0)
+    unlink(tmp.c_str());
+}
+
+bool load_check_snap(CheckSnap& snap)
+{
+  const std::string path = check_state_path();
+  if (path.empty())
+    return false;
+  const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+  if (fd < 0)
+    return false;
+  struct stat st {};
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(fd);
+    return false;
+  }
+  std::string text;
+  char buf[4096];
+  while (text.size() < 1024 * 1024) {
+    const ssize_t n = read(fd, buf, sizeof buf);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      close(fd);
+      return false;
+    }
+    if (n == 0)
+      break;
+    text.append(buf, static_cast<std::size_t>(n));
+  }
+  close(fd);
+  snap = CheckSnap{};
+  std::istringstream in(text);
+  std::string line;
+  bool saw_fp = false;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line.compare(0, 12, "FINGERPRINT ") == 0) {
+      snap.fingerprint = line.substr(12);
+      if (snap.fingerprint.empty() || snap.fingerprint.size() > 64)
+        return false;
+      for (char ch : snap.fingerprint) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch)))
+          return false;
+      }
+      saw_fp = true;
+    } else if (line.compare(0, 5, "KEPT ") == 0) {
+      const std::string name = line.substr(5);
+      if (!good_snap_name(name))
+        return false;
+      snap.kept.push_back(name);
+    } else if (line.compare(0, 13, "UNCLASSIFIED ") == 0) {
+      const std::string name = line.substr(13);
+      if (!good_snap_name(name))
+        return false;
+      snap.unclassified.push_back(name);
+    } else if (line.compare(0, 7, "PHASED ") == 0) {
+      const std::string name = line.substr(7);
+      if (!good_snap_name(name))
+        return false;
+      snap.phased.push_back(name);
+    } else if (line.compare(0, 5, "HELD ") == 0) {
+      const std::string name = line.substr(5);
+      if (!good_snap_name(name))
+        return false;
+      snap.held.push_back(name);
+    } else if (line.compare(0, 7, "REMOVE ") == 0) {
+      std::istringstream ps(line.substr(7));
+      SimulateResult::KeptRemoval removal;
+      if (!(ps >> removal.package) || !good_snap_name(removal.package))
+        return false;
+      std::string victim;
+      while (ps >> victim) {
+        if (!good_snap_name(victim))
+          return false;
+        removal.removes.push_back(victim);
+      }
+      snap.removals.push_back(removal);
+    } else if (!line.empty()) {
+      return false;
+    }
+  }
+  return saw_fp;
+}
+
+std::vector<std::string> sorted_copy(std::vector<std::string> names)
+{
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+bool same_names(std::vector<std::string> left, std::vector<std::string> right)
+{
+  return sorted_copy(std::move(left)) == sorted_copy(std::move(right));
+}
+
+bool classification_matches(const SimulateResult& sim, const CheckSnap& snap)
+{
+  std::vector<std::string> pending = snap.kept;
+  for (const auto& removal : snap.removals)
+    pending.push_back(removal.package);
+  for (const auto& name : snap.unclassified)
+    pending.push_back(name);
+  return same_names(sim.kept_back, pending) && same_names(sim.held, snap.held) &&
+         same_names(sim.phased, snap.phased);
+}
+
+void apply_classification(SimulateResult& sim, const CheckSnap& snap)
+{
+  sim.kept_back = snap.kept;
+  sim.unclassified = snap.unclassified;
+  sim.kept_removals = snap.removals;
+  sim.held = snap.held;
+  sim.phased = snap.phased;
+}
+
+void add_warning(std::string& warning, const std::string& note)
+{
+  if (note.empty())
+    return;
+  if (warning.empty())
+    warning = note;
+  else
+    warning += "\n" + note;
+}
+
+const char kListsChanged[] = "Package lists changed since the check. Checking again.";
+
+bool run_simulation(const std::string& apt, std::string& out, std::string& err, int& rc)
+{
+  const std::vector<const char*> sim_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "-s", "-q",
+                                             "upgrade"};
+  const AptClock sim_clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+  rc = run_apt(sim_argv, sim_clock.idle_sec, sim_clock.hard_sec, out, err, false);
   return true;
 }
 
@@ -1361,6 +1701,7 @@ int do_simulate()
 
   SimulateResult result = parse_apt_simulate(out + "\n" + err);
   note_holds(result);
+  mark_security(result);
   if (!classify_kept_removals(result, nullptr, true)) {
     emit_error("Update check was cancelled");
     return 1;
@@ -1371,6 +1712,7 @@ int do_simulate()
   }
   if (!update_warning.empty())
     result.warning = update_warning;
+  save_check_snap(result);
   emit(result);
   return result.status == SimulateResult::Error ? 1 : 0;
 }
@@ -1382,37 +1724,79 @@ int do_upgrade(const std::vector<std::string>& pins)
     return 1;
   }
   announce_ready();
-  emit_phase("refresh");
+
+  /* Reuse the check when the list files still match it. The safety
+   * simulation and the name=version pins still run. A different list, or a
+   * kept-back set the check did not classify, takes the full path. */
+  CheckSnap snap;
+  const bool have_check = load_check_snap(snap);
+  const std::string lists_now = lists_fingerprint();
+  const bool lists_same =
+      have_check && !snap.fingerprint.empty() && !lists_now.empty() && snap.fingerprint == lists_now;
+  std::string fallback_note;
 
   std::string update_warning;
-  if (!refresh_package_lists("Install was cancelled",
-                             "Timed out while refreshing package lists", update_warning))
-    return 1;
-  if (stop_requested()) {
-    emit_error("Install was cancelled");
-    return 1;
+  if (!lists_same) {
+    if (have_check)
+      fallback_note = kListsChanged;
+    emit_phase("refresh");
+    if (!refresh_package_lists("Install was cancelled",
+                               "Timed out while refreshing package lists", update_warning))
+      return 1;
+    if (stop_requested()) {
+      emit_error("Install was cancelled");
+      return 1;
+    }
   }
 
-  /* Confirm the reviewed set against the indexes just fetched. A different
-   * set is returned to the window and nothing is installed. */
+  /* Confirm the reviewed set. A different set is returned and nothing is installed. */
   emit_phase("simulate");
   const std::string apt = apt_get_path();
   std::string out;
   std::string err;
-  const std::vector<const char*> sim_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "-s", "-q",
-                                             "upgrade"};
-  const AptClock sim_clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
-  int rc = run_apt(sim_argv, sim_clock.idle_sec, sim_clock.hard_sec, out, err, false);
+  int rc = 0;
+  run_simulation(apt, out, err, rc);
   if (fail_apt(rc, out, err, "Install was cancelled",
                "Timed out while simulating apt-get upgrade", update_warning) != 0)
     return 1;
 
   SimulateResult sim = parse_apt_simulate(out + "\n" + err);
   note_holds(sim);
-  if (!classify_kept_removals(sim, nullptr, true)) {
-    emit_error("Install was cancelled");
-    return 1;
+  mark_security(sim);
+  const bool reuse = lists_same && classification_matches(sim, snap);
+  if (reuse) {
+    apply_classification(sim, snap);
+  } else {
+    if (have_check)
+      fallback_note = kListsChanged;
+    /* Lists matched, but the kept-back set did not. Run the update that was
+     * skipped, then simulate and classify again. */
+    if (lists_same && have_check) {
+      emit_phase("refresh");
+      if (!refresh_package_lists("Install was cancelled",
+                                 "Timed out while refreshing package lists", update_warning))
+        return 1;
+      if (stop_requested()) {
+        emit_error("Install was cancelled");
+        return 1;
+      }
+      emit_phase("simulate");
+      out.clear();
+      err.clear();
+      run_simulation(apt, out, err, rc);
+      if (fail_apt(rc, out, err, "Install was cancelled",
+                   "Timed out while simulating apt-get upgrade", update_warning) != 0)
+        return 1;
+      sim = parse_apt_simulate(out + "\n" + err);
+      note_holds(sim);
+      mark_security(sim);
+    }
+    if (!classify_kept_removals(sim, nullptr, true)) {
+      emit_error("Install was cancelled");
+      return 1;
+    }
   }
+  add_warning(sim.warning, fallback_note);
   if (sim.status == SimulateResult::Error) {
     std::string msg = sim.error_msg.empty() ? first_error_line(out, err) : sim.error_msg;
     if (!update_warning.empty())
@@ -1422,12 +1806,12 @@ int do_upgrade(const std::vector<std::string>& pins)
   }
   if (!same_package_set(sim.packages, pins)) {
     sim.install_skipped = true;
-    const std::string note =
+    std::string note =
         "The package list changed after refreshing indexes. Nothing was installed.";
+    add_warning(note, fallback_note);
     if (!update_warning.empty())
-      sim.warning = update_warning + "\n" + note;
-    else
-      sim.warning = note;
+      note = update_warning + "\n" + note;
+    sim.warning = note;
     emit(sim);
     return 0;
   }
@@ -1484,6 +1868,7 @@ int do_upgrade(const std::vector<std::string>& pins)
   result.conffiles_kept = parsed.conffiles_kept;
   result.packages = parsed.packages;
   result.warning = update_warning;
+  add_warning(result.warning, fallback_note);
   const bool summary_seen = parsed.upgraded_count >= 0 || parsed.not_upgraded_count >= 0;
   result.summary_missing = !summary_seen;
   const bool kept = !result.kept_back.empty() || !result.phased.empty() || !result.held.empty() ||

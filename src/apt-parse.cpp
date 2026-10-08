@@ -7,6 +7,7 @@
 #include "apt-parse.hpp"
 
 #include <cctype>
+#include <cstring>
 #include <sstream>
 
 static std::string trim_cr(std::string line)
@@ -34,6 +35,8 @@ static std::string normalize_breaks(std::string text)
   }
   return out;
 }
+
+static bool archive_is_security(const std::string& archive);
 
 static std::string lower_copy(std::string text)
 {
@@ -95,7 +98,288 @@ bool parse_inst_line(const std::string& raw, PackageUpgrade& out)
   if (ver_end == std::string::npos || ver_end == 0)
     return false;
   out.new_version = rest.substr(0, ver_end);
+  rest = rest.substr(ver_end);
+  while (!rest.empty() && rest[0] == ' ')
+    rest.erase(0, 1);
+  if (!rest.empty() && rest[0] != ')') {
+    const std::string::size_type arch = rest.find_first_of(" )");
+    out.archive = arch == std::string::npos ? rest : rest.substr(0, arch);
+  }
+  out.security = archive_is_security(out.archive);
   return !out.name.empty() && !out.new_version.empty();
+}
+
+static bool ends_ci(const std::string& text, const char* suffix)
+{
+  const std::size_t n = std::strlen(suffix);
+  if (text.size() < n)
+    return false;
+  for (std::size_t i = 0; i < n; ++i) {
+    const unsigned char a = static_cast<unsigned char>(text[text.size() - n + i]);
+    const unsigned char b = static_cast<unsigned char>(suffix[i]);
+    if (std::tolower(a) != std::tolower(b))
+      return false;
+  }
+  return true;
+}
+
+static bool eq_ci(const std::string& text, const char* other)
+{
+  const std::size_t n = std::strlen(other);
+  if (text.size() != n)
+    return false;
+  return ends_ci(text, other);
+}
+
+/* Origin "Debian-Security", or a suite / label / codename ending in -security.
+ * The Inst token is "Origin:version/suite". */
+static bool archive_is_security(const std::string& archive)
+{
+  if (archive.empty())
+    return false;
+  const std::string::size_type slash = archive.find('/');
+  const std::string left = slash == std::string::npos ? archive : archive.substr(0, slash);
+  const std::string suite = slash == std::string::npos ? std::string() : archive.substr(slash + 1);
+  const std::string::size_type colon = left.find(':');
+  const std::string origin = colon == std::string::npos ? left : left.substr(0, colon);
+  if (eq_ci(origin, "Debian-Security") || ends_ci(origin, "-security"))
+    return true;
+  if (ends_ci(suite, "-security") || ends_ci(left, "-security"))
+    return true;
+  return false;
+}
+
+bool progress_line_visible(const std::string& line)
+{
+  for (unsigned char ch : line) {
+    if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' && ch != '\f' && ch != '\v')
+      return true;
+  }
+  return false;
+}
+
+static int percent_at(const std::string& line, std::size_t begin, std::size_t end)
+{
+  if (begin >= end || end > line.size())
+    return -1;
+  int value = 0;
+  for (std::size_t i = begin; i < end; ++i) {
+    const unsigned char ch = static_cast<unsigned char>(line[i]);
+    if (!std::isdigit(ch))
+      return -1;
+    value = value * 10 + (line[i] - '0');
+    if (value > 100)
+      return -1;
+  }
+  return value;
+}
+
+int progress_percent(const std::string& line)
+{
+  std::size_t i = 0;
+  while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
+    ++i;
+  std::size_t end = i;
+  while (end < line.size() && std::isdigit(static_cast<unsigned char>(line[end])))
+    ++end;
+  if (end > i && end < line.size() && line[end] == '%') {
+    const int lead = percent_at(line, i, end);
+    if (lead >= 0)
+      return lead;
+  }
+  if (line.empty() || line.back() != '%')
+    return -1;
+  std::size_t digit = line.size() - 1;
+  if (digit == 0)
+    return -1;
+  --digit;
+  if (!std::isdigit(static_cast<unsigned char>(line[digit])))
+    return -1;
+  const std::size_t stop = digit + 1;
+  while (digit > 0 && std::isdigit(static_cast<unsigned char>(line[digit - 1])))
+    --digit;
+  return percent_at(line, digit, stop);
+}
+
+static std::string field_value(const std::string& text, const char* key)
+{
+  const std::string prefix = std::string(key) + ":";
+  std::istringstream in(text);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line.compare(0, prefix.size(), prefix) != 0)
+      continue;
+    std::string value = line.substr(prefix.size());
+    while (!value.empty() && (value[0] == ' ' || value[0] == '\t'))
+      value.erase(0, 1);
+    const std::string::size_type cut = value.find_first_of(" \t");
+    if (cut != std::string::npos)
+      value.resize(cut);
+    return value;
+  }
+  return {};
+}
+
+bool release_text_is_security(const std::string& text)
+{
+  const std::string origin = field_value(text, "Origin");
+  const std::string label = field_value(text, "Label");
+  const std::string suite = field_value(text, "Suite");
+  const std::string codename = field_value(text, "Codename");
+  if (eq_ci(origin, "Debian-Security"))
+    return true;
+  if (ends_ci(label, "-security") || ends_ci(suite, "-security") || ends_ci(codename, "-security"))
+    return true;
+  return false;
+}
+
+void collect_security_ids(const std::string& text, std::vector<std::string>& ids)
+{
+  if (!release_text_is_security(text))
+    return;
+  const char* keys[] = {"Origin", "Label", "Suite", "Codename"};
+  for (const char* key : keys) {
+    const std::string value = field_value(text, key);
+    if (value.size() < 8)
+      continue;
+    if (!eq_ci(value, "Debian-Security") && !ends_ci(value, "-security"))
+      continue;
+    bool seen = false;
+    for (const auto& have : ids) {
+      if (have == value)
+        seen = true;
+    }
+    if (!seen)
+      ids.push_back(value);
+  }
+}
+
+void apply_security_ids(std::vector<PackageUpgrade>& packages, const std::vector<std::string>& ids)
+{
+  for (auto& pkg : packages) {
+    if (pkg.security || archive_is_security(pkg.archive)) {
+      pkg.security = true;
+      continue;
+    }
+    for (const auto& id : ids) {
+      if (!pkg.archive.empty() && pkg.archive.find(id) != std::string::npos)
+        pkg.security = true;
+    }
+  }
+}
+
+static std::string format_byte_size(unsigned long long bytes)
+{
+  if (bytes < 1000)
+    return std::to_string(bytes) + " B";
+  const char* unit = "kB";
+  double value = static_cast<double>(bytes) / 1000.0;
+  if (bytes >= 1000ull * 1000ull * 1000ull) {
+    value = static_cast<double>(bytes) / 1000000000.0;
+    unit = "GB";
+  } else if (bytes >= 1000ull * 1000ull) {
+    value = static_cast<double>(bytes) / 1000000.0;
+    unit = "MB";
+  }
+  std::ostringstream out;
+  out.setf(std::ios::fixed);
+  out.precision(1);
+  out << value << " " << unit;
+  return out.str();
+}
+
+static bool split_deb_filename(const std::string& file, std::string& name, std::string& version)
+{
+  if (file.size() < 5 || file.compare(file.size() - 4, 4, ".deb") != 0)
+    return false;
+  const std::string stem = file.substr(0, file.size() - 4);
+  const std::string::size_type us2 = stem.rfind('_');
+  if (us2 == std::string::npos || us2 == 0)
+    return false;
+  const std::string::size_type us1 = stem.rfind('_', us2 - 1);
+  if (us1 == std::string::npos || us1 == 0)
+    return false;
+  name = stem.substr(0, us1);
+  version = stem.substr(us1 + 1, us2 - us1 - 1);
+  return !name.empty() && !version.empty();
+}
+
+void apply_download_details(SimulateResult& result, const std::string& text)
+{
+  const std::string need = parse_download_need(text);
+  if (!need.empty())
+    result.download_need = need;
+  std::istringstream in(normalize_breaks(text));
+  std::string line;
+  while (std::getline(in, line)) {
+    line = trim_cr(line);
+    if (result.disk_use.empty() && line.compare(0, 20, "After this operation") == 0)
+      result.disk_use = line;
+    if (line.size() < 6 || line.find(".deb") == std::string::npos)
+      continue;
+    std::istringstream fields(line);
+    std::string quoted;
+    std::string file;
+    std::string bytes_text;
+    if (!(fields >> quoted >> file >> bytes_text))
+      continue;
+    unsigned long long bytes = 0;
+    bool digits = !bytes_text.empty();
+    for (char ch : bytes_text) {
+      if (!std::isdigit(static_cast<unsigned char>(ch))) {
+        digits = false;
+        break;
+      }
+      bytes = bytes * 10ull + static_cast<unsigned long long>(ch - '0');
+    }
+    if (!digits)
+      continue;
+    std::string name;
+    std::string version;
+    if (!split_deb_filename(file, name, version))
+      continue;
+    for (auto& pkg : result.packages) {
+      if (pkg.name == name && pkg.new_version == version)
+        pkg.size = format_byte_size(bytes);
+    }
+  }
+}
+
+std::string present_download_need(const std::string& text)
+{
+  std::istringstream in(text);
+  std::string line;
+  std::string out;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line.empty())
+      continue;
+    std::string shown = line;
+    const std::string prefix = "Need to get ";
+    if (line.compare(0, prefix.size(), prefix) == 0) {
+      const std::string rest = line.substr(prefix.size());
+      if (rest.compare(0, 4, "0 B/") == 0) {
+        std::string size = rest.substr(4);
+        const std::string::size_type of = size.find(" of archives");
+        if (of != std::string::npos)
+          size.resize(of);
+        while (!size.empty() && size.back() == '.')
+          size.pop_back();
+        shown = size.empty() ? "The packages are already downloaded."
+                             : "The packages are already downloaded (" + size + ").";
+      } else if (rest.compare(0, 4, "0 B ") == 0 || rest == "0 B of archives." ||
+                 rest == "0 B of archives") {
+        shown = "The packages are already downloaded.";
+      }
+    }
+    if (!out.empty())
+      out += " ";
+    out += shown;
+  }
+  return out;
 }
 
 static int integer_before(const std::string& line, std::string::size_type word)
@@ -432,6 +716,14 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
         out << "NEED " << need << "\n";
     }
   }
+  if (!result.disk_use.empty())
+    out << "DISK " << result.disk_use << "\n";
+  for (const auto& pkg : result.packages) {
+    if (pkg.security)
+      out << "SEC " << pkg.name << "\n";
+    if (!pkg.size.empty())
+      out << "SIZE " << pkg.name << " " << pkg.size << "\n";
+  }
   for (const auto& name : result.phased)
     out << "PHASED " << name << "\n";
   for (const auto& name : result.held)
@@ -506,6 +798,8 @@ SimulateResult parse_protocol(const std::string& text)
   result.status = SimulateResult::Error;
   result.error_msg = "No STATUS from helper";
   bool saw_status = false;
+  std::vector<std::string> security_names;
+  std::vector<std::pair<std::string, std::string>> sizes;
 
   std::istringstream in(text);
   std::string line;
@@ -567,6 +861,25 @@ SimulateResult parse_protocol(const std::string& text)
         else
           result.download_need += "\n" + need;
       }
+    } else if (line.compare(0, 5, "DISK ") == 0) {
+      const std::string disk = line.substr(5);
+      if (!disk.empty())
+        result.disk_use = disk;
+    } else if (line.compare(0, 4, "SEC ") == 0) {
+      const std::string name = line.substr(4);
+      if (!name.empty())
+        security_names.push_back(name);
+    } else if (line.compare(0, 5, "SIZE ") == 0) {
+      std::istringstream ps(line.substr(5));
+      std::string name;
+      std::string size;
+      if (ps >> name) {
+        std::getline(ps, size);
+        while (!size.empty() && size[0] == ' ')
+          size.erase(0, 1);
+        if (!name.empty() && !size.empty())
+          sizes.emplace_back(name, size);
+      }
     } else if (line.compare(0, 7, "PHASED ") == 0) {
       const std::string name = line.substr(7);
       if (!name.empty())
@@ -627,6 +940,17 @@ SimulateResult parse_protocol(const std::string& text)
       PackageUpgrade pkg;
       if (ps >> pkg.name >> pkg.old_version >> pkg.new_version)
         result.packages.push_back(pkg);
+    }
+  }
+
+  for (auto& pkg : result.packages) {
+    for (const auto& name : security_names) {
+      if (name == pkg.name)
+        pkg.security = true;
+    }
+    for (const auto& size : sizes) {
+      if (size.first == pkg.name)
+        pkg.size = size.second;
     }
   }
 
@@ -967,7 +1291,8 @@ std::string describe_remaining(const SimulateResult& result)
     add("These packages are held: " + join_names(result.held) + ".");
   add(removal_sentence(result));
   if (!result.unclassified.empty())
-    add("Some kept-back packages were not classified: " + join_names(result.unclassified) + ".");
+    add("These updates were not included and will be offered on a later check: " +
+        join_names(result.unclassified) + ".");
   if (!result.kept_back.empty())
     add("This tool will not install updates that need extra packages: " + join_names(result.kept_back) +
         ".");
@@ -1064,9 +1389,23 @@ JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_
   if (result.status == SimulateResult::Upgrades && !result.packages.empty()) {
     out.packages = PackageListAction::Show;
     out.install_enabled = true;
-    std::string status = "Updates are available.";
-    if (!result.download_need.empty())
-      status += " " + result.download_need;
+    const std::size_t count = result.packages.size();
+    std::string status = std::to_string(count);
+    status += count == 1 ? " update." : " updates.";
+    int security = 0;
+    for (const auto& pkg : result.packages) {
+      if (pkg.security)
+        ++security;
+    }
+    if (security == 1)
+      status += " 1 of these is a security update.";
+    else if (security > 1)
+      status += " " + std::to_string(security) + " of these are security updates.";
+    const std::string need = present_download_need(result.download_need);
+    if (!need.empty())
+      status += " " + need;
+    if (!result.disk_use.empty())
+      status += " " + result.disk_use;
     const std::string kept = describe_remaining(result);
     if (!kept.empty())
       status += " " + kept;
@@ -1152,6 +1491,7 @@ JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool hav
   append_sentence(status, pending);
   out.packages = PackageListAction::Hide;
   out.install_enabled = false;
+  out.offer_restart = result.reboot_required;
   out.status = with_warning_text(status, result.warning, JobKind::Install);
   return out;
 }

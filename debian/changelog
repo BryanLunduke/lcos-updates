@@ -1,3 +1,19 @@
+lcos-updates (0.9-7) unstable; urgency=medium
+
+  * Download progress no longer blanks when apt clears the line, and the
+    status names the package being downloaded.
+  * The package list lines up name, versions and size, and the count is
+    the number of rows. Security updates are marked and counted.
+  * Cancelling or closing while packages are still downloading asks first.
+    Once dpkg has started, Close leaves the install running.
+  * Install reuses the last check when the package lists have not changed.
+  * A finished install that needs a restart offers a Restart button.
+    Restart asks first and uses loginctl.
+  * The idle sentence is "Check for updates." Install updates sits at the
+    trailing edge when it is the action that will run.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 16:40:00 +0000
+
 lcos-updates (0.9-6) unstable; urgency=medium
 
   * Cancelling a check while kept-back packages are classified says the
