@@ -89,7 +89,8 @@ fakeroot dpkg-deb --root-owner-group --build "$DEST" "$DEB_DIR/${PKGNAME}.deb"
 # the purge test runs (literal path, purge-only).
 CTRL_TMP="$(mktemp -d)"
 dpkg-deb -I "$DEB_DIR/${PKGNAME}.deb" > "$CTRL_TMP/info"
-if ! grep -E '[[:space:]]postrm$' "$CTRL_TMP/info" >/dev/null; then
+# dpkg-deb -I prints " *  postrm               #!/bin/sh", not a bare name.
+if ! grep -E '[[:space:]]postrm[[:space:]]' "$CTRL_TMP/info" >/dev/null; then
   echo "built deb control archive has no postrm" >&2
   cat "$CTRL_TMP/info" >&2
   exit 1
