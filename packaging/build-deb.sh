@@ -70,6 +70,11 @@ exit 0
 POST
 chmod 0755 "$DEST/DEBIAN/postinst"
 
+# debian/postrm is the purge script. Installed like postinst: executable,
+# in the control archive, not in the data md5sums.
+cp "$ROOT/debian/postrm" "$DEST/DEBIAN/postrm"
+chmod 0755 "$DEST/DEBIAN/postrm"
+
 (
   cd "$DEST"
   find usr -type f -print0 | sort -z | xargs -0 md5sum > DEBIAN/md5sums
@@ -79,5 +84,26 @@ rm -rf "$DEST/debian"
 
 mkdir -p "$DEB_DIR"
 fakeroot dpkg-deb --root-owner-group --build "$DEST" "$DEB_DIR/${PKGNAME}.deb"
+
+# The built deb must contain the postrm, and that copy must be the script
+# the purge test runs (literal path, purge-only).
+CTRL_TMP="$(mktemp -d)"
+dpkg-deb -I "$DEB_DIR/${PKGNAME}.deb" > "$CTRL_TMP/info"
+if ! grep -E '[[:space:]]postrm$' "$CTRL_TMP/info" >/dev/null; then
+  echo "built deb control archive has no postrm" >&2
+  cat "$CTRL_TMP/info" >&2
+  exit 1
+fi
+dpkg-deb -e "$DEB_DIR/${PKGNAME}.deb" "$CTRL_TMP/DEBIAN"
+if [ ! -f "$CTRL_TMP/DEBIAN/postrm" ] || [ ! -x "$CTRL_TMP/DEBIAN/postrm" ]; then
+  echo "built deb is missing an executable postrm" >&2
+  exit 1
+fi
+if ! cmp -s "$ROOT/debian/postrm" "$CTRL_TMP/DEBIAN/postrm"; then
+  echo "deb postrm does not match debian/postrm" >&2
+  exit 1
+fi
+sh "$ROOT/tests/test-postrm.sh" "$CTRL_TMP/DEBIAN/postrm"
+rm -rf "$CTRL_TMP"
 
 echo "built $DEB_DIR/${PKGNAME}.deb"

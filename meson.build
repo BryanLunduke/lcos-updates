@@ -165,3 +165,10 @@ test(
     lcos_updates.full_path(),
   ],
 )
+
+# Purge deletes /var/lib/lcos-updates. remove and upgrade leave it.
+test(
+  'postrm-purge',
+  find_program('sh'),
+  args: [files('tests/test-postrm.sh')],
+)
