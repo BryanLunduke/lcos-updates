@@ -25,6 +25,13 @@ constexpr int kSimulateHardCapSec = 300;
 constexpr int kUpgradeIdleSec = 300;
 constexpr int kUpgradeHardCapSec = 7200;
 
+/* After dpkg has started unpacking or configuring, the helper does not kill
+ * apt on the idle clock or the hard cap. The window instead counts the
+ * current phase and, with no apt or dpkg progress, says the install is still
+ * running. A longer stall downgrades the shutdown inhibitor. */
+constexpr int kStallNoticeSec = 10 * 60;
+constexpr int kStallInhibitSec = 30 * 60;
+
 /* Names kept for the GUI backstop, which must cover the helper hard caps. */
 constexpr int kUpdateTimeoutSec = kUpdateHardCapSec;
 constexpr int kSimulateTimeoutSec = kSimulateHardCapSec;

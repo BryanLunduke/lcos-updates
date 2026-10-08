@@ -1,3 +1,25 @@
+lcos-updates (0.9-5) unstable; urgency=medium
+
+  * Closing after an install that already finished reports that result and
+    does not leave Check stuck. The same outcome text is used for the
+    window and the notification.
+  * A finished install keeps phased, held, and kept-back packages from the
+    check, and says "You're up to date" only when nothing is left.
+  * Once dpkg has started, the install is not killed for idle time or the
+    hard cap. A stall shows how long the phase has run, and after a long
+    stall the shutdown inhibitor is relaxed.
+  * Package-list errors keep apt's own lines. A proxy or offline hint is
+    added only when that cause is plausible.
+  * A full disk shows dpkg's cause. dpkg --configure -a is mentioned only
+    after an interrupted dpkg has exited.
+  * A restart sentence is printed once, after "Updates installed." A
+    reboot-required flag that was already there is not called this install.
+  * A package kept back because another package would be removed is
+    described as a removal.
+  * Apt's carriage-return download progress is shown in the window.
+
+ -- LCOS <lcos@lunduke.com>  Thu, 08 Oct 2026 12:40:00 +0000
+
 lcos-updates (0.9-4) unstable; urgency=medium
 
   * A package-list refresh that fetched nothing is an error, not "up to

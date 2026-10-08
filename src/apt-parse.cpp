@@ -251,16 +251,42 @@ static bool is_hit_or_get(const std::string& line)
   return starts_with(line, "Hit:") || starts_with(line, "Get:");
 }
 
-static bool is_fetch_notice_line(const std::string& line, const std::string& lower)
+static bool is_connect_failure(const std::string& lower)
 {
-  if (starts_with(line, "E:") || starts_with(line, "W:") || starts_with(line, "Err:"))
-    return has(lower, "fail") || has(lower, "timed out") || has(lower, "unable to connect") ||
-           has(lower, "could not connect") || has(lower, "could not resolve") ||
-           has(lower, "temporary failure resolving") || has(lower, "name or service not known") ||
-           has(lower, "network is unreachable") || has(lower, "hash sum mismatch") ||
-           has(lower, "no_pubkey") || has(lower, "404") || has(lower, "index files");
-  return has(lower, "some index files failed to download") || has(lower, "old ones used instead") ||
-         has(lower, "hash sum mismatch") || has(lower, "no_pubkey");
+  return has(lower, "connection timed out") || has(lower, "unable to connect") ||
+         has(lower, "could not connect") || has(lower, "connection refused");
+}
+
+static bool is_resolve_failure(const std::string& lower)
+{
+  return has(lower, "temporary failure resolving") || has(lower, "could not resolve") ||
+         has(lower, "name or service not known") || has(lower, "network is unreachable");
+}
+
+static bool is_apt_diagnostic_line(const std::string& line)
+{
+  return starts_with(line, "E:") || starts_with(line, "W:") || starts_with(line, "Err:") ||
+         starts_with(line, "N:");
+}
+
+/* Keep apt's own lines. Add at most one hint, and only for a total failure
+ * that is a connect problem or a resolve / unreachable network. */
+static std::string append_fetch_hint(std::string detail, bool connect, bool resolve)
+{
+  if (resolve) {
+    if (detail.find(kOfflineHint) == std::string::npos) {
+      if (!detail.empty())
+        detail += "\n";
+      detail += kOfflineHint;
+    }
+    return detail;
+  }
+  if (connect && detail.find(kProxyHint) == std::string::npos) {
+    if (!detail.empty())
+      detail += "\n";
+    detail += kProxyHint;
+  }
+  return detail;
 }
 
 UpdateFetch classify_apt_update(const std::string& text)
@@ -270,7 +296,8 @@ UpdateFetch classify_apt_update(const std::string& text)
   bool fetch_fail = false;
   bool connect = false;
   bool resolve = false;
-  std::string notices;
+  std::string apt_lines;
+  bool keep_next = false;
 
   std::istringstream in(text);
   std::string line;
@@ -283,44 +310,44 @@ UpdateFetch classify_apt_update(const std::string& text)
     const std::string lower = lower_copy(line);
     const bool index_note = has(lower, "some index files failed to download") ||
                             has(lower, "old ones used instead");
-    const bool connect_line = has(lower, "connection timed out") || has(lower, "unable to connect") ||
-                              has(lower, "could not connect");
-    const bool resolve_line = has(lower, "temporary failure resolving") || has(lower, "could not resolve") ||
-                              has(lower, "name or service not known") || has(lower, "network is unreachable");
+    const bool connect_line = is_connect_failure(lower);
+    const bool resolve_line = is_resolve_failure(lower);
     const bool fetch_line = has(lower, "failed to fetch") || has(lower, "hash sum mismatch") ||
-                            has(lower, "no_pubkey") || starts_with(line, "Err:") || index_note ||
-                            connect_line || resolve_line;
+                            has(lower, "no_pubkey") || has(lower, "release file") ||
+                            starts_with(line, "Err:") || index_note || connect_line || resolve_line;
     if (fetch_line)
       fetch_fail = true;
     if (connect_line)
       connect = true;
     if (resolve_line)
       resolve = true;
-    if (!is_fetch_notice_line(line, lower))
+    const bool diagnostic = is_apt_diagnostic_line(line);
+    const bool continuation = keep_next && !line.empty() && (line[0] == ' ' || line[0] == '\t');
+    if (diagnostic || continuation || connect_line || resolve_line) {
+      if (!apt_lines.empty())
+        apt_lines += "\n";
+      apt_lines += line;
+      keep_next = diagnostic || continuation;
       continue;
-    if (!notices.empty())
-      notices += "\n";
-    notices += line;
+    }
+    keep_next = false;
   }
 
   if (!fetch_fail)
     return out;
   /* No Hit: or Get: means nothing was fetched. That includes a dead mirror
-   * whose apt still exits 0, and a resolve failure of every source. */
+   * whose apt still exits 0, and a resolve failure of every source. The apt
+   * lines stay; a hint is only added after them. */
   if (!hit) {
     out.kind = UpdateFetchKind::Total;
-    if (connect && !resolve)
-      out.detail = kProxyHint;
-    else if (resolve)
-      out.detail = kOfflineHint;
-    else if (!notices.empty())
-      out.detail = notices;
-    else
+    if (apt_lines.empty())
       out.detail = "The package lists could not be refreshed.";
+    else
+      out.detail = append_fetch_hint(apt_lines, connect, resolve);
     return out;
   }
   out.kind = UpdateFetchKind::Partial;
-  out.detail = notices;
+  out.detail = apt_lines;
   return out;
 }
 
@@ -384,6 +411,18 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
       out << "REBOOT\n";
     for (const auto& name : result.reboot_pkgs)
       out << "REBOOT " << name << "\n";
+  }
+  if (result.reboot_already) {
+    if (result.reboot_pending_pkgs.empty())
+      out << "REBOOT_ALREADY\n";
+    for (const auto& name : result.reboot_pending_pkgs)
+      out << "REBOOT_ALREADY " << name << "\n";
+  }
+  for (const auto& removal : result.kept_removals) {
+    if (removal.removes.empty())
+      out << "REMOVE " << removal.package << "\n";
+    for (const auto& victim : removal.removes)
+      out << "REMOVE " << removal.package << " " << victim << "\n";
   }
   if (result.summary_missing)
     out << "SUMMARY_MISSING\n";
@@ -494,6 +533,13 @@ SimulateResult parse_protocol(const std::string& text)
       const std::string name = line.substr(5);
       if (!name.empty())
         result.held.push_back(name);
+    } else if (line == "REBOOT_ALREADY") {
+      result.reboot_already = true;
+    } else if (line.compare(0, 15, "REBOOT_ALREADY ") == 0) {
+      result.reboot_already = true;
+      const std::string name = line.substr(15);
+      if (!name.empty())
+        result.reboot_pending_pkgs.push_back(name);
     } else if (line == "REBOOT") {
       result.reboot_required = true;
     } else if (line.compare(0, 7, "REBOOT ") == 0) {
@@ -501,6 +547,26 @@ SimulateResult parse_protocol(const std::string& text)
       const std::string name = line.substr(7);
       if (!name.empty())
         result.reboot_pkgs.push_back(name);
+    } else if (line.compare(0, 7, "REMOVE ") == 0) {
+      std::istringstream ps(line.substr(7));
+      std::string package;
+      std::string victim;
+      if (!(ps >> package))
+        continue;
+      SimulateResult::KeptRemoval* slot = nullptr;
+      for (auto& have : result.kept_removals) {
+        if (have.package == package)
+          slot = &have;
+      }
+      if (slot == nullptr) {
+        result.kept_removals.push_back(SimulateResult::KeptRemoval{});
+        slot = &result.kept_removals.back();
+        slot->package = package;
+      }
+      while (ps >> victim) {
+        if (!victim.empty())
+          slot->removes.push_back(victim);
+      }
     } else if (line == "SUMMARY_MISSING") {
       result.summary_missing = true;
     } else if (line.compare(0, 13, "NOT_UPGRADED ") == 0) {
@@ -530,22 +596,25 @@ SimulateResult parse_protocol(const std::string& text)
   return result;
 }
 
-static std::string friendly_one_line(const std::string& msg, JobKind kind, bool leave_fetch)
+static bool is_helper_timeout_line(const std::string& lower)
+{
+  return has(lower, "timed out while") || has(lower, "timed out waiting");
+}
+
+static std::string map_helper_timeout(JobKind kind)
+{
+  if (kind == JobKind::Install)
+    return "Timed out while installing updates.";
+  return "Timed out waiting for the update check. Check your network and try again.";
+}
+
+static std::string friendly_one_line(const std::string& msg, JobKind kind)
 {
   const std::string lower = lower_copy(msg);
-  /* A partial refresh already says some indexes were skipped. One timed-out
-   * mirror in that text is not "the computer is offline". */
-  if (!leave_fetch && (has(lower, "connection timed out") || has(lower, "unable to connect") ||
-                       has(lower, "could not connect")))
-    return kProxyHint;
-  if (!leave_fetch && (has(lower, "temporary failure resolving") || has(lower, "could not resolve") ||
-                       has(lower, "name or service not known") || has(lower, "network is unreachable")))
-    return kOfflineHint;
-  if (!leave_fetch && (has(lower, "timeout") || has(lower, "timed out"))) {
-    if (kind == JobKind::Install)
-      return "Timed out while installing updates.";
-    return "Timed out waiting for the update check. Check your network and try again.";
-  }
+  /* Helper deadlines stay in the check or install wording. Apt's own
+   * "connection timed out" line is not one of those sentences. */
+  if (is_helper_timeout_line(lower))
+    return map_helper_timeout(kind);
   if (msg.empty())
     return "The update helper failed.";
   return msg;
@@ -554,27 +623,34 @@ static std::string friendly_one_line(const std::string& msg, JobKind kind, bool 
 std::string friendly_job_error(const std::string& msg, JobKind kind)
 {
   const std::string lower = lower_copy(msg);
+  /* A partial refresh already says some indexes were skipped. Do not add a
+   * proxy or offline hint on top of apt's own summary. */
   const bool leave_fetch = has(lower, "some index files failed to download") ||
                            has(lower, "old ones used instead");
-  if (msg.find('\n') == std::string::npos)
-    return friendly_one_line(msg, kind, leave_fetch);
-  std::istringstream in(msg);
-  std::string line;
   std::string out;
-  while (std::getline(in, line)) {
-    line = trim_cr(line);
-    if (line.empty())
-      continue;
-    const std::string one = friendly_one_line(line, kind, leave_fetch);
-    if (one.empty())
-      continue;
-    if (!out.empty())
-      out += "\n";
-    out += one;
+  if (msg.find('\n') == std::string::npos) {
+    out = friendly_one_line(msg, kind);
+  } else {
+    std::istringstream in(msg);
+    std::string line;
+    while (std::getline(in, line)) {
+      line = trim_cr(line);
+      if (line.empty())
+        continue;
+      const std::string one = friendly_one_line(line, kind);
+      if (one.empty())
+        continue;
+      if (!out.empty())
+        out += "\n";
+      out += one;
+    }
+    if (out.empty())
+      out = friendly_one_line(msg, kind);
   }
-  if (out.empty())
-    return friendly_one_line(msg, kind, leave_fetch);
-  return out;
+  if (leave_fetch || is_helper_timeout_line(lower_copy(out)))
+    return out;
+  const std::string shown = lower_copy(out);
+  return append_fetch_hint(out, is_connect_failure(shown), is_resolve_failure(shown));
 }
 
 void apply_held_packages(SimulateResult& result, const std::string& status_text)
@@ -729,4 +805,298 @@ std::string capture_text(const CaptureBuf& cap)
   while (std::getline(preserved, line))
     add_line(trim_cr(line));
   return prefix + cap.data;
+}
+
+static bool is_removed_header(const std::string& line)
+{
+  const std::string header = "The following packages will be REMOVED:";
+  return line.compare(0, header.size(), header) == 0;
+}
+
+static bool is_new_header(const std::string& line)
+{
+  const std::string header = "The following NEW packages will be installed:";
+  return line.compare(0, header.size(), header) == 0;
+}
+
+void parse_removal_plan(const std::string& text, std::vector<std::string>& removed,
+                        std::vector<std::string>& newly)
+{
+  removed.clear();
+  newly.clear();
+  std::istringstream in(text);
+  std::string line;
+  enum class Section { None, Removed, New };
+  Section section = Section::None;
+  while (std::getline(in, line)) {
+    line = trim_cr(line);
+    if (section != Section::None) {
+      if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
+        append_tokens(line, section == Section::Removed ? removed : newly);
+        continue;
+      }
+      section = Section::None;
+    }
+    if (is_removed_header(line)) {
+      section = Section::Removed;
+      const std::string::size_type colon = line.find(':');
+      if (colon != std::string::npos)
+        append_tokens(line.substr(colon + 1), removed);
+      continue;
+    }
+    if (is_new_header(line)) {
+      section = Section::New;
+      const std::string::size_type colon = line.find(':');
+      if (colon != std::string::npos)
+        append_tokens(line.substr(colon + 1), newly);
+    }
+  }
+}
+
+static std::string join_names(const std::vector<std::string>& names)
+{
+  std::string out;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    if (i != 0)
+      out += ", ";
+    out += names[i];
+  }
+  return out;
+}
+
+static std::string removal_sentence(const SimulateResult& result)
+{
+  if (result.kept_removals.empty())
+    return {};
+  std::string out = "This tool will not install updates that would remove packages: ";
+  for (std::size_t i = 0; i < result.kept_removals.size(); ++i) {
+    if (i != 0)
+      out += ", ";
+    const auto& removal = result.kept_removals[i];
+    out += removal.package;
+    if (!removal.removes.empty()) {
+      out += " (would remove ";
+      out += join_names(removal.removes);
+      out += ")";
+    }
+  }
+  out += ".";
+  return out;
+}
+
+std::string describe_remaining(const SimulateResult& result)
+{
+  std::string out;
+  auto add = [&](const std::string& sentence) {
+    if (sentence.empty())
+      return;
+    if (!out.empty())
+      out += " ";
+    out += sentence;
+  };
+  if (!result.phased.empty())
+    add("These updates are waiting and will be offered later: " + join_names(result.phased) + ".");
+  if (!result.held.empty())
+    add("These packages are held: " + join_names(result.held) + ".");
+  add(removal_sentence(result));
+  if (!result.kept_back.empty())
+    add("This tool will not install updates that need extra packages: " + join_names(result.kept_back) +
+        ".");
+  else if (result.phased.empty() && result.held.empty() && result.kept_removals.empty() &&
+           result.not_upgraded_count > 0)
+    add("This tool will not install updates that need extra packages.");
+  return out;
+}
+
+static bool has_remaining(const SimulateResult& result)
+{
+  return !result.kept_back.empty() || !result.phased.empty() || !result.held.empty() ||
+         !result.kept_removals.empty() || result.not_upgraded_count > 0;
+}
+
+std::string kept_headline(const SimulateResult& result)
+{
+  const bool only_phased = !result.phased.empty() && result.kept_back.empty() && result.held.empty() &&
+                           result.kept_removals.empty();
+  const bool only_held = !result.held.empty() && result.kept_back.empty() && result.phased.empty() &&
+                         result.kept_removals.empty();
+  const bool only_removal = !result.kept_removals.empty() && result.kept_back.empty() &&
+                            result.phased.empty() && result.held.empty();
+  const std::string detail = describe_remaining(result);
+  if (only_phased || only_held || only_removal)
+    return detail;
+  if (detail.empty())
+    return "Some updates were kept back.";
+  return "Some updates were kept back. " + detail;
+}
+
+static std::string conf_sentence(const SimulateResult& result)
+{
+  if (result.conffiles_kept.empty())
+    return {};
+  return "Existing configuration was kept for " + join_names(result.conffiles_kept) + ".";
+}
+
+static std::string reboot_sentence(const SimulateResult& result)
+{
+  if (!result.reboot_required)
+    return {};
+  std::string sentence = "Restart to finish installing updates.";
+  if (!result.reboot_pkgs.empty())
+    sentence += " " + join_names(result.reboot_pkgs) + ".";
+  return sentence;
+}
+
+static std::string pending_sentence(const SimulateResult& result)
+{
+  if (!result.reboot_already)
+    return {};
+  std::string sentence = "A restart was already pending.";
+  if (!result.reboot_pending_pkgs.empty())
+    sentence += " " + join_names(result.reboot_pending_pkgs) + ".";
+  return sentence;
+}
+
+static std::string with_warning_text(std::string status, const std::string& warning, JobKind kind)
+{
+  if (warning.empty())
+    return status;
+  const std::string shown = friendly_job_error(warning, kind);
+  if (shown.empty())
+    return status;
+  if (status.empty())
+    return shown;
+  return shown + "\n" + status;
+}
+
+static void append_sentence(std::string& status, const std::string& sentence)
+{
+  if (sentence.empty())
+    return;
+  if (!status.empty() && status.back() != ' ' && status.back() != '\n')
+    status += " ";
+  status += sentence;
+}
+
+JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_rows)
+{
+  JobOutcome out;
+  out.check_enabled = true;
+  if ((result.status == SimulateResult::UpToDate || result.status == SimulateResult::Success) &&
+      !has_remaining(result)) {
+    out.packages = PackageListAction::Hide;
+    out.install_enabled = false;
+    out.status = with_warning_text("You're up to date.", result.warning, JobKind::Check);
+    return out;
+  }
+  if (result.status == SimulateResult::Upgrades && !result.packages.empty()) {
+    out.packages = PackageListAction::Show;
+    out.install_enabled = true;
+    std::string status = "Updates are available.";
+    const std::string kept = describe_remaining(result);
+    if (!kept.empty())
+      status += " " + kept;
+    out.status = with_warning_text(status, result.warning, JobKind::Check);
+    return out;
+  }
+  if (result.status == SimulateResult::KeptBack || (result.packages.empty() && has_remaining(result))) {
+    out.packages = PackageListAction::Hide;
+    out.install_enabled = false;
+    out.status = with_warning_text(kept_headline(result), result.warning, JobKind::Check);
+    return out;
+  }
+  std::string msg = result.error_msg;
+  if (msg.empty() || msg == "No STATUS from helper") {
+    if (exit_code == 127 || exit_code == 126)
+      msg = "Could not run the update helper (pkexec).";
+    else
+      msg = "The update check failed.";
+  }
+  out.status = friendly_job_error(msg, JobKind::Check);
+  out.packages = have_rows ? PackageListAction::Keep : PackageListAction::Hide;
+  out.install_enabled = have_rows;
+  return out;
+}
+
+JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool have_rows)
+{
+  JobOutcome out;
+  out.check_enabled = true;
+  const std::string conf = conf_sentence(result);
+  const std::string reboot = reboot_sentence(result);
+  const std::string pending = pending_sentence(result);
+  const std::string extras = describe_remaining(result);
+  if (result.install_skipped) {
+    std::string status = "The update list changed. Nothing was installed.";
+    if (result.status == SimulateResult::Upgrades && !result.packages.empty()) {
+      out.packages = PackageListAction::Show;
+      out.install_enabled = true;
+      append_sentence(status, extras);
+    } else {
+      out.packages = PackageListAction::Hide;
+      out.install_enabled = false;
+      if (has_remaining(result))
+        append_sentence(status, extras);
+      else if (result.status == SimulateResult::UpToDate || result.status == SimulateResult::Success)
+        append_sentence(status, "You're up to date.");
+    }
+    append_sentence(status, conf);
+    out.status = with_warning_text(status, result.warning, JobKind::Install);
+    return out;
+  }
+  if (result.status == SimulateResult::Error) {
+    std::string msg = result.error_msg;
+    if (msg.empty() || msg == "No STATUS from helper") {
+      if (exit_code == 127 || exit_code == 126)
+        msg = "Could not run the update helper (pkexec).";
+      else
+        msg = "apt-get upgrade failed.";
+    }
+    out.status = friendly_job_error(msg, JobKind::Install);
+    out.packages = PackageListAction::Keep;
+    out.install_enabled = have_rows;
+    return out;
+  }
+
+  const bool nothing_installed =
+      result.status == SimulateResult::KeptBack && result.upgraded_count <= 0 && result.packages.empty();
+  std::string status;
+  if (nothing_installed) {
+    status = kept_headline(result);
+  } else {
+    status = "Updates installed.";
+    if (result.summary_missing)
+      append_sentence(status, "Apt did not report whether any packages were kept back.");
+    append_sentence(status, extras);
+    const bool empty_set = !result.summary_missing && extras.empty() && conf.empty() && reboot.empty() &&
+                           pending.empty() && !has_remaining(result);
+    if (empty_set)
+      append_sentence(status, "You're up to date.");
+  }
+  append_sentence(status, conf);
+  append_sentence(status, reboot);
+  append_sentence(status, pending);
+  out.packages = PackageListAction::Hide;
+  out.install_enabled = false;
+  out.status = with_warning_text(status, result.warning, JobKind::Install);
+  return out;
+}
+
+JobOutcome outcome_timeout(bool installing, bool helper_ready, bool have_rows)
+{
+  JobOutcome out;
+  out.check_enabled = true;
+  out.install_enabled = have_rows;
+  out.packages = (!installing && !have_rows) ? PackageListAction::Hide : PackageListAction::Keep;
+  if (!helper_ready) {
+    out.status = "Timed out waiting for authentication. Try again.";
+    if (!have_rows)
+      out.packages = PackageListAction::Hide;
+  } else if (!installing) {
+    out.status = "Timed out waiting for the update check. Check your network and try again.";
+  } else {
+    out.status = "Timed out while installing updates.";
+    out.packages = PackageListAction::Keep;
+  }
+  return out;
 }

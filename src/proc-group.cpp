@@ -332,6 +332,35 @@ bool process_tree_contains_dpkg(pid_t leader)
   return false;
 }
 
+void remember_configuring_dpkg(pid_t leader, std::vector<DpkgNote>& notes)
+{
+  if (leader <= 1)
+    return;
+  std::vector<Tracked> members;
+  collect_descendants(leader, members);
+  for (const Tracked& tracked : members) {
+    if (!pid_is_configuring_dpkg(tracked.pid))
+      continue;
+    bool seen = false;
+    for (const DpkgNote& note : notes) {
+      if (note.pid == tracked.pid && note.starttime == tracked.starttime)
+        seen = true;
+    }
+    if (!seen)
+      notes.push_back(DpkgNote{tracked.pid, tracked.starttime});
+  }
+}
+
+bool configuring_dpkg_alive(const std::vector<DpkgNote>& notes)
+{
+  for (const DpkgNote& note : notes) {
+    const Tracked tracked{note.pid, note.starttime};
+    if (process_alive(tracked))
+      return true;
+  }
+  return false;
+}
+
 bool terminate_process_tree(pid_t leader, int term_grace_ms, bool* signaled)
 {
   if (signaled != nullptr)

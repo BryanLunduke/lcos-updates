@@ -8,6 +8,19 @@
 #define LCOS_UPDATES_PROC_GROUP_HPP
 
 #include <sys/types.h>
+#include <vector>
+
+struct DpkgNote {
+  pid_t pid = 0;
+  unsigned long long starttime = 0;
+};
+
+/* Remember configuring dpkg descendants so a later check can see them after
+ * they are reparented. A pid is recorded only while it is still in the tree. */
+void remember_configuring_dpkg(pid_t leader, std::vector<DpkgNote>& notes);
+
+/* True when a noted dpkg is still the same live process. */
+bool configuring_dpkg_alive(const std::vector<DpkgNote>& notes);
 
 /* True when a non-zombie descendant is configuring packages.
  * That is a cmdline containing --unpack, --configure, --install, --remove,

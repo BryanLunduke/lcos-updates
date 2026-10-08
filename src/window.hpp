@@ -55,6 +55,10 @@ public:
   bool status_selectable_for_test() const { return m_status.get_selectable(); }
   Glib::ustring notification_text_for_test() const { return m_notification; }
   bool background_for_test() const { return m_background; }
+  bool closing_for_test() const { return m_closing; }
+  Glib::ustring inhibit_mode_for_test() const { return m_inhibit_mode; }
+  int stall_notifications_for_test() const { return m_stall_notifications; }
+  void test_keep_open();
   bool warning_visible_for_test() const { return m_warning.get_visible(); }
   Glib::ustring warning_text_for_test() const { return m_warning.get_text(); }
   Glib::ustring commit_note_for_test() const { return m_commit_note.get_text(); }
@@ -118,6 +122,13 @@ private:
   void note_helper_activity();
   void notify_and_leave(const Glib::ustring& body);
   void use_cancel_as_default();
+  void present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages);
+  bool on_phase_tick();
+  void relax_logind_inhibitor();
+  void send_stall_notification(const Glib::ustring& body);
+  void arm_phase_timer();
+  Glib::ustring phase_age_suffix() const;
+  void refresh_commit_note();
 
   Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 0};
   Gtk::MenuBar m_menubar;
@@ -167,6 +178,7 @@ private:
   sigc::connection m_retry;
   sigc::connection m_check_idle;
   sigc::connection m_leave_idle;
+  sigc::connection m_phase_timer;
   std::string m_stdout;
   std::string m_stderr;
   CaptureBuf m_out_cap;
@@ -187,6 +199,14 @@ private:
   bool m_check_after_job = false;
   bool m_stop_was_timeout = false;
   bool m_closing = false;
+  bool m_stopping = false;
+  bool m_inhibit_relaxed = false;
+  bool m_stall_notified = false;
+  bool m_delay_inhibit = false;
+  int m_stall_notifications = 0;
+  std::string m_inhibit_mode;
+  gint64 m_phase_mark_us = 0;
+  gint64 m_progress_mark_us = 0;
   Job m_stopped_job = Job::None;
   unsigned m_spawn_gen = 0;
   unsigned m_retry_gen = 0;

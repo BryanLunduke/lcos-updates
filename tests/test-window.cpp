@@ -75,6 +75,28 @@ static void set_mode(const char* mode)
   setenv("LCOS_PKEXEC_MODE", mode, 1);
 }
 
+static int count_in(const std::string& hay, const char* needle)
+{
+  int n = 0;
+  const std::string nd(needle);
+  for (std::string::size_type pos = 0; (pos = hay.find(nd, pos)) != std::string::npos; pos += nd.size())
+    ++n;
+  return n;
+}
+
+static void ensure_app(const Glib::RefPtr<Gtk::Application>& app)
+{
+  static bool started = false;
+  if (started || !app)
+    return;
+  GError* error = nullptr;
+  g_application_register(G_APPLICATION(app->gobj()), nullptr, &error);
+  if (error != nullptr)
+    g_error_free(error);
+  g_signal_emit_by_name(app->gobj(), "startup");
+  started = true;
+}
+
 static int count_lines(const std::string& path)
 {
   std::ifstream in(path);
@@ -317,6 +339,52 @@ case "$mode" in
     else
       printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
     fi
+    ;;
+  finish-during-dialog)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      echo DPKG_STARTED >&2
+      while [ ! -e "$release" ]; do
+        wait_sec 0.05
+      done
+      echo DPKG_IDLE >&2
+      printf 'STATUS success\nREBOOT linux-image-amd64\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
+  stall-configure)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      echo DPKG_STARTED >&2
+      while [ ! -e "$release" ]; do
+        wait_sec 0.05
+      done
+      echo DPKG_IDLE >&2
+      printf 'STATUS success\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
+  list-then-phased)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      printf 'STATUS success\nPHASED shim-signed\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
+  list-then-reboot-already)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      printf 'STATUS success\nREBOOT_ALREADY linux-image-amd64\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
+  removal-only)
+    echo HELPER_READY >&2
+    printf 'STATUS kept-back\nREMOVE foo oldplug\n'
     ;;
   *)
     echo HELPER_READY >&2
@@ -867,9 +935,12 @@ int main()
       return contains(window->status_text_for_test(), "Restart to finish installing updates.");
     });
     expect(done, "a reboot flag says to restart");
-    expect(contains(window->status_text_for_test(), "linux-image-amd64"), "a reboot flag names the package");
-    expect(!contains(window->status_text_for_test(), "You're up to date."),
-           "a reboot flag is not up to date");
+    const std::string status = window->status_text_for_test();
+    expect(status.find("Updates installed.") == 0, "a restart starts with Updates installed");
+    expect(count_in(status, "Restart to finish installing updates.") == 1,
+           "the restart sentence is printed once");
+    expect(status.find("linux-image-amd64") != std::string::npos, "a reboot flag names the package");
+    expect(status.find("You're up to date.") == std::string::npos, "a reboot flag is not up to date");
     destroy_window(window, pidfile);
   }
 
@@ -933,15 +1004,7 @@ int main()
     /* The close path holds the application so the process outlives the
      * window. Register and start the test application once so add_window
      * is legal, then this window can take that hold. */
-    static bool app_started = false;
-    if (!app_started) {
-      GError* error = nullptr;
-      g_application_register(G_APPLICATION(app->gobj()), nullptr, &error);
-      if (error != nullptr)
-        g_error_free(error);
-      g_signal_emit_by_name(app->gobj(), "startup");
-      app_started = true;
-    }
+    ensure_app(app);
     app->add_window(*window);
     window->test_click_check();
     const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
@@ -992,8 +1055,259 @@ int main()
     expect(note.find("linux-image-amd64") != std::string::npos, "the notification names the reboot package");
     expect(note.find("You're up to date.") == std::string::npos,
            "the notification does not say the system is up to date");
+    expect(note.find("Updates installed.") != std::string::npos,
+           "the notification starts from Updates installed");
+    expect(count_in(note, "Restart to finish installing updates.") == 1,
+           "the notification prints the restart sentence once");
     pump_until(1000, [&]() { return !alive(pid); });
     app->remove_window(*window);
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("finish-during-dialog");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "close-after-finish listed a package");
+    window->test_click_install();
+    const bool configuring = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Configuring packages");
+    });
+    expect(configuring, "close-after-finish reaches configuration");
+    window->test_quit();
+    pump_for(40);
+    expect(window->get_visible(), "the close dialog is up before the helper exits");
+    {
+      std::ofstream out(release);
+      out << "go\n";
+    }
+    const bool finished = pump_until(3000, [&]() {
+      return contains(window->status_text_for_test(), "Updates installed.");
+    });
+    expect(finished, "the result is written while the close dialog is open");
+    expect(window->notification_text_for_test().empty(), "no notification until Close is confirmed");
+    expect(window->closing_for_test(), "Check stays blocked while the dialog is the reason");
+    window->test_keep_open();
+    pump_for(40);
+    expect(window->notification_text_for_test().empty(), "Keep open does not notify");
+    expect(!window->closing_for_test(), "Keep open clears the close latch");
+    expect(window->check_sensitive_for_test(), "Keep open leaves Check enabled");
+    unlink(pidfile.c_str());
+    window->test_click_check();
+    const bool checking = pump_until(1500, [&]() {
+      return contains(window->status_text_for_test(), "Waiting for authentication");
+    });
+    expect(checking, "Check starts a job after Keep open");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("finish-during-dialog");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    ensure_app(app);
+    app->add_window(*window);
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "finished Close listed a package");
+    window->test_click_install();
+    const bool configuring = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Configuring packages");
+    });
+    expect(configuring, "finished Close reaches configuration");
+    window->test_quit();
+    pump_for(40);
+    {
+      std::ofstream out(release);
+      out << "go\n";
+    }
+    const bool finished = pump_until(3000, [&]() {
+      return contains(window->status_text_for_test(), "Updates installed.");
+    });
+    expect(finished, "the install finishes behind the close dialog");
+    window->test_confirm_close();
+    const bool noted = pump_until(2000, [&]() {
+      return contains(window->notification_text_for_test(), "Updates installed.");
+    });
+    expect(noted, "Close after the helper exited sends the result");
+    const std::string note = window->notification_text_for_test();
+    expect(count_in(note, "Restart to finish installing updates.") == 1,
+           "the late Close notification restarts once");
+    expect(!window->closing_for_test(), "Close after finish clears the close latch");
+    pump_until(1000, [&]() { return !window->background_for_test(); });
+    expect(!window->background_for_test(), "a finished Close does not keep the process held");
+    app->remove_window(*window);
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("stall-configure");
+    set_timeout_ms(8000);
+    setenv("LCOS_UPDATES_FAKE_INHIBIT", "1", 1);
+    setenv("LCOS_UPDATES_STALL_NOTICE_SEC", "2", 1);
+    setenv("LCOS_UPDATES_STALL_INHIBIT_SEC", "3", 1);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "stall test listed a package");
+    window->test_click_install();
+    const bool configuring = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Configuring packages");
+    });
+    expect(configuring, "stall test reaches configuration");
+    expect(window->inhibit_mode_for_test() == "block", "the install starts with a block inhibitor");
+    const bool aged = pump_until(2500, [&]() {
+      return contains(window->status_text_for_test(), "second") ||
+             contains(window->commit_note_for_test(), "second");
+    });
+    expect(aged, "the window shows how long configuration has been running");
+    const bool stalled = pump_until(4000, [&]() {
+      return contains(window->status_text_for_test(), "Still installing") &&
+             contains(window->status_text_for_test(), "no progress for") &&
+             contains(window->status_text_for_test(), "don't turn off the computer");
+    });
+    expect(stalled, "a stall says the install is still running");
+    expect(contains(window->status_text_for_test(), "0 minutes"),
+           "the stall sentence counts minutes without progress");
+    const bool relaxed = pump_until(4000, [&]() {
+      return window->inhibit_mode_for_test() == "delay";
+    });
+    expect(relaxed, "a long stall downgrades the inhibitor to delay");
+    expect(contains(window->status_text_for_test(), "Shutdown will wait a short time"),
+           "the window says shutdown will wait instead of being blocked");
+    expect(window->stall_notifications_for_test() == 0, "a visible window does not notify about the stall");
+    expect(window->cancel_sensitive_for_test() == false, "Cancel stays off during a stalled configure");
+    const pid_t pid = read_pid(pidfile);
+    expect(alive(pid), "a stall does not kill the helper");
+    {
+      std::ofstream out(release);
+      out << "go\n";
+    }
+    const bool done = pump_until(3000, [&]() {
+      return contains(window->status_text_for_test(), "Updates installed.");
+    });
+    expect(done, "the install still finishes after the stall notice");
+    expect(window->check_sensitive_for_test(), "Check is enabled after the stalled install finishes");
+    destroy_window(window, pidfile);
+    unsetenv("LCOS_UPDATES_FAKE_INHIBIT");
+    unsetenv("LCOS_UPDATES_STALL_NOTICE_SEC");
+    unsetenv("LCOS_UPDATES_STALL_INHIBIT_SEC");
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("stall-configure");
+    set_timeout_ms(8000);
+    setenv("LCOS_UPDATES_FAKE_INHIBIT", "1", 1);
+    setenv("LCOS_UPDATES_STALL_NOTICE_SEC", "1", 1);
+    setenv("LCOS_UPDATES_STALL_INHIBIT_SEC", "2", 1);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "hidden stall listed a package");
+    window->test_click_install();
+    const bool configuring = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Configuring packages");
+    });
+    expect(configuring, "hidden stall reaches configuration");
+    const pid_t pid = read_pid(pidfile);
+    window->test_quit();
+    pump_for(40);
+    window->test_confirm_close();
+    pump_for(40);
+    expect(window->background_for_test(), "close during configure keeps the install");
+    expect(alive(pid), "the hidden install is still running");
+    const bool noted = pump_until(5000, [&]() {
+      return contains(window->notification_text_for_test(), "Still installing") &&
+             contains(window->notification_text_for_test(), "Shutdown");
+    });
+    expect(noted, "a hidden stall sends one notification");
+    expect(window->stall_notifications_for_test() == 1, "the stall notification is sent once");
+    pump_for(1500);
+    expect(window->stall_notifications_for_test() == 1, "the stall notification is not repeated");
+    expect(alive(pid), "the stall notification does not stop the helper");
+    {
+      std::ofstream out(release);
+      out << "go\n";
+    }
+    const bool finished = pump_until(3000, [&]() {
+      return contains(window->notification_text_for_test(), "Updates installed.");
+    });
+    expect(finished, "the hidden install then reports the real outcome");
+    destroy_window(window, pidfile);
+    unsetenv("LCOS_UPDATES_FAKE_INHIBIT");
+    unsetenv("LCOS_UPDATES_STALL_NOTICE_SEC");
+    unsetenv("LCOS_UPDATES_STALL_INHIBIT_SEC");
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("list-then-phased");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "phased install listed a package");
+    window->test_click_install();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Updates installed.");
+    });
+    expect(done, "an install with phased leftovers says updates were installed");
+    const std::string status = window->status_text_for_test();
+    expect(status.find("will be offered later: shim-signed.") != std::string::npos,
+           "phased leftovers use the same sentence as Check");
+    expect(status.find("You're up to date.") == std::string::npos,
+           "phased leftovers are not up to date");
+    expect(window->check_sensitive_for_test(), "Check is enabled after a phased install");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("list-then-reboot-already");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "already-pending reboot listed a package");
+    window->test_click_install();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "A restart was already pending.");
+    });
+    expect(done, "an old reboot flag says a restart was already pending");
+    const std::string status = window->status_text_for_test();
+    expect(status.find("Updates installed.") == 0, "an old flag still says updates were installed");
+    expect(status.find("Restart to finish installing updates.") == std::string::npos,
+           "an old flag does not use the restart sentence");
+    expect(status.find("linux-image-amd64") != std::string::npos, "an old flag names the package");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("removal-only");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "would remove");
+    });
+    expect(done, "a removal keep-back says a package would be removed");
+    const std::string status = window->status_text_for_test();
+    expect(status.find("oldplug") != std::string::npos, "the removal names the package that would go");
+    expect(status.find("need extra packages") == std::string::npos,
+           "a removal is not described as extra packages");
+    expect(window->check_sensitive_for_test(), "Check is enabled for a removal keep-back");
+    expect(!window->install_sensitive_for_test(), "a removal-only result does not offer Install");
     destroy_window(window, pidfile);
   }
 
