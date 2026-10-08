@@ -75,6 +75,20 @@ public:
   int column_count_for_test() const { return m_view.get_n_columns(); }
   bool ask_default_is_cancel_for_test() const;
   bool status_selectable_for_test() const { return m_status.get_selectable(); }
+  bool status_can_focus_for_test() const { return m_status.get_can_focus(); }
+  bool status_has_selection_for_test() const
+  {
+    int start = 0;
+    int end = 0;
+    return m_status.get_selection_bounds(start, end);
+  }
+  bool status_has_focus_for_test() const { return m_status.has_focus(); }
+  bool version_columns_ready_for_test() const;
+  Glib::ustring version_tip_for_test(int row) const;
+  Glib::ustring old_version_at_row_for_test(int row) const;
+  Glib::ustring new_version_at_row_for_test(int row) const;
+  Glib::ustring restart_primary_for_test() const { return m_restart_primary; }
+  Glib::ustring restart_secondary_for_test() const { return m_restart_secondary; }
   Glib::ustring notification_text_for_test() const { return m_notification; }
   bool background_for_test() const { return m_background; }
   bool closing_for_test() const { return m_closing; }
@@ -139,7 +153,9 @@ private:
   void order_trailing(Gtk::Button& trailing);
   void on_restart_clicked();
   void spawn_reboot();
-  void tune_column(int index, int width, bool expand, bool ellipsize);
+  void tune_column(int index, int width, bool expand, Pango::EllipsizeMode ellipsize, bool resizable);
+  bool on_view_tooltip(int x, int y, bool keyboard_tooltip, const Glib::RefPtr<Gtk::Tooltip>& tooltip);
+  void set_status_text(const Glib::ustring& status);
   void append_stdout(const char* data, std::size_t n);
   void append_stderr(const char* data, std::size_t n);
   std::string stderr_text() const;
@@ -185,12 +201,14 @@ private:
       add(package);
       add(old_version);
       add(new_version);
+      add(version_tip);
       add(size);
       add(security);
     }
     Gtk::TreeModelColumn<Glib::ustring> package;
     Gtk::TreeModelColumn<Glib::ustring> old_version;
     Gtk::TreeModelColumn<Glib::ustring> new_version;
+    Gtk::TreeModelColumn<Glib::ustring> version_tip;
     Gtk::TreeModelColumn<Glib::ustring> size;
     Gtk::TreeModelColumn<Glib::ustring> security;
   };
@@ -255,6 +273,7 @@ private:
   Glib::ustring m_close_primary;
   Glib::ustring m_close_secondary;
   Glib::ustring m_restart_primary;
+  Glib::ustring m_restart_secondary;
   sigc::connection m_reboot_watch;
   int m_reboot_err_fd = -1;
   Glib::ustring m_notification;

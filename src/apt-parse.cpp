@@ -174,8 +174,110 @@ static int percent_at(const std::string& line, std::size_t begin, std::size_t en
   return value;
 }
 
+static int hex_digit(char ch)
+{
+  const unsigned char c = static_cast<unsigned char>(ch);
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+/* Apt writes an epoch colon as %3a in deb filenames. Other %XX sequences
+ * are decoded the same way so a version can be compared with an Inst line. */
+static std::string percent_decode(const std::string& text)
+{
+  std::string out;
+  out.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '%' && i + 2 < text.size()) {
+      const int hi = hex_digit(text[i + 1]);
+      const int lo = hex_digit(text[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(text[i]);
+  }
+  return out;
+}
+
+std::string canonical_deb_version(const std::string& version)
+{
+  return percent_decode(version);
+}
+
+bool deb_versions_match(const std::string& a, const std::string& b)
+{
+  return canonical_deb_version(a) == canonical_deb_version(b);
+}
+
+static bool status_fd_line(const std::string& line, std::string& tag, std::string& id,
+                           std::string& percent, std::string& message)
+{
+  const std::string::size_type c1 = line.find(':');
+  if (c1 == std::string::npos || c1 == 0)
+    return false;
+  tag = line.substr(0, c1);
+  if (tag != "dlstatus" && tag != "pmstatus" && tag != "pmerror" && tag != "pmconffile")
+    return false;
+  const std::string::size_type c2 = line.find(':', c1 + 1);
+  if (c2 == std::string::npos)
+    return false;
+  const std::string::size_type c3 = line.find(':', c2 + 1);
+  if (c3 == std::string::npos)
+    return false;
+  id = line.substr(c1 + 1, c2 - c1 - 1);
+  percent = line.substr(c2 + 1, c3 - c2 - 1);
+  message = line.substr(c3 + 1);
+  return true;
+}
+
+static int percent_float(const std::string& text)
+{
+  if (text.empty())
+    return -1;
+  double value = 0;
+  std::size_t i = 0;
+  bool any = false;
+  while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) {
+    any = true;
+    value = value * 10.0 + static_cast<double>(text[i] - '0');
+    ++i;
+  }
+  if (i < text.size() && text[i] == '.') {
+    ++i;
+    double place = 0.1;
+    while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) {
+      any = true;
+      value += static_cast<double>(text[i] - '0') * place;
+      place *= 0.1;
+      ++i;
+    }
+  }
+  if (!any || i != text.size() || value < 0.0 || value > 100.0001)
+    return -1;
+  int rounded = static_cast<int>(value + 0.5);
+  if (rounded > 100)
+    rounded = 100;
+  if (rounded < 0)
+    rounded = 0;
+  return rounded;
+}
+
 int progress_percent(const std::string& line)
 {
+  std::string tag;
+  std::string id;
+  std::string percent;
+  std::string message;
+  if (status_fd_line(line, tag, id, percent, message))
+    return percent_float(percent);
   std::size_t i = 0;
   while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
     ++i;
@@ -199,6 +301,235 @@ int progress_percent(const std::string& line)
   while (digit > 0 && std::isdigit(static_cast<unsigned char>(line[digit - 1])))
     --digit;
   return percent_at(line, digit, stop);
+}
+
+static bool debian_package_name(const std::string& name)
+{
+  if (name.size() < 2 || name.size() > 200)
+    return false;
+  const unsigned char first = static_cast<unsigned char>(name[0]);
+  if (!std::islower(first) && !std::isdigit(first))
+    return false;
+  for (char ch : name) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (std::islower(c) || std::isdigit(c) || c == '+' || c == '-' || c == '.')
+      continue;
+    return false;
+  }
+  /* Tokens apt prints when it has no package yet, including the status-fd
+   * stand-in for "about to run dpkg". */
+  if (name == "dpkg-exec" || name == "working" || name == "connecting" || name == "waiting" ||
+      name == "retrieving" || name == "hit" || name == "get" || name == "ign" || name == "err" ||
+      name == "fetched")
+    return false;
+  return true;
+}
+
+static std::string word_package(const std::string& text, std::size_t begin)
+{
+  if (begin >= text.size())
+    return {};
+  const std::string::size_type end = text.find_first_of(" ](", begin);
+  const std::string::size_type stop = end == std::string::npos ? text.size() : end;
+  if (stop <= begin)
+    return {};
+  const std::string name = text.substr(begin, stop - begin);
+  if (!debian_package_name(name))
+    return {};
+  return name;
+}
+
+/* ".deb" at the end of a filename, not the ".deb" inside "deb.debian.org". */
+static std::string::size_type find_deb_suffix(const std::string& line)
+{
+  std::string::size_type pos = 0;
+  while ((pos = line.find(".deb", pos)) != std::string::npos) {
+    const std::size_t after = pos + 4;
+    if (after >= line.size() || line[after] == ' ' || line[after] == '\'' || line[after] == '"' ||
+        line[after] == '\t' || line[after] == '\r')
+      return pos;
+    pos = after;
+  }
+  return std::string::npos;
+}
+
+static std::string deb_filename_package(const std::string& file)
+{
+  const std::string decoded = percent_decode(file);
+  std::string stem = decoded;
+  if (stem.size() >= 4 && stem.compare(stem.size() - 4, 4, ".deb") == 0)
+    stem.resize(stem.size() - 4);
+  const std::string::size_type us = stem.find('_');
+  const std::string name = us == std::string::npos ? stem : stem.substr(0, us);
+  if (!debian_package_name(name))
+    return {};
+  return name;
+}
+
+std::string progress_package_name(const std::string& line)
+{
+  std::string tag;
+  std::string id;
+  std::string percent;
+  std::string message;
+  if (status_fd_line(line, tag, id, percent, message)) {
+    /* dlstatus names a file index, not a package. pmerror is a failure. */
+    if (tag != "pmstatus")
+      return {};
+    if (!debian_package_name(id))
+      return {};
+    return id;
+  }
+  const char* configure[] = {"Setting up ", "Unpacking "};
+  for (const char* prefix : configure) {
+    const std::size_t n = std::strlen(prefix);
+    if (line.compare(0, n, prefix) == 0)
+      return word_package(line, n);
+  }
+  const std::string::size_type bracket = line.find('[');
+  if (bracket != std::string::npos) {
+    std::size_t i = bracket + 1;
+    while (i < line.size() && line[i] == ' ')
+      ++i;
+    /* Apt's per-item form is "[<digits> <name> …]". [Working], [Connecting to …]
+     * and [Waiting for headers] have no item number. */
+    if (i < line.size() && std::isdigit(static_cast<unsigned char>(line[i]))) {
+      while (i < line.size() && std::isdigit(static_cast<unsigned char>(line[i])))
+        ++i;
+      if (i < line.size() && line[i] == ' ') {
+        while (i < line.size() && line[i] == ' ')
+          ++i;
+        const std::string name = word_package(line, i);
+        if (!name.empty())
+          return name;
+      }
+    }
+  }
+  if (line.compare(0, 4, "Get:") == 0) {
+    const std::string::size_type deb = find_deb_suffix(line);
+    if (deb == std::string::npos)
+      return {};
+    const std::string::size_type slash = line.rfind('/', deb);
+    const std::string::size_type start = slash == std::string::npos ? 0 : slash + 1;
+    if (deb < start)
+      return {};
+    return deb_filename_package(line.substr(start, deb + 4 - start));
+  }
+  return {};
+}
+
+bool progress_is_configure_line(const std::string& line)
+{
+  if (line.compare(0, 11, "Setting up ") == 0 || line.compare(0, 10, "Unpacking ") == 0)
+    return !progress_package_name(line).empty();
+  std::string tag;
+  std::string id;
+  std::string percent;
+  std::string message;
+  if (!status_fd_line(line, tag, id, percent, message))
+    return false;
+  return tag == "pmstatus" && !progress_package_name(line).empty();
+}
+
+bool progress_is_download_noise(const std::string& line)
+{
+  if (!progress_package_name(line).empty())
+    return false;
+  std::string tag;
+  std::string id;
+  std::string percent;
+  std::string message;
+  if (status_fd_line(line, tag, id, percent, message))
+    return true;
+  if (line.compare(0, 4, "Hit:") == 0 || line.compare(0, 4, "Get:") == 0 ||
+      line.compare(0, 4, "Ign:") == 0 || line.compare(0, 4, "Err:") == 0)
+    return true;
+  if (line.find('[') != std::string::npos)
+    return true;
+  return false;
+}
+
+static std::string downloading_file_sentence(const std::string& message)
+{
+  const std::string prefix = "Retrieving file ";
+  if (message.compare(0, prefix.size(), prefix) != 0)
+    return {};
+  std::string rest = message.substr(prefix.size());
+  const std::string::size_type paren = rest.find(" (");
+  if (paren != std::string::npos)
+    rest.resize(paren);
+  while (!rest.empty() && rest.back() == ' ')
+    rest.pop_back();
+  if (rest.find(" of ") == std::string::npos)
+    return {};
+  return "Downloading file " + rest + "…";
+}
+
+std::string friendly_progress_text(const std::string& line, const std::string& phase)
+{
+  if (line.compare(0, 21, "Reading package lists") == 0)
+    return "Reading package lists…";
+  if (line.compare(0, 19, "Calculating upgrade") == 0)
+    return "Calculating upgrade…";
+  if (line.compare(0, 24, "Building dependency tree") == 0)
+    return "Building dependency tree…";
+  if (progress_is_configure_line(line)) {
+    const std::string pkg = progress_package_name(line);
+    if (!pkg.empty())
+      return "Configuring " + pkg + "…";
+  }
+  const std::string pkg = progress_package_name(line);
+  if (!pkg.empty())
+    return "Downloading " + pkg + "…";
+  std::string tag;
+  std::string id;
+  std::string percent;
+  std::string message;
+  if (status_fd_line(line, tag, id, percent, message) && tag == "dlstatus") {
+    const std::string files = downloading_file_sentence(message);
+    if (!files.empty())
+      return files;
+    return "Downloading updates…";
+  }
+  if (progress_is_download_noise(line)) {
+    if (phase == "download" || progress_percent(line) >= 0)
+      return "Downloading updates…";
+    return line;
+  }
+  if (phase == "download")
+    return "Downloading updates…";
+  return line;
+}
+
+AptProgressNote apt_progress_note(const std::string& line, const std::string& current_shown)
+{
+  AptProgressNote out;
+  out.shown = current_shown;
+  if (!progress_line_visible(line))
+    return out;
+  if (line.compare(0, 5, "Inst ") == 0 || line.compare(0, 5, "Conf ") == 0)
+    return out;
+  const int pct = progress_percent(line);
+  if (pct >= 0) {
+    out.have_percent = true;
+    out.percent = pct;
+  }
+  const std::string named = progress_package_name(line);
+  if (!named.empty()) {
+    out.replace_shown = true;
+    out.shown = line;
+    return out;
+  }
+  if (progress_is_download_noise(line)) {
+    if (current_shown.empty() || progress_package_name(current_shown).empty()) {
+      out.replace_shown = true;
+      out.shown = line;
+    }
+    return out;
+  }
+  out.replace_shown = true;
+  out.shown = line;
+  return out;
 }
 
 static std::string field_value(const std::string& text, const char* key)
@@ -292,9 +623,10 @@ static std::string format_byte_size(unsigned long long bytes)
 
 static bool split_deb_filename(const std::string& file, std::string& name, std::string& version)
 {
-  if (file.size() < 5 || file.compare(file.size() - 4, 4, ".deb") != 0)
+  const std::string decoded = percent_decode(file);
+  if (decoded.size() < 5 || decoded.compare(decoded.size() - 4, 4, ".deb") != 0)
     return false;
-  const std::string stem = file.substr(0, file.size() - 4);
+  const std::string stem = decoded.substr(0, decoded.size() - 4);
   const std::string::size_type us2 = stem.rfind('_');
   if (us2 == std::string::npos || us2 == 0)
     return false;
@@ -341,7 +673,7 @@ void apply_download_details(SimulateResult& result, const std::string& text)
     if (!split_deb_filename(file, name, version))
       continue;
     for (auto& pkg : result.packages) {
-      if (pkg.name == name && pkg.new_version == version)
+      if (pkg.name == name && deb_versions_match(pkg.new_version, version))
         pkg.size = format_byte_size(bytes);
     }
   }
@@ -1340,7 +1672,7 @@ static std::string reboot_sentence(const SimulateResult& result)
     return {};
   std::string sentence = "Restart to finish installing updates.";
   if (!result.reboot_pkgs.empty())
-    sentence += " " + join_names(result.reboot_pkgs) + ".";
+    sentence += " (needed by " + join_names(result.reboot_pkgs) + ").";
   return sentence;
 }
 
@@ -1350,7 +1682,7 @@ static std::string pending_sentence(const SimulateResult& result)
     return {};
   std::string sentence = "A restart was already pending.";
   if (!result.reboot_pending_pkgs.empty())
-    sentence += " " + join_names(result.reboot_pending_pkgs) + ".";
+    sentence += " (needed by " + join_names(result.reboot_pending_pkgs) + ").";
   return sentence;
 }
 

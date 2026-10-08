@@ -1,0 +1,5 @@
+'http://deb.example/debian/pool/main/a/automake/automake_1%3a1.17-4_all.deb' automake_1%3a1.17-4_all.deb 123456 SHA256:abc
+'http://deb.example/debian/pool/main/g/gcc-defaults/gcc_4%3a14.2.0-1_amd64.deb' gcc_4%3a14.2.0-1_amd64.deb 2345678 SHA256:def
+'http://deb.example/debian/pool/main/i/imagemagick/imagemagick_8%3a6.9.12.98%2bdfsg1-5.2_amd64.deb' imagemagick_8%3a6.9.12.98%2bdfsg1-5.2_amd64.deb 3456789 SHA256:fff
+Need to get 5,925 kB of archives.
+After this operation, 10.0 MB of additional disk space will be used.

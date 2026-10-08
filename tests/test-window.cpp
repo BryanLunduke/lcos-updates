@@ -463,6 +463,27 @@ case "$mode" in
       printf 'STATUS upgrades\nCOUNT 1\nPKG xz-utils 1 2\n'
     fi
     ;;
+  working-download)
+    echo HELPER_READY >&2
+    echo 'PHASE download' >&2
+    echo 'PROGRESS 0% [Connecting to deb.debian.org (151.101.2.132)]' >&2
+    while [ ! -e "$release.1" ]; do wait_sec 0.05; done
+    echo 'PROGRESS 0% [Waiting for headers]' >&2
+    while [ ! -e "$release.2" ]; do wait_sec 0.05; done
+    echo 'PROGRESS 17% [Working]' >&2
+    while [ ! -e "$release.3" ]; do wait_sec 0.05; done
+    echo 'PROGRESS 40% [1 bash 20.0 kB/200 kB 10%]' >&2
+    while [ ! -e "$release.4" ]; do wait_sec 0.05; done
+    echo 'PROGRESS 55% [Working]' >&2
+    while [ ! -e "$release.5" ]; do wait_sec 0.05; done
+    echo 'PROGRESS dlstatus:2:70.0000:Retrieving file 2 of 2' >&2
+    while [ ! -e "$release.6" ]; do wait_sec 0.05; done
+    echo 'PROGRESS Hit:1 http://deb.example stable InRelease' >&2
+    while [ ! -e "$release.7" ]; do wait_sec 0.05; done
+    echo 'PROGRESS Err:1 http://deb.example/bash 404 Not Found' >&2
+    while [ ! -e "$release.8" ]; do wait_sec 0.05; done
+    printf 'STATUS up-to-date\n'
+    ;;
   *)
     echo HELPER_READY >&2
     printf 'STATUS up-to-date\n'
@@ -473,6 +494,11 @@ esac
 int main()
 {
   setvbuf(stdout, nullptr, _IOLBF, 0);
+  const char* display = std::getenv("DISPLAY");
+  if (display == nullptr || display[0] == '\0') {
+    std::fprintf(stderr, "DISPLAY is not set; the window test cannot run\n");
+    return 1;
+  }
   int argc = 1;
   char arg0[] = "test-window";
   char* argv[] = {arg0, nullptr};
@@ -517,6 +543,10 @@ int main()
     expect(!window->progress_visible_for_test(), "progress starts hidden");
     expect(window->status_text_for_test() == "Check for updates.",
            "the window opens with Check for updates.");
+    expect(window->status_selectable_for_test(), "the status text can still be selected");
+    expect(!window->status_can_focus_for_test(), "the status text is not focused on startup");
+    expect(!window->status_has_focus_for_test(), "startup focus is not the status sentence");
+    expect(!window->status_has_selection_for_test(), "the status sentence is not selected");
     expect(window->check_x_for_test() > window->install_x_for_test(),
            "Check is the trailing button before updates are listed");
     expect(!window->restart_visible_for_test(), "Restart is hidden until a reboot is required");
@@ -1585,6 +1615,13 @@ int main()
     expect(window->size_at_row_for_test(0) == "12.4 MB", "the size column shows the archive size");
     expect(window->package_at_row_for_test(0).find("21.0.12.1+1-1~24.04.4") == std::string::npos,
            "the version stays in its own column");
+    expect(window->version_columns_ready_for_test(),
+           "version columns ellipsize in the middle and can be resized");
+    expect(window->old_version_at_row_for_test(0) == "21.0.11+9-1", "the old version is kept in full");
+    expect(window->new_version_at_row_for_test(0) == "21.0.12.1+1-1~24.04.4",
+           "the new version is kept in full");
+    expect(window->version_tip_for_test(0) == "21.0.11+9-1 → 21.0.12.1+1-1~24.04.4",
+           "the version tooltip shows the full old and new versions");
     expect(window->install_x_for_test() > window->check_x_for_test(),
            "Install stays at the trailing edge of a long list");
     expect(window->column_count_for_test() == 5, "package, versions, size, and security are columns");
@@ -1681,6 +1718,7 @@ int main()
       out << "#!/bin/sh\n"
              "printf '%s\\n' \"$@\" >> \"$LCOS_LOGINCTL_LOG\"\n"
              "if [ -n \"$LCOS_LOGINCTL_FAIL\" ]; then\n"
+             "  echo 'Interactive authentication required.' >&2\n"
              "  exit 1\n"
              "fi\n"
              "exit 0\n";
@@ -1712,7 +1750,12 @@ int main()
     pump_for(40);
     expect(contains(window->status_text_for_test(), "Restart to finish installing updates."),
            "opening the question does not restart yet");
-    expect(window->restart_default_is_cancel_for_test(), "the restart question defaults to Cancel");
+    expect(window->restart_default_is_cancel_for_test(), "the restart question defaults to Don't restart");
+    expect(window->restart_primary_for_test() == "Restart this computer now?",
+           "the restart question says the computer restarts");
+    expect(window->restart_secondary_for_test().find("Open applications will be closed") != std::string::npos &&
+               window->restart_secondary_for_test().find("save your work") != std::string::npos,
+           "the restart question says to save your work");
     window->test_cancel_restart();
     pump_for(80);
     expect(slurp(loginctl_log).empty(), "Cancel does not run loginctl");
@@ -1743,11 +1786,104 @@ int main()
       return contains(window->status_text_for_test(), "Could not restart this computer.");
     });
     expect(failed, "a failed loginctl shows an error");
+    expect(contains(window->status_text_for_test(), "Interactive authentication required."),
+           "a failed restart shows loginctl's reason");
     expect(window->restart_sensitive_for_test(), "Restart can be tried again after a failure");
     destroy_window(window, pidfile);
     unsetenv("LCOS_LOGINCTL_FAIL");
     unsetenv("LCOS_UPDATES_TEST_LOGINCTL");
     unsetenv("LCOS_LOGINCTL_LOG");
+  }
+
+  {
+    unlink(pidfile.c_str());
+    for (int i = 1; i <= 8; ++i)
+      unlink((release + "." + std::to_string(i)).c_str());
+    set_mode("working-download");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool connecting = pump_until(2000, [&]() {
+      return window->progress_visible_for_test() &&
+             window->status_text_for_test().find("Connecting") == std::string::npos &&
+             window->status_text_for_test().find("Working") == std::string::npos;
+    });
+    expect(connecting, "connecting is not shown as a package name");
+    expect(contains(window->status_text_for_test(), "Downloading"),
+           "a download without a package name still says downloading");
+    {
+      std::ofstream out(release + ".1");
+      out << "go\n";
+    }
+    pump_for(200);
+    expect(window->status_text_for_test().find("Waiting") == std::string::npos,
+           "waiting for headers is not a package name");
+    {
+      std::ofstream out(release + ".2");
+      out << "go\n";
+    }
+    const bool working = pump_until(1500, [&]() {
+      return window->progress_fraction_for_test() > 0.16 && window->progress_fraction_for_test() < 0.18;
+    });
+    expect(working, "a Working line still moves the bar");
+    expect(window->status_text_for_test().find("Working") == std::string::npos,
+           "Working is not shown as a package name");
+    expect(contains(window->status_text_for_test(), "Downloading updates"),
+           "a Working line falls back to downloading updates");
+    {
+      std::ofstream out(release + ".3");
+      out << "go\n";
+    }
+    const bool named = pump_until(1500, [&]() {
+      return contains(window->status_text_for_test(), "Downloading bash");
+    });
+    expect(named, "a numbered progress line names the package");
+    {
+      std::ofstream out(release + ".4");
+      out << "go\n";
+    }
+    const bool kept = pump_until(1500, [&]() {
+      return window->progress_fraction_for_test() > 0.54 && window->progress_fraction_for_test() < 0.56 &&
+             contains(window->status_text_for_test(), "Downloading bash");
+    });
+    expect(kept, "a later Working line keeps the package name and the new percent");
+    expect(window->status_text_for_test().find("Working") == std::string::npos,
+           "the later Working line is not a package name");
+    {
+      std::ofstream out(release + ".5");
+      out << "go\n";
+    }
+    const bool files = pump_until(1500, [&]() {
+      return window->progress_fraction_for_test() > 0.69 && window->progress_fraction_for_test() < 0.71 &&
+             contains(window->status_text_for_test(), "Downloading bash");
+    });
+    expect(files, "a dlstatus line updates the percent and keeps the package");
+    expect(window->status_text_for_test().find("Retrieving") == std::string::npos,
+           "dlstatus does not show Retrieving as a package");
+    {
+      std::ofstream out(release + ".6");
+      out << "go\n";
+    }
+    pump_for(200);
+    expect(contains(window->status_text_for_test(), "Downloading bash"),
+           "a Hit line does not replace the package being downloaded");
+    expect(window->status_text_for_test().find("Hit:") == std::string::npos,
+           "a Hit prefix is not the download status");
+    {
+      std::ofstream out(release + ".7");
+      out << "go\n";
+    }
+    pump_for(200);
+    expect(contains(window->status_text_for_test(), "Downloading bash"),
+           "an Err line does not replace the package being downloaded");
+    expect(window->status_text_for_test().find("Err:") == std::string::npos,
+           "an Err prefix is not the download status");
+    {
+      std::ofstream out(release + ".8");
+      out << "go\n";
+    }
+    pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    destroy_window(window, pidfile);
   }
 
   if (g_fails != 0) {

@@ -14,6 +14,13 @@ project(
 gtkmm = dependency('gtkmm-3.0')
 inc = include_directories('src')
 
+# Debug info would otherwise record the build directory. The shipped binary
+# must not contain a workspace path.
+add_project_arguments(
+  '-ffile-prefix-map=' + meson.project_source_root() + '/=./',
+  language: 'cpp',
+)
+
 apt_parse = static_library(
   'apt-parse',
   'src/apt-parse.cpp',
@@ -154,15 +161,26 @@ test(
   args: [files('tests/test-policy.py'), files('data/org.lunduke.lcos-updates.policy')],
 )
 
-# The production GUI must not contain the test-only pkexec or loginctl
-# overrides, and it must not name systemctl.
+# The production GUI must not contain test-only hooks, systemctl, or a
+# workspace path. The release build leaves LCOS_UPDATES_TEST undefined.
 test(
   'production-pkexec-has-no-test-override',
   find_program('python3'),
   args: [
     '-c',
-    'import pathlib,sys; d=pathlib.Path(sys.argv[1]).read_bytes(); bad=(b"LCOS_UPDATES_TEST_PKEXEC", b"LCOS_UPDATES_TEST_LOGINCTL", b"systemctl"); sys.exit(0 if not any(x in d for x in bad) else 1)',
+    '''import pathlib,sys
+bins=[pathlib.Path(p) for p in sys.argv[1:]]
+gui_bad=(b"LCOS_UPDATES_TEST_PKEXEC", b"LCOS_UPDATES_TEST_LOGINCTL", b"LCOS_UPDATES_GUI_TIMEOUT_MS", b"LCOS_UPDATES_STALL_NOTICE_SEC", b"LCOS_UPDATES_STALL_INHIBIT_SEC", b"LCOS_UPDATES_FAKE_INHIBIT", b"systemctl", b"/workspace")
+helper_bad=(b"LCOS_UPDATES_TEST_", b"systemctl", b"/workspace")
+for path, bad in ((bins[0], gui_bad), (bins[1], helper_bad)):
+    data=path.read_bytes()
+    hit=[item.decode() for item in bad if item in data]
+    if hit:
+        print(path, hit)
+        sys.exit(1)
+''',
     lcos_updates.full_path(),
+    helper.full_path(),
   ],
 )
 

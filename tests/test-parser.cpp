@@ -589,7 +589,8 @@ int main(int argc, char** argv)
     pending.reboot_pending_pkgs.push_back("linux-image-amd64");
     const JobOutcome old_flag = outcome_install(pending, 0, false);
     expect(old_flag.status.find("Updates installed.") == 0, "an old reboot flag still says Updates installed");
-    expect(old_flag.status.find("A restart was already pending. linux-image-amd64.") != std::string::npos,
+    expect(old_flag.status.find("A restart was already pending. (needed by linux-image-amd64).") !=
+               std::string::npos,
            "an old reboot flag is a separate sentence");
     expect(old_flag.status.find(restart) == std::string::npos,
            "an old reboot flag does not use the restart sentence");
@@ -600,7 +601,7 @@ int main(int argc, char** argv)
     grew.reboot_pending_pkgs = {"bash"};
     const JobOutcome both = outcome_install(grew, 0, false);
     expect(count_phrase(both.status, restart) == 1, "a grown reboot flag restarts once");
-    expect(both.status.find("A restart was already pending. bash.") != std::string::npos,
+    expect(both.status.find("A restart was already pending. (needed by bash).") != std::string::npos,
            "packages already pending stay on the old-flag sentence");
 
     SimulateResult missing = clean;
@@ -930,6 +931,9 @@ int main(int argc, char** argv)
     reboot.reboot_pkgs.push_back("linux-image-amd64");
     const JobOutcome installed = outcome_install(reboot, 0, false);
     expect(installed.offer_restart, "a reboot flag offers Restart");
+    expect(installed.status.find("Restart to finish installing updates. (needed by linux-image-amd64).") !=
+               std::string::npos,
+           "a reboot package is named as needed by that package");
     expect(!outcome_install(SimulateResult{}, 0, false).offer_restart,
            "an install without a reboot flag does not offer Restart");
     const std::string proto = format_protocol(shown);
@@ -942,6 +946,143 @@ int main(int argc, char** argv)
            "SEC round trip marks only the security package");
     expect(back.disk_use.find("37.5 MB") != std::string::npos, "DISK round trip");
     expect(back.download_need.find("387 MB") != std::string::npos, "NEED round trip keeps apt's line");
+  }
+
+  {
+    const std::string human = read_file(dir + "/apt-progress-download.txt");
+    expect(human.find("[Working]") != std::string::npos, "download fixture records [Working]");
+    expect(human.find("[Connecting to") != std::string::npos, "download fixture records Connecting");
+    expect(human.find("[Waiting for headers]") != std::string::npos, "download fixture records Waiting");
+    expect(human.find("[1 bash") != std::string::npos && human.find("[2 xz-utils") != std::string::npos,
+           "download fixture records two files");
+    expect(human.find("Err:3 ") != std::string::npos, "download fixture records an error");
+    std::string shown;
+    int percent = -1;
+    std::string rest = human;
+    std::string forbidden;
+    auto consider = [&](const std::string& line) {
+      const AptProgressNote note = apt_progress_note(line, shown);
+      if (note.replace_shown)
+        shown = note.shown;
+      if (note.have_percent)
+        percent = note.percent;
+      const std::string text = friendly_progress_text(shown, "download");
+      const char* bad[] = {"Downloading Working", "Downloading Connecting", "Downloading Waiting",
+                           "Downloading Hit",     "Downloading Get",        "Downloading Ign",
+                           "Downloading Err",     "Downloading Retrieving", "Downloading dpkg-exec",
+                           "Downloading 404",     "Downloading Not"};
+      for (const char* needle : bad) {
+        if (text.find(needle) != std::string::npos)
+          forbidden = needle;
+      }
+      const std::string named = progress_package_name(line);
+      if (named == "working" || named == "Working" || named == "Connecting" || named == "Waiting" ||
+          named == "Hit" || named == "Get" || named == "Ign" || named == "Err" || named == "Retrieving" ||
+          named == "dpkg-exec")
+        forbidden = named;
+    };
+    while (!rest.empty()) {
+      const std::string::size_type cut = rest.find_first_of("\r\n");
+      std::string line = cut == std::string::npos ? rest : rest.substr(0, cut);
+      rest = cut == std::string::npos ? std::string() : rest.substr(cut + 1);
+      consider(line);
+    }
+    expect(forbidden.empty(), "a placeholder or error token is not a package name");
+    expect(shown.find("xz-utils") != std::string::npos, "the last real download name is kept");
+    expect(friendly_progress_text(shown, "download").find("Downloading xz-utils") != std::string::npos,
+           "the status still names xz-utils after Hit, Ign, and Err");
+    expect(percent == 40, "the last human percent is kept");
+    expect(progress_package_name("17% [Working]").empty(), "[Working] has no package");
+    expect(progress_package_name("0% [Connecting to deb.debian.org (151.101.2.132)]").empty(),
+           "[Connecting] has no package");
+    expect(progress_package_name("0% [Waiting for headers]").empty(), "[Waiting] has no package");
+    expect(progress_package_name("40% [2 xz-utils 10.0 kB/80.0 kB 12%]") == "xz-utils",
+           "a numbered bracket names the package");
+    expect(progress_package_name(
+               "Get:1 http://deb.example/pool/bash_5.2.15-2%2bb7_amd64.deb [1 kB]") == "bash",
+           "Get: names the package in the deb filename");
+    expect(friendly_progress_text("17% [Working]", "download") == "Downloading updates…",
+           "a lone Working line is not a package");
+    expect(friendly_progress_text("Hit:1 http://deb.example stable InRelease", "refresh")
+                   .find("Hit:1") != std::string::npos,
+           "a refresh still shows the Hit line");
+
+    const std::string machine = read_file(dir + "/apt-progress-status-fd.txt");
+    expect(machine.find("dlstatus:") != std::string::npos && machine.find("pmstatus:") != std::string::npos &&
+               machine.find("pmerror:") != std::string::npos,
+           "status-fd fixture has dlstatus, pmstatus, and pmerror");
+    shown.clear();
+    percent = -1;
+    forbidden.clear();
+    rest = machine;
+    bool saw_file = false;
+    bool saw_bash = false;
+    while (!rest.empty()) {
+      const std::string::size_type cut = rest.find('\n');
+      std::string line = cut == std::string::npos ? rest : rest.substr(0, cut);
+      rest = cut == std::string::npos ? std::string() : rest.substr(cut + 1);
+      consider(line);
+      const std::string text = friendly_progress_text(shown, "download");
+      if (text.find("Downloading file 1 of 2") != std::string::npos)
+        saw_file = true;
+      if (text.find("Configuring bash") != std::string::npos)
+        saw_bash = true;
+    }
+    expect(forbidden.empty(), "status-fd tokens are not package names");
+    expect(saw_file, "dlstatus says which file is being retrieved");
+    expect(saw_bash, "pmstatus names the package being configured");
+    expect(progress_percent("dlstatus:1:17.5000:Retrieving file 1 of 2") == 18,
+           "a status-fd percent rounds to the bar");
+    expect(progress_percent("dlstatus:2:60.2500:Retrieving file 2 of 2 (1s remaining)") == 60,
+           "a status-fd percent keeps the whole number");
+    expect(progress_package_name("pmstatus:dpkg-exec:0.0000:Running dpkg").empty(),
+           "dpkg-exec is not a package");
+    expect(progress_package_name("pmerror:bash:80.0000:subprocess returned error exit status 1").empty(),
+           "pmerror is not a download name");
+    expect(friendly_progress_text(shown, "download").find("Configuring bash") != std::string::npos,
+           "an error line does not replace the package being configured");
+
+    const std::string uris = read_file(dir + "/apt-print-uris-epoch.txt");
+    expect(uris.find("%3a") != std::string::npos, "epoch fixture encodes the colon");
+    expect(deb_versions_match("1:1.17-4", "1%3a1.17-4"), "an epoch matches its filename encoding");
+    expect(deb_versions_match("8:6.9.12.98+dfsg1-5.2", "8%3a6.9.12.98%2bdfsg1-5.2"),
+           "a plus in an epoch version is decoded");
+    expect(!deb_versions_match("1:1.17-4", "1.17-4"), "a missing epoch is a different version");
+    expect(canonical_deb_version("4%3a14.2.0-1") == "4:14.2.0-1", "canonical version has the colon");
+    SimulateResult epoch;
+    epoch.status = SimulateResult::Upgrades;
+    PackageUpgrade automake;
+    automake.name = "automake";
+    automake.old_version = "1:1.16.5-1.3";
+    automake.new_version = "1:1.17-4";
+    PackageUpgrade gcc;
+    gcc.name = "gcc";
+    gcc.old_version = "4:12.2.0-3";
+    gcc.new_version = "4:14.2.0-1";
+    PackageUpgrade image;
+    image.name = "imagemagick";
+    image.old_version = "8:6.9.11.60+dfsg-1.6";
+    image.new_version = "8:6.9.12.98+dfsg1-5.2";
+    PackageUpgrade plain;
+    plain.name = "bash";
+    plain.old_version = "5.2.15-2";
+    plain.new_version = "5.2.21-2";
+    epoch.packages = {automake, gcc, image, plain};
+    apply_download_details(epoch, uris);
+    expect(epoch.packages[0].size == "123.5 kB", "an epoch package gets a size");
+    expect(epoch.packages[1].size == "2.3 MB", "gcc's epoch version matches the filename");
+    expect(epoch.packages[2].size == "3.5 MB", "a percent-encoded plus still matches");
+    expect(epoch.packages[3].size.empty(), "a package with no filename is left blank");
+    const std::string inst =
+        "Inst automake [1:1.16.5-1.3] (1:1.17-4 Debian:13/stable [all])\n"
+        "Inst gcc [4:12.2.0-3] (4:14.2.0-1 Debian:13/stable [amd64])\n";
+    SimulateResult parsed = parse_apt_simulate(inst);
+    expect(parsed.packages.size() == 2 && parsed.packages[0].new_version == "1:1.17-4" &&
+               parsed.packages[1].old_version == "4:12.2.0-3",
+           "Inst lines keep epoch versions");
+    apply_download_details(parsed, uris);
+    expect(parsed.packages[0].size == "123.5 kB" && parsed.packages[1].size == "2.3 MB",
+           "sizes attach to Inst versions that contain an epoch");
   }
 
   if (g_fails != 0) {

@@ -206,6 +206,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
 {
   int out_pipe[2] = {-1, -1};
   int err_pipe[2] = {-1, -1};
+  int status_pipe[2] = {-1, -1};
   if (pipe(out_pipe) != 0)
     return -1;
   if (pipe(err_pipe) != 0) {
@@ -213,6 +214,9 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     close(out_pipe[1]);
     return -1;
   }
+  /* Machine-readable dlstatus/pmstatus. Human percent lines stay the fallback
+   * when this pipe cannot be created. */
+  const bool have_status = pipe(status_pipe) == 0;
 
   const pid_t pid = fork();
   if (pid < 0) {
@@ -220,6 +224,10 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     close(out_pipe[1]);
     close(err_pipe[0]);
     close(err_pipe[1]);
+    if (have_status) {
+      close(status_pipe[0]);
+      close(status_pipe[1]);
+    }
     return -1;
   }
 
@@ -243,6 +251,20 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     }
     if (saved_args.empty())
       _exit(127);
+    if (have_status) {
+      saved_args.emplace_back("-o");
+      saved_args.emplace_back("APT::Status-Fd=3");
+    }
+    /* Copy the status write end above the standard descriptors before those
+     * are replaced. The originals may themselves be 0, 1, or 2. */
+    int status_kept = -1;
+    if (have_status) {
+      status_kept = fcntl(status_pipe[1], F_DUPFD, 8);
+      if (status_kept < 0)
+        _exit(127);
+      close(status_pipe[0]);
+      close(status_pipe[1]);
+    }
     /* Test seams. Copied before clearenv and restored only when not root. */
     const std::string stub_script = saved_env("LCOS_STUB_SCRIPT");
     const std::string stub_pid = saved_env("LCOS_STUB_PIDFILE");
@@ -261,6 +283,13 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     close(out_pipe[1]);
     close(err_pipe[0]);
     close(err_pipe[1]);
+    if (status_kept >= 0) {
+      if (dup2(status_kept, 3) < 0)
+        _exit(127);
+      if (status_kept != 3)
+        close(status_kept);
+      fcntl(3, F_SETFD, 0);
+    }
     if (clearenv() != 0)
       _exit(127);
     if (setenv("PATH", kSafePath, 1) != 0 || setenv("LANG", "C.UTF-8", 1) != 0 ||
@@ -290,6 +319,11 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   close(err_pipe[1]);
   fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
   fcntl(err_pipe[0], F_SETFL, O_NONBLOCK);
+  if (have_status) {
+    close(status_pipe[1]);
+    status_pipe[1] = -1;
+    fcntl(status_pipe[0], F_SETFL, O_NONBLOCK);
+  }
 
   CaptureBuf out_cap;
   CaptureBuf err_cap;
@@ -300,6 +334,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
 
   bool out_open = true;
   bool err_open = true;
+  bool status_open = have_status;
   bool timed_out = false;
   bool cancelled = false;
   bool configuring = false;
@@ -313,6 +348,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   bool did_scan = false;
   bool did_progress = false;
   std::string progress_hold;
+  std::string status_hold;
   std::string progress_pending;
   std::vector<DpkgNote> dpkg_seen;
 
@@ -404,7 +440,15 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   auto emit_progress = [&](const std::string& clean) {
     if (!forward_progress || drop_progress(clean))
       return;
+    /* A real package name must not be dropped when apt's next line is
+     * [Working] a few milliseconds later. */
+    if (!progress_package_name(clean).empty()) {
+      publish_progress(clean);
+      return;
+    }
     if (did_progress && elapsed_ms(last_progress) < 200) {
+      if (!progress_package_name(progress_pending).empty())
+        return;
       progress_pending = clean;
       return;
     }
@@ -416,7 +460,13 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (force && !progress_hold.empty()) {
       const std::string clean = clean_progress(progress_hold);
       progress_hold.clear();
-      if (!drop_progress(clean))
+      if (!drop_progress(clean) && progress_package_name(progress_pending).empty())
+        progress_pending = clean;
+    }
+    if (force && !status_hold.empty()) {
+      const std::string clean = clean_progress(status_hold);
+      status_hold.clear();
+      if (!drop_progress(clean) && progress_package_name(progress_pending).empty())
         progress_pending = clean;
     }
     if (progress_pending.empty())
@@ -445,6 +495,21 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       const std::string::size_type cut = cr < nl ? cr : nl;
       emit_progress(clean_progress(progress_hold.substr(0, cut)));
       progress_hold.erase(0, cut + 1);
+    }
+  };
+  auto note_status = [&](const char* data, std::size_t n) {
+    struct timespec now {};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    last_output = now;
+    status_hold.append(data, n);
+    if (status_hold.size() > 8192)
+      status_hold.erase(0, status_hold.size() - 1024);
+    for (;;) {
+      const std::string::size_type nl = status_hold.find('\n');
+      if (nl == std::string::npos)
+        break;
+      emit_progress(clean_progress(status_hold.substr(0, nl)));
+      status_hold.erase(0, nl + 1);
     }
   };
   auto interrupted_code = [&]() -> int {
@@ -478,8 +543,11 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       close(out_pipe[0]);
     if (err_open)
       close(err_pipe[0]);
+    if (status_open)
+      close(status_pipe[0]);
     out_open = false;
     err_open = false;
+    status_open = false;
     for (;;) {
       int status = 0;
       const pid_t got = waitpid(pid, &status, 0);
@@ -495,7 +563,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   };
 
   for (;;) {
-    while (out_open || err_open) {
+    while (out_open || err_open || status_open) {
       scan_configure(false);
       flush_progress(false);
       if (g_dpkg_committed) {
@@ -516,10 +584,11 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
           break;
         }
       }
-      pollfd fds[3];
+      pollfd fds[4];
       nfds_t nfd = 0;
       int out_i = -1;
       int err_i = -1;
+      int status_i = -1;
       int cancel_i = -1;
       if (out_open) {
         out_i = static_cast<int>(nfd);
@@ -531,6 +600,13 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       if (err_open) {
         err_i = static_cast<int>(nfd);
         fds[nfd].fd = err_pipe[0];
+        fds[nfd].events = POLLIN | POLLHUP | POLLERR;
+        fds[nfd].revents = 0;
+        nfd++;
+      }
+      if (status_open) {
+        status_i = static_cast<int>(nfd);
+        fds[nfd].fd = status_pipe[0];
         fds[nfd].events = POLLIN | POLLHUP | POLLERR;
         fds[nfd].revents = 0;
         nfd++;
@@ -583,6 +659,20 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       };
       drain(out_i, out_pipe[0], out_open, out_cap);
       drain(err_i, err_pipe[0], err_open, err_cap);
+      if (status_i >= 0 && (fds[status_i].revents & (POLLIN | POLLHUP | POLLERR))) {
+        for (;;) {
+          const ssize_t n = read(status_pipe[0], buf, sizeof buf);
+          if (n > 0) {
+            note_status(buf, static_cast<std::size_t>(n));
+            continue;
+          }
+          if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+            status_open = false;
+          break;
+        }
+        if (!status_open)
+          close(status_pipe[0]);
+      }
     }
 
     flush_progress(true);
@@ -599,7 +689,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (g_dpkg_committed) {
       timed_out = false;
       cancelled = false;
-      if (!out_open && !err_open)
+      if (!out_open && !err_open && !status_open)
         break;
       continue;
     }
@@ -607,14 +697,14 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (g_dpkg_committed) {
       cancelled = false;
       timed_out = false;
-      if (!out_open && !err_open)
+      if (!out_open && !err_open && !status_open)
         break;
       continue;
     }
     if (configuring) {
       /* Do not close apt's pipes and do not return. Wait until apt exits. */
       timed_out = false;
-      if (!out_open && !err_open)
+      if (!out_open && !err_open && !status_open)
         break;
       continue;
     }
@@ -630,7 +720,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       timed_out = false;
       if (!configuring)
         poll(nullptr, 0, 200);
-      if (!out_open && !err_open)
+      if (!out_open && !err_open && !status_open)
         break;
       continue;
     }
@@ -643,8 +733,11 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     close(out_pipe[0]);
   if (err_open)
     close(err_pipe[0]);
+  if (status_open)
+    close(status_pipe[0]);
   out_open = false;
   err_open = false;
+  status_open = false;
   int status = 0;
   for (;;) {
     const pid_t got = waitpid(pid, &status, 0);
@@ -958,8 +1051,17 @@ bool same_package_set(const std::vector<PackageUpgrade>& packages, const std::ve
   std::vector<std::string> got;
   got.reserve(packages.size());
   for (const auto& pkg : packages)
-    got.push_back(pkg.name + "=" + pkg.new_version);
-  std::vector<std::string> want = pins;
+    got.push_back(pkg.name + "=" + canonical_deb_version(pkg.new_version));
+  std::vector<std::string> want;
+  want.reserve(pins.size());
+  for (const auto& pin : pins) {
+    const std::string::size_type eq = pin.find('=');
+    if (eq == std::string::npos) {
+      want.push_back(pin);
+      continue;
+    }
+    want.push_back(pin.substr(0, eq) + "=" + canonical_deb_version(pin.substr(eq + 1)));
+  }
   std::sort(got.begin(), got.end());
   std::sort(want.begin(), want.end());
   return got == want;

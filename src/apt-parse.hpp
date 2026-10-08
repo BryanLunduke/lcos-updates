@@ -92,8 +92,42 @@ bool parse_inst_line(const std::string& line, PackageUpgrade& out);
  * apt writes before the next percent. It is not a status. */
 bool progress_line_visible(const std::string& line);
 
-/* Leading "28%" or a trailing "Reading package lists... 59%". -1 when absent. */
+/* Leading "28%" or a trailing "Reading package lists... 59%".
+ * A status-fd line uses the float percent (dlstatus:1:17.5000:…). -1 when absent. */
 int progress_percent(const std::string& line);
+
+/* Package named by a progress line. Empty for apt placeholders ([Working],
+ * [Connecting …], [Waiting …]), Hit/Get/Ign/Err prefixes, dlstatus text,
+ * dpkg-exec, and error lines. */
+std::string progress_package_name(const std::string& line);
+
+/* True when the line must not replace a status that already names a package. */
+bool progress_is_download_noise(const std::string& line);
+
+/* Unpacking, Setting up, or a pmstatus line that names a real package. */
+bool progress_is_configure_line(const std::string& line);
+
+/* How one progress segment updates the line on screen.
+ * A placeholder does not replace a line that already names a package.
+ * The percent is still taken from the new segment. */
+struct AptProgressNote {
+  bool replace_shown = false;
+  std::string shown;
+  bool have_percent = false;
+  int percent = -1;
+};
+
+AptProgressNote apt_progress_note(const std::string& line, const std::string& current_shown);
+
+/* Sentence for the line currently on screen. Placeholders never become a name. */
+std::string friendly_progress_text(const std::string& line, const std::string& phase);
+
+/* Percent-decode apt's filename version (%3a is the epoch colon). */
+std::string canonical_deb_version(const std::string& version);
+
+/* True when two versions are the same after filename decoding.
+ * An epoch (N:ver) is part of the version. */
+bool deb_versions_match(const std::string& a, const std::string& b);
 
 /* True for a Release/InRelease body whose Origin is Debian-Security, or whose
  * Label, Suite, or Codename ends in -security. */

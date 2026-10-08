@@ -207,70 +207,58 @@ bool progress_has_count(const Glib::ustring& line)
   return line.find('(') != Glib::ustring::npos && line.find(" of ") != Glib::ustring::npos;
 }
 
-Glib::ustring download_package_name(const Glib::ustring& line)
-{
-  const auto bracket = line.find('[');
-  if (bracket != Glib::ustring::npos) {
-    auto i = bracket + 1;
-    while (i < line.size() && line[i] == ' ')
-      ++i;
-    if (i < line.size() && g_ascii_isdigit(line[i])) {
-      while (i < line.size() && g_ascii_isdigit(line[i]))
-        ++i;
-      while (i < line.size() && line[i] == ' ')
-        ++i;
-    }
-    const auto end = line.find_first_of(" ]", i);
-    if (end != Glib::ustring::npos && end > i)
-      return line.substr(i, end - i);
-  }
-  if (line.compare(0, 4, "Get:") == 0) {
-    const auto slash = line.rfind('/');
-    const auto deb = line.find(".deb");
-    if (slash != Glib::ustring::npos && deb != Glib::ustring::npos && deb > slash + 1) {
-      const Glib::ustring file = line.substr(slash + 1, deb - (slash + 1));
-      const auto us = file.find('_');
-      if (us == Glib::ustring::npos)
-        return file;
-      if (us > 0)
-        return file.substr(0, us);
-    }
-  }
-  return {};
-}
-
-Glib::ustring friendly_progress(const Glib::ustring& line, const Glib::ustring& phase)
-{
-  if (line.compare(0, 21, "Reading package lists") == 0)
-    return "Reading package lists…";
-  if (line.compare(0, 19, "Calculating upgrade") == 0)
-    return "Calculating upgrade…";
-  if (line.compare(0, 24, "Building dependency tree") == 0)
-    return "Building dependency tree…";
-  const Glib::ustring pkg = download_package_name(line);
-  if (!pkg.empty() && (line.compare(0, 4, "Get:") == 0 || progress_percent(line) >= 0))
-    return "Downloading " + pkg + "…";
-  if (phase == "download")
-    return "Downloading updates…";
-  return line;
-}
-
 Glib::ustring package_being_configured(const Glib::ustring& line)
 {
-  const char* prefixes[] = {"Setting up ", "Unpacking "};
-  for (const char* prefix : prefixes) {
-    const std::size_t n = std::strlen(prefix);
-    if (line.compare(0, n, prefix) != 0)
+  if (!progress_is_configure_line(std::string(line)))
+    return {};
+  return progress_package_name(std::string(line));
+}
+
+std::string read_fd_text(int fd)
+{
+  if (fd < 0)
+    return {};
+  const int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0)
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  std::string out;
+  char buf[512];
+  for (;;) {
+    const ssize_t n = ::read(fd, buf, sizeof buf);
+    if (n > 0) {
+      out.append(buf, static_cast<std::size_t>(n));
+      if (out.size() > 2000) {
+        out.resize(2000);
+        break;
+      }
       continue;
-    Glib::ustring rest = line.substr(n);
-    const auto end = rest.find_first_of(" (");
-    if (end != Glib::ustring::npos)
-      rest = rest.substr(0, end);
-    while (!rest.empty() && (rest[rest.size() - 1] == '.' || rest[rest.size() - 1] == ' '))
-      rest.erase(rest.size() - 1);
-    return rest;
+    }
+    break;
   }
-  return {};
+  std::string reason;
+  for (char ch : out) {
+    if (ch == '\r' || ch == '\n' || ch == '\t')
+      reason.push_back(' ');
+    else
+      reason.push_back(ch);
+  }
+  std::size_t begin = 0;
+  while (begin < reason.size() && reason[begin] == ' ')
+    ++begin;
+  std::size_t end = reason.size();
+  while (end > begin && reason[end - 1] == ' ')
+    --end;
+  reason = reason.substr(begin, end - begin);
+  if (reason.size() > 180)
+    reason.resize(180);
+  return reason;
+}
+
+std::string restart_failure_text(const std::string& reason)
+{
+  if (reason.empty())
+    return "Could not restart this computer.";
+  return "Could not restart this computer. " + reason;
 }
 
 std::string authentication_message(const std::string& err, int exit_code)
@@ -321,10 +309,14 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_status.set_line_wrap(true);
   m_status.set_line_wrap_mode(Pango::WRAP_WORD_CHAR);
   m_status.set_max_width_chars(64);
+  /* Selectable so a long error can be copied, but not focusable: a focused
+   * selectable label opens with its whole sentence highlighted. */
   m_status.set_selectable(true);
+  m_status.set_can_focus(false);
   m_status.set_xalign(0.0f);
   m_status.set_yalign(0.0f);
-  m_status.set_text("Check for updates.");
+  set_status_text("Check for updates.");
+  m_status.select_region(0, 0);
 
   /* A long apt error wraps inside the window and scrolls instead of pushing
    * the buttons off the screen. */
@@ -374,11 +366,13 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_view.get_selection()->set_mode(Gtk::SELECTION_NONE);
   /* Fixed shares keep the versions and the size inside the window. Long
    * package names ellipsize instead of pushing the new version off screen. */
-  tune_column(0, 160, true, true);
-  tune_column(1, 168, false, false);
-  tune_column(2, 210, false, false);
-  tune_column(3, 96, false, false);
-  tune_column(4, 84, false, false);
+  tune_column(0, 160, true, Pango::ELLIPSIZE_END, false);
+  tune_column(1, 168, false, Pango::ELLIPSIZE_MIDDLE, true);
+  tune_column(2, 210, false, Pango::ELLIPSIZE_MIDDLE, true);
+  tune_column(3, 96, false, Pango::ELLIPSIZE_NONE, false);
+  tune_column(4, 84, false, Pango::ELLIPSIZE_NONE, false);
+  m_view.set_has_tooltip(true);
+  m_view.signal_query_tooltip().connect(sigc::mem_fun(*this, &UpdatesWindow::on_view_tooltip));
 
   m_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
   m_scroller.set_shadow_type(Gtk::SHADOW_IN);
@@ -423,6 +417,11 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   show_all_children();
   m_check.grab_default();
   set_default(m_check);
+  signal_map().connect([this]() {
+    m_status.select_region(0, 0);
+    if (m_job == Job::None && m_check.get_sensitive())
+      m_check.grab_focus();
+  });
 
   if (check_on_start)
     request_check();
@@ -513,10 +512,16 @@ bool UpdatesWindow::on_check_idle()
   return false;
 }
 
+void UpdatesWindow::set_status_text(const Glib::ustring& status)
+{
+  m_status.set_text(status);
+  m_status.select_region(0, 0);
+}
+
 void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
 {
   /* Always replace prior error/status text — never leave a stale string. */
-  m_status.set_text(status);
+  set_status_text(status);
   m_check.set_sensitive(!busy);
   m_cancel.set_sensitive(busy && !m_install_committed);
   if (busy)
@@ -587,6 +592,7 @@ void UpdatesWindow::show_packages(const std::vector<PackageUpgrade>& packages)
     row[m_cols.package] = pkg.name;
     row[m_cols.old_version] = pkg.old_version;
     row[m_cols.new_version] = pkg.new_version;
+    row[m_cols.version_tip] = pkg.old_version + " → " + pkg.new_version;
     row[m_cols.size] = pkg.size;
     row[m_cols.security] = pkg.security ? "Yes" : "";
   }
@@ -636,18 +642,46 @@ void UpdatesWindow::hide_package_list()
   use_check_as_default();
 }
 
-void UpdatesWindow::tune_column(int index, int width, bool expand, bool ellipsize)
+void UpdatesWindow::tune_column(int index, int width, bool expand, Pango::EllipsizeMode ellipsize,
+                                bool resizable)
 {
   Gtk::TreeViewColumn* column = m_view.get_column(index);
   if (column == nullptr)
     return;
   column->set_sizing(Gtk::TREE_VIEW_COLUMN_FIXED);
   column->set_fixed_width(width);
-  column->set_min_width(width);
-  column->set_resizable(false);
+  column->set_min_width(resizable ? 96 : width);
+  column->set_resizable(resizable);
   column->set_expand(expand);
   if (auto* cell = dynamic_cast<Gtk::CellRendererText*>(column->get_first_cell()))
-    cell->property_ellipsize() = ellipsize ? Pango::ELLIPSIZE_END : Pango::ELLIPSIZE_NONE;
+    cell->property_ellipsize() = ellipsize;
+}
+
+bool UpdatesWindow::on_view_tooltip(int x, int y, bool /*keyboard_tooltip*/,
+                                    const Glib::RefPtr<Gtk::Tooltip>& tooltip)
+{
+  Gtk::TreeModel::Path path;
+  Gtk::TreeViewColumn* column = nullptr;
+  int cell_x = 0;
+  int cell_y = 0;
+  if (!m_view.get_path_at_pos(x, y, path, column, cell_x, cell_y) || column == nullptr)
+    return false;
+  const std::vector<Gtk::TreeViewColumn*> columns = m_view.get_columns();
+  const auto found = std::find(columns.begin(), columns.end(), column);
+  if (found == columns.end())
+    return false;
+  const int index = static_cast<int>(found - columns.begin());
+  if (index != 1 && index != 2)
+    return false;
+  auto iter = m_store->get_iter(path);
+  if (!iter)
+    return false;
+  const Glib::ustring tip = (*iter)[m_cols.version_tip];
+  if (tip.empty())
+    return false;
+  tooltip->set_text(tip);
+  m_view.set_tooltip_cell(tooltip, &path, column, nullptr);
+  return true;
 }
 
 void UpdatesWindow::order_trailing(Gtk::Button& trailing)
@@ -717,7 +751,7 @@ void UpdatesWindow::request_stop()
     m_install.set_sensitive(false);
     m_commit_note.show();
     if (m_dpkg_started)
-      m_status.set_text("Configuring packages…");
+      set_status_text("Configuring packages…");
     return;
   }
   m_stopping = true;
@@ -730,7 +764,7 @@ void UpdatesWindow::request_stop()
   const Job job = m_job;
   m_check.set_sensitive(false);
   m_install.set_sensitive(false);
-  m_status.set_text(job == Job::Install ? "Stopping the update…" : "Stopping the update check…");
+  set_status_text(job == Job::Install ? "Stopping the update…" : "Stopping the update check…");
   if (m_helper_ready || !m_have_pid)
     return;
   const pid_t child = static_cast<pid_t>(m_pid);
@@ -936,21 +970,25 @@ void UpdatesWindow::append_stderr(const char* data, std::size_t n)
       m_phase = next;
     }
     else if (line.compare(0, 9, "PROGRESS ") == 0) {
-      const Glib::ustring raw(line.substr(9));
+      std::string raw = line.substr(9);
+      if (raw.size() > 240)
+        raw.resize(240);
       /* A spaces-only clear-line, or an Inst/Conf plan line, must not blank
-       * the status or drop the percent the bar is already showing. */
-      if (progress_line_visible(raw) && !apt_plan_line(raw)) {
-        m_progress_line = raw;
+       * the status or drop the percent the bar is already showing. A
+       * placeholder such as [Working] updates the percent and leaves the
+       * package name that is already on screen. */
+      const AptProgressNote note = apt_progress_note(raw, std::string(m_progress_line));
+      if (note.replace_shown) {
+        m_progress_line = note.shown;
         if (m_progress_line.size() > 240)
           m_progress_line.resize(240);
-        const int pct = progress_percent(std::string(m_progress_line));
-        if (pct >= 0)
-          m_progress_percent = pct;
-        if (m_progress_percent >= 0 && m_progress.get_visible()) {
-          m_progress.set_show_text(true);
-          m_progress.set_text(std::to_string(m_progress_percent) + "%");
-          m_progress.set_fraction(static_cast<double>(m_progress_percent) / 100.0);
-        }
+      }
+      if (note.have_percent)
+        m_progress_percent = note.percent;
+      if (m_progress_percent >= 0 && m_progress.get_visible()) {
+        m_progress.set_show_text(true);
+        m_progress.set_text(std::to_string(m_progress_percent) + "%");
+        m_progress.set_fraction(static_cast<double>(m_progress_percent) / 100.0);
       }
     }
     if (m_stderr_first_error.empty() && line.compare(0, 2, "E:") == 0) {
@@ -1034,7 +1072,7 @@ void UpdatesWindow::maybe_rearm_job_timeout()
   arm_phase_timer();
   show_job_progress();
   if (!m_dpkg_started && m_phase.empty() && m_progress_line.empty())
-    m_status.set_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
+    set_status_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
   apply_phase_status();
   if (m_dpkg_started || m_install_committed)
     return;
@@ -1060,7 +1098,7 @@ void UpdatesWindow::maybe_note_dpkg()
     m_phase_mark_us = g_get_monotonic_time();
     m_progress_mark_us = m_phase_mark_us;
     arm_phase_timer();
-    m_status.set_text("Configuring packages…");
+    set_status_text("Configuring packages…");
     if (m_install_committed) {
       m_cancel.set_sensitive(false);
       m_commit_note.show();
@@ -1077,7 +1115,7 @@ void UpdatesWindow::maybe_note_dpkg()
   arm_job_timeout();
   apply_phase_status();
   if (m_progress_line.empty() && m_phase.empty())
-    m_status.set_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
+    set_status_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
 }
 
 void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages)
@@ -1128,7 +1166,7 @@ bool UpdatesWindow::on_timeout()
     m_cancel.set_sensitive(false);
     m_commit_note.show();
     if (m_dpkg_started)
-      m_status.set_text("Configuring packages…");
+      set_status_text("Configuring packages…");
     return false;
   }
   m_stopped_job = m_job == Job::None ? m_stopped_job : m_job;
@@ -1422,11 +1460,14 @@ void UpdatesWindow::on_restart_clicked()
 {
   if (!m_restart.get_sensitive() || m_restart_dialog != nullptr || m_job != Job::None)
     return;
-  m_restart_primary = "Restart now?";
+  m_restart_primary = "Restart this computer now?";
+  m_restart_secondary =
+      "The computer will restart now. Open applications will be closed, so save your work first.";
   auto* dialog = new Gtk::MessageDialog(*this, m_restart_primary, false, Gtk::MESSAGE_QUESTION,
                                         Gtk::BUTTONS_NONE, true);
-  dialog->add_button("_Cancel", Gtk::RESPONSE_CANCEL);
-  dialog->add_button("_Restart", Gtk::RESPONSE_OK);
+  dialog->set_secondary_text(m_restart_secondary);
+  dialog->add_button("_Don't restart", Gtk::RESPONSE_CANCEL);
+  dialog->add_button("_Restart now", Gtk::RESPONSE_OK);
   dialog->set_default_response(Gtk::RESPONSE_CANCEL);
   m_restart_dialog = dialog;
   dialog->signal_response().connect([this](int response) {
@@ -1454,26 +1495,32 @@ void UpdatesWindow::spawn_reboot()
     Glib::spawn_async_with_pipes(std::string(), argv, Glib::SPAWN_DO_NOT_REAP_CHILD,
                                  sigc::slot<void>(), &pid, nullptr, nullptr, &err_fd);
   } catch (const Glib::Error&) {
-    m_status.set_text("Could not restart this computer.");
+    set_status_text("Could not restart this computer.");
     m_restart.set_sensitive(true);
     return;
   }
   if (m_reboot_err_fd >= 0)
     ::close(m_reboot_err_fd);
   m_reboot_err_fd = err_fd;
-  m_status.set_text("Restarting…");
+  if (m_reboot_err_fd >= 0) {
+    const int flags = fcntl(m_reboot_err_fd, F_GETFL, 0);
+    if (flags >= 0)
+      fcntl(m_reboot_err_fd, F_SETFL, flags | O_NONBLOCK);
+  }
+  set_status_text("Restarting…");
   m_reboot_watch.disconnect();
   m_reboot_watch = Glib::signal_child_watch().connect(
       [this](Glib::Pid child, int wait_status) {
         Glib::spawn_close_pid(child);
         m_reboot_watch.disconnect();
+        const std::string reason = read_fd_text(m_reboot_err_fd);
         if (m_reboot_err_fd >= 0) {
           ::close(m_reboot_err_fd);
           m_reboot_err_fd = -1;
         }
         const bool ok = WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0;
         if (!ok) {
-          m_status.set_text("Could not restart this computer.");
+          set_status_text(restart_failure_text(reason));
           m_restart.set_sensitive(true);
         }
       },
@@ -1642,7 +1689,7 @@ void UpdatesWindow::apply_phase_status()
     else
       text = "Configuring " + pkg + "…";
   } else if (progress_line_visible(m_progress_line) && !apt_plan_line(m_progress_line))
-    text = friendly_progress(m_progress_line, m_phase);
+    text = friendly_progress_text(std::string(m_progress_line), std::string(m_phase));
   else if (m_phase == "refresh")
     text = "Refreshing package lists…";
   else if (m_phase == "download")
@@ -1653,7 +1700,7 @@ void UpdatesWindow::apply_phase_status()
     return;
   if (!progress_has_count(text))
     text += phase_age_suffix();
-  m_status.set_text(text);
+  set_status_text(text);
   refresh_commit_note();
 }
 
@@ -1747,7 +1794,7 @@ bool UpdatesWindow::on_phase_tick()
       else
         text += " Shutdown is no longer blocked.";
     }
-    m_status.set_text(text);
+    set_status_text(text);
     refresh_commit_note();
     if (!get_visible() || m_background) {
       /* 10 minutes with no progress: tell them the install is still running.
@@ -1854,7 +1901,7 @@ bool UpdatesWindow::restart_default_is_cancel_for_test() const
   if (m_restart_dialog == nullptr)
     return false;
   auto* def = dynamic_cast<Gtk::Button*>(m_restart_dialog->get_default_widget());
-  return def != nullptr && def->get_label() == "_Cancel";
+  return def != nullptr && def->get_label() == "_Don't restart";
 }
 
 int UpdatesWindow::package_rows_for_test() const
@@ -1909,11 +1956,51 @@ bool UpdatesWindow::columns_fit_for_test() const
     if (i == 0) {
       if (cell->property_ellipsize() != Pango::ELLIPSIZE_END)
         return false;
+    } else if (i == 1 || i == 2) {
+      if (cell->property_ellipsize() != Pango::ELLIPSIZE_MIDDLE || !column->get_resizable())
+        return false;
     } else if (cell->property_ellipsize() != Pango::ELLIPSIZE_NONE) {
       return false;
     }
   }
   return true;
+}
+
+bool UpdatesWindow::version_columns_ready_for_test() const
+{
+  for (int index : {1, 2}) {
+    const Gtk::TreeViewColumn* column = m_view.get_column(index);
+    if (column == nullptr || !column->get_resizable())
+      return false;
+    const auto* cell = dynamic_cast<const Gtk::CellRendererText*>(column->get_first_cell());
+    if (cell == nullptr || cell->property_ellipsize() != Pango::ELLIPSIZE_MIDDLE)
+      return false;
+  }
+  return true;
+}
+
+Glib::ustring UpdatesWindow::version_tip_for_test(int row) const
+{
+  const auto children = m_store->children();
+  if (row < 0 || row >= static_cast<int>(children.size()))
+    return {};
+  return (*children[static_cast<std::size_t>(row)])[m_cols.version_tip];
+}
+
+Glib::ustring UpdatesWindow::old_version_at_row_for_test(int row) const
+{
+  const auto children = m_store->children();
+  if (row < 0 || row >= static_cast<int>(children.size()))
+    return {};
+  return (*children[static_cast<std::size_t>(row)])[m_cols.old_version];
+}
+
+Glib::ustring UpdatesWindow::new_version_at_row_for_test(int row) const
+{
+  const auto children = m_store->children();
+  if (row < 0 || row >= static_cast<int>(children.size()))
+    return {};
+  return (*children[static_cast<std::size_t>(row)])[m_cols.new_version];
 }
 
 bool UpdatesWindow::ask_default_is_cancel_for_test() const
