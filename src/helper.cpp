@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -42,10 +43,15 @@ const char kDpkgRecovery[] =
 const char kSafePath[] = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 volatile sig_atomic_t g_stop = 0;
+/* Set once the install's apt has started unpacking or configuring. After
+ * that, stdin EOF and session SIGTERM/SIGHUP are not a cancel. */
+volatile sig_atomic_t g_dpkg_committed = 0;
 int g_cancel_fd = -1;
 
 void on_stop_signal(int /*sig*/)
 {
+  if (g_dpkg_committed)
+    return;
   g_stop = 1;
 }
 
@@ -61,18 +67,45 @@ const char* apt_get_path()
   return kAptGet;
 }
 
-int effective_timeout(int fallback)
+struct AptClock {
+  int idle_sec = 0;
+  int hard_sec = 0;
+};
+
+int parse_clock_env(const char* key, int max_sec)
 {
-  if (geteuid() == 0)
-    return fallback;
-  const char* env = std::getenv("LCOS_UPDATES_TIMEOUT_SEC");
+  const char* env = std::getenv(key);
   if (env == nullptr || env[0] == '\0')
-    return fallback;
+    return 0;
   char* end = nullptr;
   const long parsed = std::strtol(env, &end, 10);
-  if (end == env || *end != '\0' || parsed < 1 || parsed > 30)
-    return fallback;
+  if (end == env || *end != '\0' || parsed < 1 || parsed > max_sec)
+    return 0;
   return static_cast<int>(parsed);
+}
+
+/* Non-root tests may shorten the idle clock (LCOS_UPDATES_TIMEOUT_SEC, 1..30)
+ * and the hard cap (LCOS_UPDATES_HARD_CAP_SEC, 1..120). Root ignores both.
+ * An idle override without a hard cap uses the same value for both, so the
+ * existing kill tests still finish. */
+AptClock apt_clock(int idle_fallback, int hard_fallback)
+{
+  AptClock clock;
+  clock.idle_sec = idle_fallback;
+  clock.hard_sec = hard_fallback;
+  if (geteuid() == 0)
+    return clock;
+  const int idle = parse_clock_env("LCOS_UPDATES_TIMEOUT_SEC", 30);
+  const int hard = parse_clock_env("LCOS_UPDATES_HARD_CAP_SEC", 120);
+  if (idle > 0)
+    clock.idle_sec = idle;
+  if (hard > 0)
+    clock.hard_sec = hard;
+  else if (idle > 0)
+    clock.hard_sec = idle;
+  if (clock.hard_sec < clock.idle_sec)
+    clock.hard_sec = clock.idle_sec;
+  return clock;
 }
 
 void write_all_fd(int fd, const std::string& s)
@@ -101,6 +134,11 @@ void announce_ready()
   write_all_fd(STDERR_FILENO, "HELPER_READY\n");
 }
 
+void emit_phase(const char* phase)
+{
+  write_all_fd(STDERR_FILENO, std::string("PHASE ") + phase + "\n");
+}
+
 void emit(const SimulateResult& result)
 {
   write_all_stdout(format_protocol(result));
@@ -116,6 +154,10 @@ void emit_error(const std::string& msg)
 
 bool stop_requested()
 {
+  /* Once dpkg has started unpacking or configuring, the install finishes.
+   * EOF on the cancel pipe and a session SIGTERM/SIGHUP are ignored. */
+  if (g_dpkg_committed)
+    return false;
   if (g_stop)
     return true;
   if (g_cancel_fd < 0)
@@ -150,7 +192,7 @@ void restore_env(const char* key, const std::string& value)
 /* watch_configure is false for apt-get update and for simulations. A
  * configuring dpkg latches only for the install invocation, and only while
  * that dpkg is still alive. */
-int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& out,
+int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, std::string& out,
             std::string& err, bool watch_configure)
 {
   int out_pipe[2] = {-1, -1};
@@ -180,6 +222,9 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
     signal(SIGTERM, SIG_DFL);
     signal(SIGINT, SIG_DFL);
     signal(SIGPIPE, SIG_DFL);
+    /* Session teardown sends SIGHUP. The helper still cancels apt itself
+     * with SIGTERM/SIGKILL before dpkg has started. */
+    signal(SIGHUP, SIG_IGN);
     std::vector<std::string> saved_args;
     saved_args.reserve(args.size());
     for (const char* arg : args) {
@@ -195,6 +240,7 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
     const std::string stub_count = saved_env("LCOS_STUB_COUNTFILE");
     const std::string stub_argv = saved_env("LCOS_STUB_ARGVFILE");
     const std::string stub_env = saved_env("LCOS_STUB_ENVFILE");
+    const std::string stub_state = saved_env("LCOS_STUB_STATEFILE");
     const int devnull = open("/dev/null", O_RDONLY);
     if (devnull >= 0) {
       dup2(devnull, STDIN_FILENO);
@@ -219,6 +265,7 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
       restore_env("LCOS_STUB_COUNTFILE", stub_count);
       restore_env("LCOS_STUB_ARGVFILE", stub_argv);
       restore_env("LCOS_STUB_ENVFILE", stub_env);
+      restore_env("LCOS_STUB_STATEFILE", stub_state);
     }
     std::vector<char*> argv;
     argv.reserve(saved_args.size() + 1);
@@ -251,25 +298,50 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
   char buf[4096];
   struct timespec start {};
   clock_gettime(CLOCK_MONOTONIC, &start);
+  struct timespec last_output = start;
   struct timespec last_scan {};
+  struct timespec last_progress {};
   bool did_scan = false;
+  bool did_progress = false;
+  std::string progress_hold;
 
-  auto remaining_ms = [&]() -> int {
+  auto elapsed_ms = [](const struct timespec& from) -> long {
     struct timespec now {};
     clock_gettime(CLOCK_MONOTONIC, &now);
-    const long elapsed = (now.tv_sec - start.tv_sec) * 1000L +
-                         (now.tv_nsec - start.tv_nsec) / 1000000L;
-    const long remain = static_cast<long>(timeout_sec) * 1000L - elapsed;
+    return (now.tv_sec - from.tv_sec) * 1000L + (now.tv_nsec - from.tv_nsec) / 1000000L;
+  };
+  auto remain_from = [&](const struct timespec& from, int seconds) -> int {
+    const long remain = static_cast<long>(seconds) * 1000L - elapsed_ms(from);
     if (remain <= 0)
       return 0;
     if (remain > 1000000000L)
       return 1000000000;
     return static_cast<int>(remain);
   };
+  /* Idle restarts when apt writes. The hard cap does not. */
+  auto budget_ms = [&]() -> int {
+    const int idle = remain_from(last_output, idle_sec);
+    const int hard = remain_from(start, hard_sec);
+    return idle < hard ? idle : hard;
+  };
+
+  auto shift_clock = [](struct timespec& ts, const struct timespec& began, const struct timespec& now) {
+    ts.tv_sec += now.tv_sec - began.tv_sec;
+    ts.tv_nsec += now.tv_nsec - began.tv_nsec;
+    if (ts.tv_nsec >= 1000000000L) {
+      ts.tv_sec += ts.tv_nsec / 1000000000L;
+      ts.tv_nsec %= 1000000000L;
+    } else if (ts.tv_nsec < 0) {
+      const long borrow = (-ts.tv_nsec + 999999999L) / 1000000000L;
+      ts.tv_sec -= borrow;
+      ts.tv_nsec += borrow * 1000000000L;
+    }
+  };
 
   struct timespec cfg_began {};
-  /* Pause the apt deadline while a configuring dpkg is alive, then apply
-   * whatever time is left once that dpkg has left the tree. */
+  /* Pause both clocks while a configuring dpkg is alive. The first time that
+   * dpkg appears, the install is committed: later EOF or SIGTERM is not a
+   * cancel, including the gap before apt starts the next package. */
   auto publish_cfg = [&](bool now_cfg) {
     if (now_cfg == configuring)
       return;
@@ -277,20 +349,52 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (now_cfg) {
       cfg_began = now;
+      g_dpkg_committed = 1;
+      g_stop = 0;
+      cancelled = false;
     } else {
-      start.tv_sec += now.tv_sec - cfg_began.tv_sec;
-      start.tv_nsec += now.tv_nsec - cfg_began.tv_nsec;
-      if (start.tv_nsec >= 1000000000L) {
-        start.tv_sec += start.tv_nsec / 1000000000L;
-        start.tv_nsec %= 1000000000L;
-      } else if (start.tv_nsec < 0) {
-        const long borrow = (-start.tv_nsec + 999999999L) / 1000000000L;
-        start.tv_sec -= borrow;
-        start.tv_nsec += borrow * 1000000000L;
-      }
+      shift_clock(start, cfg_began, now);
+      shift_clock(last_output, cfg_began, now);
     }
     configuring = now_cfg;
     write_all_fd(STDERR_FILENO, configuring ? "DPKG_STARTED\n" : "DPKG_IDLE\n");
+  };
+
+  auto note_apt_output = [&](const char* data, std::size_t n) {
+    struct timespec now {};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    last_output = now;
+    progress_hold.append(data, n);
+    if (progress_hold.size() > 8192)
+      progress_hold.erase(0, progress_hold.size() - 1024);
+    const std::string::size_type nl = progress_hold.rfind('\n');
+    if (nl == std::string::npos)
+      return;
+    std::string chunk = progress_hold.substr(0, nl);
+    progress_hold.erase(0, nl + 1);
+    const std::string::size_type prev = chunk.rfind('\n');
+    std::string line = prev == std::string::npos ? chunk : chunk.substr(prev + 1);
+    const std::string::size_type cr = line.rfind('\r');
+    if (cr != std::string::npos)
+      line = line.substr(cr + 1);
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    std::string clean;
+    for (char ch : line) {
+      const unsigned char c = static_cast<unsigned char>(ch);
+      if (c < 32)
+        continue;
+      clean.push_back(ch);
+      if (clean.size() >= 240)
+        break;
+    }
+    if (clean.empty())
+      return;
+    if (did_progress && elapsed_ms(last_progress) < 200)
+      return;
+    did_progress = true;
+    last_progress = now;
+    write_all_fd(STDERR_FILENO, "PROGRESS " + clean + "\n");
   };
 
   /* /proc is walked at most once a second unless we are about to signal. */
@@ -334,14 +438,17 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
   for (;;) {
     while (out_open || err_open) {
       scan_configure(false);
-      /* Latch cancel even while configuring, but do not act on it until that
-       * dpkg has left. The deadline is paused for the same interval. */
+      if (g_dpkg_committed)
+        cancelled = false;
+      /* Before dpkg starts, latch cancel but do not act on it while a
+       * configuring dpkg is still alive. After it has started, EOF is not
+       * a cancel. The deadline is paused while that dpkg is alive. */
       if (stop_requested())
         cancelled = true;
       if (!configuring) {
         if (cancelled)
           break;
-        if (remaining_ms() <= 0) {
+        if (budget_ms() <= 0) {
           timed_out = true;
           break;
         }
@@ -365,7 +472,7 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
         fds[nfd].revents = 0;
         nfd++;
       }
-      if (!configuring && g_cancel_fd >= 0) {
+      if (!configuring && !g_dpkg_committed && g_cancel_fd >= 0) {
         cancel_i = static_cast<int>(nfd);
         fds[nfd].fd = g_cancel_fd;
         fds[nfd].events = POLLIN | POLLHUP | POLLERR;
@@ -374,7 +481,7 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
       }
       int slice = 1000;
       if (!configuring) {
-        const int remain = remaining_ms();
+        const int remain = budget_ms();
         if (remain <= 0) {
           timed_out = true;
           break;
@@ -402,6 +509,7 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
             const ssize_t n = read(fd, buf, sizeof buf);
             if (n > 0) {
               capture_append(dest, buf, static_cast<std::size_t>(n));
+              note_apt_output(buf, static_cast<std::size_t>(n));
               continue;
             }
             if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
@@ -416,9 +524,13 @@ int run_apt(const std::vector<const char*>& args, int timeout_sec, std::string& 
 
     if (stop_requested())
       cancelled = true;
+    if (g_dpkg_committed)
+      cancelled = false;
     if (!(timed_out || cancelled))
       break;
     scan_configure(true);
+    if (g_dpkg_committed)
+      cancelled = false;
     if (configuring) {
       /* Do not close apt's pipes and do not return. Wait until apt exits.
        * A cancel stays latched so the result is still a cancel, not success. */
@@ -530,7 +642,8 @@ bool refresh_package_lists(const char* cancel_msg, const char* timeout_msg, std:
   const std::vector<const char*> update_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "update"};
   std::string out;
   std::string err;
-  const int rc = run_apt(update_argv, effective_timeout(kUpdateTimeoutSec), out, err, false);
+  const AptClock clock = apt_clock(kUpdateIdleSec, kUpdateHardCapSec);
+  const int rc = run_apt(update_argv, clock.idle_sec, clock.hard_sec, out, err, false);
   if (rc == -5) {
     emit_error(kDpkgRecovery);
     return false;
@@ -543,10 +656,15 @@ bool refresh_package_lists(const char* cancel_msg, const char* timeout_msg, std:
     emit_error(timeout_msg);
     return false;
   }
+  const std::string blob = err + "\n" + out;
+  const UpdateFetch fetch = classify_apt_update(blob);
+  if (fetch.kind == UpdateFetchKind::Total) {
+    emit_error(fetch.detail.empty() ? first_error_line(out, err) : fetch.detail);
+    return false;
+  }
   if (rc != 0) {
-    const std::string blob = err + "\n" + out;
-    if (apt_index_failure_is_partial(blob)) {
-      warning = apt_index_warning(blob);
+    if (fetch.kind == UpdateFetchKind::Partial) {
+      warning = fetch.detail.empty() ? apt_index_warning(blob) : fetch.detail;
       if (warning.empty())
         warning = first_error_line(out, err);
       return true;
@@ -554,6 +672,8 @@ bool refresh_package_lists(const char* cancel_msg, const char* timeout_msg, std:
     emit_error(first_error_line(out, err));
     return false;
   }
+  if (fetch.kind == UpdateFetchKind::Partial)
+    warning = fetch.detail.empty() ? apt_index_warning(blob) : fetch.detail;
   return true;
 }
 
@@ -571,9 +691,28 @@ bool valid_pin(const std::string& pin)
   auto name_char = [](unsigned char c) {
     return std::islower(c) || std::isdigit(c);
   };
-  if (!name_char(static_cast<unsigned char>(name[0])))
+  auto arch_char = [](unsigned char c) {
+    return std::islower(c) || std::isdigit(c);
+  };
+  std::string base = name;
+  const std::string::size_type colon = name.find(':');
+  if (colon != std::string::npos) {
+    if (name.find(':', colon + 1) != std::string::npos)
+      return false;
+    base = name.substr(0, colon);
+    const std::string arch = name.substr(colon + 1);
+    if (arch.size() < 2 || arch.size() > 20)
+      return false;
+    if (!std::islower(static_cast<unsigned char>(arch[0])))
+      return false;
+    for (char ch : arch) {
+      if (!arch_char(static_cast<unsigned char>(ch)))
+        return false;
+    }
+  }
+  if (base.empty() || !name_char(static_cast<unsigned char>(base[0])))
     return false;
-  for (char ch : name) {
+  for (char ch : base) {
     const unsigned char c = static_cast<unsigned char>(ch);
     if (name_char(c) || c == '+' || c == '-' || c == '.')
       continue;
@@ -632,6 +771,75 @@ int fail_apt(int rc, const std::string& out, const std::string& err, const char*
   return 0;
 }
 
+std::string read_limited(const char* path, std::size_t cap)
+{
+  FILE* file = std::fopen(path, "r");
+  if (file == nullptr)
+    return {};
+  std::string out;
+  char buf[4096];
+  while (out.size() < cap) {
+    const std::size_t n = std::fread(buf, 1, sizeof buf, file);
+    if (n == 0)
+      break;
+    const std::size_t room = cap - out.size();
+    out.append(buf, n > room ? room : n);
+  }
+  std::fclose(file);
+  return out;
+}
+
+const char* dpkg_status_path()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_DPKG_STATUS");
+    if (env != nullptr && env[0] == '/')
+      return env;
+  }
+  return "/var/lib/dpkg/status";
+}
+
+void note_holds(SimulateResult& result)
+{
+  apply_held_packages(result, read_limited(dpkg_status_path(), 8 * 1024 * 1024));
+}
+
+void note_reboot(SimulateResult& result)
+{
+  const char* path = "/var/run/reboot-required";
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_REBOOT_FILE");
+    if (env != nullptr && env[0] == '/')
+      path = env;
+  }
+  if (access(path, R_OK) != 0)
+    return;
+  result.reboot_required = true;
+  const std::string pkgs = read_limited((std::string(path) + ".pkgs").c_str(), 64 * 1024);
+  std::istringstream in(pkgs);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (!line.empty())
+      result.reboot_pkgs.push_back(line);
+  }
+}
+
+std::string pin_for_message(const char* raw)
+{
+  if (raw == nullptr)
+    return {};
+  std::string pin(raw);
+  if (pin.size() > 200)
+    pin.resize(200);
+  for (char& ch : pin) {
+    if (ch == '\n' || ch == '\r' || static_cast<unsigned char>(ch) < 32)
+      ch = '?';
+  }
+  return pin;
+}
+
 int do_simulate()
 {
   if (stop_requested()) {
@@ -639,6 +847,7 @@ int do_simulate()
     return 1;
   }
   announce_ready();
+  emit_phase("refresh");
 
   std::string update_warning;
   if (!refresh_package_lists("Update check was cancelled",
@@ -649,17 +858,20 @@ int do_simulate()
     return 1;
   }
 
+  emit_phase("simulate");
   const std::string apt = apt_get_path();
   std::string out;
   std::string err;
   const std::vector<const char*> sim_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "-s", "-q",
                                              "upgrade"};
-  const int rc = run_apt(sim_argv, effective_timeout(kSimulateTimeoutSec), out, err, false);
+  const AptClock sim_clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+  const int rc = run_apt(sim_argv, sim_clock.idle_sec, sim_clock.hard_sec, out, err, false);
   if (fail_apt(rc, out, err, "Update check was cancelled",
                "Timed out while simulating apt-get upgrade", update_warning) != 0)
     return 1;
 
   SimulateResult result = parse_apt_simulate(out + "\n" + err);
+  note_holds(result);
   if (!update_warning.empty())
     result.warning = update_warning;
   emit(result);
@@ -673,6 +885,7 @@ int do_upgrade(const std::vector<std::string>& pins)
     return 1;
   }
   announce_ready();
+  emit_phase("refresh");
 
   std::string update_warning;
   if (!refresh_package_lists("Install was cancelled",
@@ -685,17 +898,20 @@ int do_upgrade(const std::vector<std::string>& pins)
 
   /* Confirm the reviewed set against the indexes just fetched. A different
    * set is returned to the window and nothing is installed. */
+  emit_phase("simulate");
   const std::string apt = apt_get_path();
   std::string out;
   std::string err;
   const std::vector<const char*> sim_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "-s", "-q",
                                              "upgrade"};
-  int rc = run_apt(sim_argv, effective_timeout(kSimulateTimeoutSec), out, err, false);
+  const AptClock sim_clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+  int rc = run_apt(sim_argv, sim_clock.idle_sec, sim_clock.hard_sec, out, err, false);
   if (fail_apt(rc, out, err, "Install was cancelled",
                "Timed out while simulating apt-get upgrade", update_warning) != 0)
     return 1;
 
   SimulateResult sim = parse_apt_simulate(out + "\n" + err);
+  note_holds(sim);
   if (sim.status == SimulateResult::Error) {
     std::string msg = sim.error_msg.empty() ? first_error_line(out, err) : sim.error_msg;
     if (!update_warning.empty())
@@ -737,22 +953,33 @@ int do_upgrade(const std::vector<std::string>& pins)
 
   out.clear();
   err.clear();
-  rc = run_apt(up_argv, effective_timeout(kUpgradeTimeoutSec), out, err, true);
+  emit_phase("download");
+  const AptClock up_clock = apt_clock(kUpgradeIdleSec, kUpgradeHardCapSec);
+  rc = run_apt(up_argv, up_clock.idle_sec, up_clock.hard_sec, out, err, true);
   if (fail_apt(rc, out, err, "Install was cancelled", "Timed out while installing updates",
                update_warning) != 0)
     return 1;
 
   const SimulateResult parsed = parse_apt_simulate(out + "\n" + err);
   SimulateResult result;
-  const bool kept = !parsed.kept_back.empty() || parsed.not_upgraded_count > 0;
+  result.kept_back = parsed.kept_back;
+  result.phased = parsed.phased;
+  result.held = parsed.held;
+  note_holds(result);
+  result.not_upgraded_count = parsed.not_upgraded_count;
+  result.upgraded_count = parsed.upgraded_count;
+  result.conffiles_kept = parsed.conffiles_kept;
+  result.packages = parsed.packages;
+  result.warning = update_warning;
+  const bool summary_seen = parsed.upgraded_count >= 0 || parsed.not_upgraded_count >= 0;
+  result.summary_missing = !summary_seen;
+  const bool kept = !result.kept_back.empty() || !result.phased.empty() || !result.held.empty() ||
+                    result.not_upgraded_count > 0;
   if (kept && parsed.upgraded_count <= 0 && parsed.packages.empty())
     result.status = SimulateResult::KeptBack;
   else
     result.status = SimulateResult::Success;
-  result.kept_back = parsed.kept_back;
-  result.not_upgraded_count = parsed.not_upgraded_count;
-  result.conffiles_kept = parsed.conffiles_kept;
-  result.warning = update_warning;
+  note_reboot(result);
   emit(result);
   return 0;
 }
@@ -768,6 +995,7 @@ int main(int argc, char** argv)
   sa.sa_flags = 0;
   sigaction(SIGTERM, &sa, nullptr);
   sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGHUP, &sa, nullptr);
 
   if (argc < 2 || argv[1] == nullptr) {
     emit_error("refused: helper accepts only simulate or upgrade");
@@ -794,7 +1022,11 @@ int main(int argc, char** argv)
     std::vector<std::string> pins;
     for (int i = 2; i < argc; ++i) {
       if (argv[i] == nullptr || !valid_pin(argv[i])) {
-        emit_error("refused: invalid package pin");
+        const std::string shown = pin_for_message(argv[i]);
+        if (shown.empty())
+          emit_error("refused: invalid package pin");
+        else
+          emit_error("refused: invalid package pin " + shown);
         return 2;
       }
       pins.emplace_back(argv[i]);
@@ -810,7 +1042,15 @@ int main(int argc, char** argv)
     std::vector<std::string> sorted = pins;
     std::sort(sorted.begin(), sorted.end());
     if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
-      emit_error("refused: invalid package pin");
+      std::string dup;
+      for (std::size_t i = 1; i < sorted.size(); ++i) {
+        if (sorted[i] == sorted[i - 1]) {
+          dup = sorted[i];
+          break;
+        }
+      }
+      emit_error(dup.empty() ? "refused: invalid package pin"
+                             : "refused: invalid package pin " + pin_for_message(dup.c_str()));
       return 2;
     }
     return do_upgrade(pins);

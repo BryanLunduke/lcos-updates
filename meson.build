@@ -126,7 +126,7 @@ test(
   'helper-kills-apt-group',
   test_helper_kill,
   args: [helper.full_path()],
-  timeout: 120,
+  timeout: 180,
 )
 
 test_window = executable(
@@ -145,7 +145,7 @@ test(
   'window',
   xvfb,
   args: ['-a', test_window.full_path()],
-  timeout: 90,
+  timeout: 120,
 )
 
 test(

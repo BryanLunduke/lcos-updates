@@ -112,6 +112,9 @@ int main(int argc, char** argv)
         "Timed out waiting for the update check. Check your network and try again.";
     const char* install_timeout = "Timed out while installing updates.";
     const char* offline = "No network connection. Connect to the Internet and try again.";
+    const char* proxy =
+        "Could not connect to the update server. If this computer uses a proxy, set it in "
+        "/etc/apt/apt.conf.d.";
     expect(friendly_job_error("Timed out while running apt-get update", JobKind::Check) ==
                check_timeout,
            "check update timeout stays a check timeout");
@@ -121,11 +124,11 @@ int main(int argc, char** argv)
     expect(friendly_job_error("Timed out while installing updates", JobKind::Install) ==
                install_timeout,
            "install timeout is not rewritten as a check timeout");
-    expect(friendly_job_error("Connection timed out", JobKind::Check) == offline,
-           "connection timed out is offline, not the check-timeout sentence");
+    expect(friendly_job_error("Connection timed out", JobKind::Check) == proxy,
+           "connection timed out mentions a proxy, not the offline sentence");
     expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease Connection timed out",
-                              JobKind::Install) == offline,
-           "connection timed out on a fetch line is offline");
+                              JobKind::Install) == proxy,
+           "connection timed out on a fetch line mentions a proxy");
     expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease", JobKind::Check) ==
                "E: Failed to fetch http://deb.example/InRelease",
            "failed to fetch without a network failure stays the apt line");
@@ -144,8 +147,10 @@ int main(int argc, char** argv)
            "resolve failure is offline");
     expect(friendly_job_error("Network is unreachable", JobKind::Install) == offline,
            "unreachable network is offline");
-    expect(friendly_job_error("E: Unable to connect to deb.example:80", JobKind::Check) == offline,
-           "unable to connect is offline");
+    expect(friendly_job_error("E: Unable to connect to deb.example:80", JobKind::Check) == proxy,
+           "unable to connect mentions a proxy");
+    expect(friendly_job_error("Could not connect to 192.0.2.1:80", JobKind::Install) == proxy,
+           "could not connect mentions a proxy");
     expect(friendly_job_error("E: Unable to correct problems, you have held broken packages.",
                               JobKind::Install) ==
                "E: Unable to correct problems, you have held broken packages.",
@@ -202,20 +207,49 @@ int main(int argc, char** argv)
   }
 
   {
-    const char* partial =
+    const char* no_hit =
         "E: Failed to fetch http://deb.example/dists/stable/InRelease 404 Not Found\n"
         "E: Some index files failed to download. They have been ignored, or old ones used instead.\n";
-    expect(apt_index_failure_is_partial(partial), "404 with some index files is partial");
+    expect(!apt_index_failure_is_partial(no_hit),
+           "404 with no Hit or Get is a total failure, not a partial one");
+    const UpdateFetch total = classify_apt_update(no_hit);
+    expect(total.kind == UpdateFetchKind::Total, "a 404 with nothing fetched stops the check");
+    expect(total.detail.find("404 Not Found") != std::string::npos,
+           "a total 404 keeps the apt line");
+    const char* partial =
+        "Hit:1 http://deb.example stable InRelease\n"
+        "E: Failed to fetch http://deb.example/dists/stable/InRelease 404 Not Found\n"
+        "E: Some index files failed to download. They have been ignored, or old ones used instead.\n";
+    expect(apt_index_failure_is_partial(partial), "404 after a Hit is partial");
     const std::string warning = apt_index_warning(partial);
     expect(warning.find("404 Not Found") != std::string::npos, "partial warning keeps the 404");
     expect(warning.find("Some index files failed") != std::string::npos,
            "partial warning keeps the apt summary");
     expect(!apt_index_failure_is_partial("E: Could not get lock /var/lib/apt/lists/lock\n"),
            "lock failure is not a partial index update");
-    expect(apt_index_failure_is_partial(
-               "W: GPG error: http://deb.example stable InRelease: NO_PUBKEY 1234ABCD\n"
-               "E: Some index files failed to download. They have been ignored, or old ones used instead.\n"),
-           "missing key with old indexes is partial");
+    const char* key_no_hit =
+        "W: GPG error: http://deb.example stable InRelease: NO_PUBKEY 1234ABCD\n"
+        "E: Some index files failed to download. They have been ignored, or old ones used instead.\n";
+    expect(!apt_index_failure_is_partial(key_no_hit),
+           "a missing key with nothing fetched is not partial");
+    expect(apt_index_failure_is_partial(std::string("Get:1 http://deb.example stable InRelease\n") +
+                                        key_no_hit),
+           "missing key after a Get is partial");
+    const char* dead =
+        "W: Failed to fetch http://deb.example/InRelease  Connection timed out\n"
+        "E: Some index files failed to download. They have been ignored, or old ones used instead.\n";
+    const UpdateFetch dead_fetch = classify_apt_update(dead);
+    expect(dead_fetch.kind == UpdateFetchKind::Total, "a dead mirror with no Hit is a total failure");
+    expect(dead_fetch.detail.find("/etc/apt/apt.conf.d") != std::string::npos,
+           "a dead mirror names the apt proxy config");
+    expect(dead_fetch.detail.find("No network connection") == std::string::npos,
+           "a connection timeout is not the offline sentence");
+    const UpdateFetch offline_fetch =
+        classify_apt_update("Err:1 http://deb.example stable InRelease\n"
+                            "  Temporary failure resolving 'deb.example'\n");
+    expect(offline_fetch.kind == UpdateFetchKind::Total &&
+               offline_fetch.detail.find("No network connection") != std::string::npos,
+           "a resolve failure with nothing fetched is the offline sentence");
   }
 
   {
@@ -245,8 +279,21 @@ int main(int argc, char** argv)
     const std::string got = friendly_job_error(blob, JobKind::Check);
     expect(got.find("404 Not Found") != std::string::npos,
            "a timeout on a later line does not discard the 404");
-    expect(got.find("No network connection") != std::string::npos,
-           "the timeout line is still mapped on its own");
+    expect(got.find("/etc/apt/apt.conf.d") != std::string::npos,
+           "the timeout line is mapped to the proxy sentence on its own");
+    expect(got.find("No network connection") == std::string::npos,
+           "that timeout line is not the offline sentence");
+    const std::string skipped =
+        friendly_job_error("E: Failed to fetch http://deb.example/InRelease  Connection timed out\n"
+                           "E: Some index files failed to download. They have been ignored, or old "
+                           "ones used instead.",
+                           JobKind::Check);
+    expect(skipped.find("Connection timed out") != std::string::npos,
+           "a skipped index does not rewrite the timed-out mirror");
+    expect(skipped.find("No network connection") == std::string::npos,
+           "a skipped index is not called offline");
+    expect(skipped.find("Some index files failed") != std::string::npos,
+           "a skipped index keeps apt's own summary");
   }
 
   {
@@ -293,6 +340,110 @@ int main(int argc, char** argv)
     expect(!startup_timestamp_from_id("no-time-here", ts), "missing timestamp is rejected");
     expect(startup_timestamp_from_id("app_TIME42", ts) && ts == 42, "non-zero timestamp is kept");
     expect(startup_timestamp_from_id("app_TIME000", ts) == false, "zero-padded zero is rejected");
+  }
+
+  {
+    const char* text =
+        "The following upgrades have been deferred due to phasing:\n"
+        "  shim-signed grub-efi-amd64-signed\n"
+        "Some packages may have been kept back due to phasing.\n"
+        "0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.\n";
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.status == SimulateResult::KeptBack, "phasing is not up to date");
+    expect(r.phased.size() == 2, "phasing names both packages");
+    expect(r.kept_back.empty(), "phasing is not the extra-packages list");
+    if (r.phased.size() >= 2) {
+      expect(r.phased[0] == "shim-signed", "phased pkg0");
+      expect(r.phased[1] == "grub-efi-amd64-signed", "phased pkg1");
+    }
+    const std::string proto = format_protocol(r);
+    expect(proto.find("PHASED shim-signed\n") != std::string::npos, "PHASED protocol line");
+    expect(proto.find("KEPT ") == std::string::npos, "phasing does not emit KEPT");
+    const SimulateResult p = parse_protocol(proto);
+    expect(p.phased.size() == 2 && p.kept_back.empty(), "PHASED round trip");
+  }
+
+  {
+    const char* text =
+        "The following held packages will be changed:\n"
+        "  held-pkg\n"
+        "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.held.empty() && r.kept_back.empty(),
+           "dist-upgrade's held-changed header is not a hold we left behind");
+    expect(r.status == SimulateResult::UpToDate, "held-changed with nothing else is up to date");
+  }
+
+  {
+    SimulateResult r;
+    r.kept_back = {"linux-image-amd64", "libc6", "libfoo:i386"};
+    const char* status =
+        "Package: linux-image-amd64\n"
+        "Status: hold ok installed\n"
+        "Architecture: amd64\n"
+        "\n"
+        "Package: libc6\n"
+        "Status: install ok installed\n"
+        "Architecture: amd64\n"
+        "\n"
+        "Package: libfoo\n"
+        "Status: hold ok installed\n"
+        "Architecture: i386\n"
+        "\n";
+    apply_held_packages(r, status);
+    expect(r.held.size() == 2, "hold status moves those names out of kept-back");
+    expect(r.kept_back.size() == 1 && r.kept_back[0] == "libc6", "a normal package stays kept back");
+    bool saw_image = false;
+    bool saw_libfoo = false;
+    for (const auto& name : r.held) {
+      if (name == "linux-image-amd64")
+        saw_image = true;
+      if (name == "libfoo:i386")
+        saw_libfoo = true;
+    }
+    expect(saw_image && saw_libfoo, "hold matches the package and the name:arch form");
+  }
+
+  {
+    SimulateResult r;
+    r.status = SimulateResult::Success;
+    r.reboot_required = true;
+    r.reboot_pkgs.push_back("linux-image-amd64");
+    r.summary_missing = true;
+    const std::string proto = format_protocol(r);
+    expect(proto.find("REBOOT linux-image-amd64\n") != std::string::npos, "REBOOT protocol line");
+    expect(proto.find("SUMMARY_MISSING\n") != std::string::npos, "SUMMARY_MISSING protocol line");
+    const SimulateResult p = parse_protocol(proto);
+    expect(p.reboot_required && p.reboot_pkgs.size() == 1 && p.reboot_pkgs[0] == "linux-image-amd64",
+           "REBOOT round trip");
+    expect(p.summary_missing, "SUMMARY_MISSING round trip");
+  }
+
+  {
+    CaptureBuf cap;
+    const std::string head =
+        "The following packages have been kept back:\n"
+        "  linux-image-amd64\n"
+        "0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n"
+        "Configuration file '/etc/ssh/sshd_config'\n"
+        " ==> Keeping old config file as default.\n";
+    capture_append(cap, head.data(), head.size());
+    std::string junk(1300 * 1024, 'x');
+    for (std::size_t i = 80; i < junk.size(); i += 80)
+      junk[i] = '\n';
+    capture_append(cap, junk.data(), junk.size());
+    const std::string text = capture_text(cap);
+    expect(text.find("The following packages have been kept back:") != std::string::npos,
+           "cap keeps the kept-back header past 1 MiB");
+    expect(text.find("linux-image-amd64") != std::string::npos, "cap keeps the kept-back name");
+    expect(text.find("0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.") !=
+               std::string::npos,
+           "cap keeps the summary line past 1 MiB");
+    expect(text.find("/etc/ssh/sshd_config") != std::string::npos, "cap keeps a conffile note");
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.kept_back.size() == 1 && r.not_upgraded_count == 1, "a long log still parses kept-back");
+    expect(!r.conffiles_kept.empty() && r.conffiles_kept[0] == "/etc/ssh/sshd_config",
+           "a long log still parses the conffile");
   }
 
   if (g_fails != 0) {

@@ -3,23 +3,32 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * The helper clocks apt-get update and the simulation separately. The GUI
- * must wait at least as long as those two limits added together, or it will
- * kill a check that is still inside the helper's own budget and show it as
- * timed out. Install refreshes package lists, simulates again to confirm the
- * reviewed set, then upgrades, so its budget is update plus simulate plus
- * upgrade plus the same 30s slack.
+ * Each apt-get run has an idle limit and a hard cap. The idle limit restarts
+ * whenever apt writes output, so a slow mirror that is still transferring is
+ * not killed at a fixed clock. The hard cap does not restart. The GUI must
+ * wait at least as long as the hard caps added together, or it will kill a
+ * check that is still inside the helper's own budget.
  *
- * Both budgets start when the helper announces HELPER_READY, not when the
- * password dialog opens.
+ * The password dialog uses kAuthTimeoutSec, not the apt budget. The apt
+ * budgets start when the helper announces HELPER_READY.
  */
 
 #ifndef LCOS_UPDATES_TIMEOUTS_HPP
 #define LCOS_UPDATES_TIMEOUTS_HPP
 
-constexpr int kUpdateTimeoutSec = 120;
-constexpr int kSimulateTimeoutSec = 120;
-constexpr int kUpgradeTimeoutSec = 600;
+constexpr int kAuthTimeoutSec = 90;
+
+constexpr int kUpdateIdleSec = 180;
+constexpr int kUpdateHardCapSec = 900;
+constexpr int kSimulateIdleSec = 180;
+constexpr int kSimulateHardCapSec = 300;
+constexpr int kUpgradeIdleSec = 300;
+constexpr int kUpgradeHardCapSec = 7200;
+
+/* Names kept for the GUI backstop, which must cover the helper hard caps. */
+constexpr int kUpdateTimeoutSec = kUpdateHardCapSec;
+constexpr int kSimulateTimeoutSec = kSimulateHardCapSec;
+constexpr int kUpgradeTimeoutSec = kUpgradeHardCapSec;
 constexpr int kGuiTimeoutMarginSec = 30;
 
 constexpr int kCheckTimeoutSec =

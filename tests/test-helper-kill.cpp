@@ -194,6 +194,7 @@ static int apt_script(const char* script)
   const int n = count_and_mark(count_path);
   if (std::strcmp(script, "partial-update") == 0) {
     if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
       std::fputs(
           "E: Failed to fetch http://deb.example/dists/stable/InRelease 404 Not Found\n"
           "E: Some index files failed to download. They have been ignored, or old ones used instead.\n",
@@ -320,6 +321,7 @@ static int apt_script(const char* script)
   }
   if (std::strcmp(script, "partial-then-lock") == 0) {
     if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
       std::fputs(
           "E: Failed to fetch http://deb.example/InRelease 404 Not Found\n"
           "E: Some index files failed to download. They have been ignored, or old ones used instead.\n",
@@ -364,6 +366,151 @@ static int apt_script(const char* script)
                " ==> Keeping old config file as default.\n"
                "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
                stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "dead-mirror") == 0) {
+    std::fputs("W: Failed to fetch http://deb.example/InRelease  Connection timed out\n"
+               "E: Some index files failed to download. They have been ignored, or old ones used instead.\n",
+               stderr);
+    return 0;
+  }
+  if (std::strcmp(script, "resolve-fail") == 0) {
+    std::fputs("Err:1 http://deb.example stable InRelease\n"
+               "  Temporary failure resolving 'deb.example'\n",
+               stderr);
+    return 0;
+  }
+  if (std::strcmp(script, "phasing") == 0) {
+    if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    std::fputs("The following upgrades have been deferred due to phasing:\n"
+               "  shim-signed grub-efi-amd64-signed\n"
+               "Some packages may have been kept back due to phasing.\n"
+               "0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.\n",
+               stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "held-packages") == 0) {
+    if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    std::fputs("The following packages have been kept back:\n"
+               "  linux-image-amd64 libc6\n"
+               "0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.\n",
+               stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "arch-pin") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst libfoo:i386 [1.0] (1.2-3 Debian:12 [i386])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "long-kept") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("The following packages have been kept back:\n"
+               "  linux-image-amd64\n"
+               "0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+               stdout);
+    std::fflush(stdout);
+    std::string junk(1300 * 1024, 'x');
+    for (std::size_t i = 80; i < junk.size(); i += 80)
+      junk[i] = '\n';
+    std::fwrite(junk.data(), 1, junk.size(), stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "no-summary") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("Reading package lists...\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "trickle") == 0) {
+    if (n == 1) {
+      for (int i = 0; i < 6; ++i) {
+        std::fprintf(stdout, "Hit:%d http://deb.example stable InRelease\n", i + 1);
+        std::fflush(stdout);
+        poll(nullptr, 0, 400);
+      }
+      return 0;
+    }
+    std::fputs("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "chatter") == 0) {
+    for (int i = 0; i < 400; ++i) {
+      std::fprintf(stdout, "Get:%d http://deb.example/Packages\n", i + 1);
+      std::fflush(stdout);
+      poll(nullptr, 0, 50);
+    }
+    return 0;
+  }
+  if (std::strcmp(script, "hang-before") == 0) {
+    const char* path = std::getenv("LCOS_STUB_STATEFILE");
+    if (path != nullptr) {
+      FILE* file = std::fopen(path, "a");
+      if (file != nullptr) {
+        std::fputs("started\n", file);
+        std::fclose(file);
+      }
+    }
+    for (;;)
+      pause();
+  }
+  if (std::strcmp(script, "finish-after-dpkg") == 0) {
+    if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    if (n == 2) {
+      std::fputs("Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    setpgid(0, 0);
+    const pid_t child = spawn_hold({"--configure", "pkg"}, true);
+    if (child <= 1)
+      return 1;
+    setpgid(child, child);
+    const char* path = std::getenv("LCOS_STUB_STATEFILE");
+    auto note = [&](const char* text) {
+      if (path == nullptr)
+        return;
+      FILE* file = std::fopen(path, "a");
+      if (file == nullptr)
+        return;
+      std::fputs(text, file);
+      std::fclose(file);
+    };
+    note("after-dpkg\n");
+    poll(nullptr, 0, 4000);
+    note("finished\n");
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    if (child > 1)
+      kill(child, SIGKILL);
     return 0;
   }
   if (std::strcmp(script, "kept-back-upgrade") == 0) {
@@ -468,7 +615,9 @@ static int run_helper(const char* helper, const std::string& apt, const std::str
                       const char* script = nullptr, const char* countfile = nullptr,
                       int* stdout_read = nullptr, const char* command = "simulate",
                       const std::vector<std::string>* extra = nullptr, int* stderr_read = nullptr,
-                      const char* argvfile = nullptr, const char* envfile = nullptr)
+                      const char* argvfile = nullptr, const char* envfile = nullptr,
+                      const char* hard_cap = nullptr, const char* statefile = nullptr,
+                      const char* reboot_file = nullptr, const char* dpkg_status = nullptr)
 {
   int fds[2] = {-1, -1};
   if (cancel_write != nullptr) {
@@ -515,6 +664,22 @@ static int run_helper(const char* helper, const std::string& apt, const std::str
       setenv("LCOS_UPDATES_TIMEOUT_SEC", timeout_sec, 1);
     else
       unsetenv("LCOS_UPDATES_TIMEOUT_SEC");
+    if (hard_cap != nullptr)
+      setenv("LCOS_UPDATES_HARD_CAP_SEC", hard_cap, 1);
+    else
+      unsetenv("LCOS_UPDATES_HARD_CAP_SEC");
+    if (statefile != nullptr)
+      setenv("LCOS_STUB_STATEFILE", statefile, 1);
+    else
+      unsetenv("LCOS_STUB_STATEFILE");
+    if (reboot_file != nullptr)
+      setenv("LCOS_UPDATES_REBOOT_FILE", reboot_file, 1);
+    else
+      unsetenv("LCOS_UPDATES_REBOOT_FILE");
+    if (dpkg_status != nullptr)
+      setenv("LCOS_UPDATES_DPKG_STATUS", dpkg_status, 1);
+    else
+      unsetenv("LCOS_UPDATES_DPKG_STATUS");
     if (stdout_read != nullptr) {
       dup2(out_pipe[1], STDOUT_FILENO);
       close(out_pipe[0]);
@@ -574,6 +739,29 @@ static std::string read_file_all(const std::string& path)
   while ((n = std::fread(buf, 1, sizeof buf, file)) > 0)
     out.append(buf, n);
   std::fclose(file);
+  return out;
+}
+
+static std::string read_until(int fd, const char* needle, int ms)
+{
+  const int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0)
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  std::string out;
+  for (int waited = 0; waited < ms; waited += 20) {
+    char buf[1024];
+    for (;;) {
+      const ssize_t n = read(fd, buf, sizeof buf);
+      if (n > 0) {
+        out.append(buf, static_cast<std::size_t>(n));
+        continue;
+      }
+      break;
+    }
+    if (needle != nullptr && out.find(needle) != std::string::npos)
+      return out;
+    poll(nullptr, 0, 20);
+  }
   return out;
 }
 
@@ -1092,6 +1280,391 @@ int main(int argc, char** argv)
     refuse({"upgrade", "not a pin"}, "invalid pin is refused");
     refuse({"upgrade", "-y"}, "option pin is refused");
     refuse({"simulate", "extra"}, "simulate with an extra argument is refused");
+    int out_pipe[2];
+    if (pipe(out_pipe) == 0) {
+      const pid_t pid = fork();
+      if (pid == 0) {
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        const int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+          dup2(devnull, STDIN_FILENO);
+          close(devnull);
+        }
+        execl(helper, helper, "upgrade", "not a pin", static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      close(out_pipe[1]);
+      int status = 0;
+      wait_pid(pid, 5000, status);
+      const std::string out = read_all_fd(out_pipe[0]);
+      close(out_pipe[0]);
+      expect(out.find("not a pin") != std::string::npos, "a refused pin is named in the message");
+    }
+    if (pipe(out_pipe) == 0) {
+      const pid_t pid = fork();
+      if (pid == 0) {
+        dup2(out_pipe[1], STDOUT_FILENO);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        const int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+          dup2(devnull, STDIN_FILENO);
+          close(devnull);
+        }
+        execl(helper, helper, "upgrade", "libc6=2", "libc6=2", static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      close(out_pipe[1]);
+      int status = 0;
+      wait_pid(pid, 5000, status);
+      const std::string out = read_all_fd(out_pipe[0]);
+      close(out_pipe[0]);
+      expect(out.find("libc6=2") != std::string::npos, "a duplicate pin is named in the message");
+    }
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/dead.count";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/dead.pids", nullptr, nullptr, helper_pid,
+                   "dead-mirror", countfile.c_str(), &stdout_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for dead mirror\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a dead mirror");
+    expect(read_count(countfile) == 1, "a dead mirror does not simulate");
+    expect(out.find("STATUS error\n") != std::string::npos, "a dead mirror is an error");
+    expect(out.find("STATUS up-to-date\n") == std::string::npos, "a dead mirror is not up to date");
+    expect(out.find("/etc/apt/apt.conf.d") != std::string::npos, "a dead mirror mentions the apt proxy");
+    expect(out.find("No network connection") == std::string::npos,
+           "a connection timeout is not reported as no network");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/resolve.count";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/resolve.pids", nullptr, nullptr, helper_pid,
+                   "resolve-fail", countfile.c_str(), &stdout_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for resolve failure\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a resolve failure");
+    expect(read_count(countfile) == 1, "a resolve failure does not simulate");
+    expect(out.find("No network connection") != std::string::npos, "a resolve failure is offline");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/phase.count";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/phase.pids", nullptr, nullptr, helper_pid,
+                   "phasing", countfile.c_str(), &stdout_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for phasing\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a phased simulate");
+    expect(out.find("STATUS kept-back\n") != std::string::npos, "phasing is kept-back, not up to date");
+    expect(out.find("PHASED shim-signed\n") != std::string::npos, "phasing names the first package");
+    expect(out.find("PHASED grub-efi-amd64-signed\n") != std::string::npos,
+           "phasing names the second package");
+    expect(out.find("KEPT ") == std::string::npos, "phasing is not described as a classic kept-back");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string status_path = std::string(dir) + "/dpkg-status";
+    {
+      FILE* file = std::fopen(status_path.c_str(), "w");
+      if (file != nullptr) {
+        std::fputs("Package: linux-image-amd64\n"
+                   "Status: hold ok installed\n"
+                   "Architecture: amd64\n"
+                   "\n"
+                   "Package: libc6\n"
+                   "Status: install ok installed\n"
+                   "Architecture: amd64\n",
+                   file);
+        std::fclose(file);
+      }
+    }
+    const std::string countfile = std::string(dir) + "/held.count";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/held.pids", nullptr, nullptr, helper_pid,
+                   "held-packages", countfile.c_str(), &stdout_read, "simulate", nullptr, nullptr,
+                   nullptr, nullptr, nullptr, nullptr, nullptr, status_path.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for held packages\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a held package");
+    expect(out.find("HELD linux-image-amd64\n") != std::string::npos, "a dpkg hold is named as held");
+    expect(out.find("KEPT libc6\n") != std::string::npos, "a package that is not held stays kept back");
+    expect(out.find("HELD libc6\n") == std::string::npos, "an installed package is not called held");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string argvfile = std::string(dir) + "/arch.argv";
+    const std::string countfile = std::string(dir) + "/arch.count";
+    const std::vector<std::string> pins = {"libfoo:i386=1.2-3"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/arch.pids", nullptr, nullptr, helper_pid,
+                   "arch-pin", countfile.c_str(), &stdout_read, "upgrade", &pins, nullptr,
+                   argvfile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for arch pin\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string argv_text = read_file_all(argvfile);
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper accepts a name:arch pin");
+    expect(out.find("STATUS success\n") != std::string::npos, "a name:arch pin is installed");
+    expect(out.find("invalid package pin") == std::string::npos, "a name:arch pin is not refused");
+    expect(argv_text.find("\nlibfoo:i386=1.2-3\n") != std::string::npos,
+           "install argv keeps the name:arch pin");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/long.count";
+    const std::vector<std::string> pins = {"libc6=2"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/long.pids", nullptr, nullptr, helper_pid,
+                   "long-kept", countfile.c_str(), &stdout_read, "upgrade", &pins) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a long kept-back log\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a long install log");
+    expect(out.find("KEPT linux-image-amd64\n") != std::string::npos,
+           "a log past 1 MiB still names the kept-back package");
+    expect(out.find("NOT_UPGRADED 1\n") != std::string::npos, "a log past 1 MiB still has the summary");
+    expect(out.find("STATUS success\n") == std::string::npos,
+           "a kept-back package past 1 MiB is not a clean success");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string countfile = std::string(dir) + "/nosum.count";
+    const std::vector<std::string> pins = {"libc6=2"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/nosum.pids", nullptr, nullptr, helper_pid,
+                   "no-summary", countfile.c_str(), &stdout_read, "upgrade", &pins) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a missing summary\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits when apt prints no summary");
+    expect(out.find("SUMMARY_MISSING\n") != std::string::npos, "a missing summary is reported");
+    expect(out.find("STATUS up-to-date\n") == std::string::npos, "a missing summary is not up to date");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string reboot = std::string(dir) + "/reboot-required";
+    {
+      FILE* file = std::fopen(reboot.c_str(), "w");
+      if (file != nullptr) {
+        std::fputs("*** System restart required ***\n", file);
+        std::fclose(file);
+      }
+      file = std::fopen((reboot + ".pkgs").c_str(), "w");
+      if (file != nullptr) {
+        std::fputs("linux-image-amd64\n", file);
+        std::fclose(file);
+      }
+    }
+    const std::string countfile = std::string(dir) + "/reboot.count";
+    const std::vector<std::string> pins = {"libc6=2"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/reboot.pids", nullptr, nullptr, helper_pid,
+                   "pin-upgrade", countfile.c_str(), &stdout_read, "upgrade", &pins, nullptr, nullptr,
+                   nullptr, nullptr, nullptr, reboot.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for reboot-required\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after an install that needs a restart");
+    expect(out.find("STATUS success\n") != std::string::npos, "a reboot flag is still a success");
+    expect(out.find("REBOOT linux-image-amd64\n") != std::string::npos,
+           "a reboot flag names the package");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    pid_t helper_pid = 0;
+    int stderr_read = -1;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/trickle.pids", "1", nullptr, helper_pid, "trickle",
+                   nullptr, &stdout_read, "simulate", nullptr, &stderr_read, nullptr, nullptr, "8") !=
+        0) {
+      std::fprintf(stderr, "failed to spawn helper for trickle\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 15000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "slow apt output does not hit the idle clock");
+    expect(out.find("STATUS up-to-date\n") != std::string::npos, "a trickle still finishes the check");
+    expect(out.find("Timed out") == std::string::npos, "a trickle is not a timeout");
+    expect(err.find("PHASE refresh\n") != std::string::npos, "the helper announces the refresh phase");
+    expect(err.find("PROGRESS Hit:") != std::string::npos, "the helper forwards an apt progress line");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/chatter.pids", "1", nullptr, helper_pid, "chatter",
+                   nullptr, &stdout_read, "simulate", nullptr, nullptr, nullptr, nullptr, "3") != 0) {
+      std::fprintf(stderr, "failed to spawn helper for chatter\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 12000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "the hard cap still ends apt that never goes idle");
+    expect(out.find("Timed out") != std::string::npos, "the hard cap is reported as a timeout");
+    expect(out.find("STATUS up-to-date\n") == std::string::npos, "the hard cap does not look finished");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/before.state";
+    pid_t helper_pid = 0;
+    int cancel_write = -1;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/before.pids", nullptr, &cancel_write, helper_pid,
+                   "hang-before", nullptr, &stdout_read, "simulate", nullptr, nullptr, nullptr, nullptr,
+                   nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for cancel before dpkg\n");
+      return 1;
+    }
+    for (int waited = 0; waited < 2000; waited += 20) {
+      if (read_file_all(statefile).find("started") != std::string::npos)
+        break;
+      poll(nullptr, 0, 20);
+    }
+    if (cancel_write >= 0) {
+      close(cancel_write);
+      cancel_write = -1;
+    }
+    kill(helper_pid, SIGTERM);
+    kill(helper_pid, SIGHUP);
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string state = read_file_all(statefile);
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits when cancelled before dpkg");
+    expect(out.find("cancelled") != std::string::npos, "EOF and SIGTERM before dpkg still cancel");
+    expect(state.find("finished") == std::string::npos, "a cancel before dpkg does not finish apt");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/finish.state";
+    const std::string countfile = std::string(dir) + "/finish.count";
+    const std::vector<std::string> pins = {"libc6=2"};
+    pid_t helper_pid = 0;
+    int cancel_write = -1;
+    int stdout_read = -1;
+    int stderr_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/finish.pids", nullptr, &cancel_write, helper_pid,
+                   "finish-after-dpkg", countfile.c_str(), &stdout_read, "upgrade", &pins, &stderr_read,
+                   nullptr, nullptr, nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for finish after dpkg\n");
+      return 1;
+    }
+    const std::string err_so_far = stderr_read >= 0 ? read_until(stderr_read, "DPKG_STARTED", 5000)
+                                                    : std::string();
+    expect(err_so_far.find("DPKG_STARTED") != std::string::npos, "install announces DPKG_STARTED");
+    if (cancel_write >= 0) {
+      close(cancel_write);
+      cancel_write = -1;
+    }
+    kill(helper_pid, SIGTERM);
+    kill(helper_pid, SIGHUP);
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string state = read_file_all(statefile);
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits after apt finishes past DPKG_STARTED");
+    expect(state.find("after-dpkg") != std::string::npos, "apt reached the dpkg phase");
+    expect(state.find("finished") != std::string::npos,
+           "EOF and SIGTERM after DPKG_STARTED still reach finished");
+    expect(out.find("STATUS success\n") != std::string::npos, "the install is reported as finished");
+    expect(out.find("cancelled") == std::string::npos, "a committed install is not cancelled");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
   }
 
   if (g_fails != 0) {

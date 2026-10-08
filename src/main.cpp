@@ -59,6 +59,10 @@ void present_updates(const Glib::RefPtr<Gtk::Application>& app,
     window->signal_hide().connect([window, alive]() {
       if (!*alive)
         return;
+      /* A committed install hides the window and keeps running. Deleting the
+       * window here would close the cancel pipe and drop the result. */
+      if (window->retains_background_job())
+        return;
       *alive = false;
       Glib::signal_idle().connect_once([window, alive]() {
         delete window;
