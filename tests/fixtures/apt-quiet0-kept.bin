@@ -1,0 +1,6 @@
+Reading package lists... 0%Reading package lists... 0%Reading package lists... 80%Reading package lists... 80%Reading package lists... 80%Reading package lists... Done
+Building dependency tree... 0%Building dependency tree... 0%Building dependency tree... 50%Building dependency tree... 50%Building dependency tree... Done
+Calculating upgrade... 0%Calculating upgrade... 50%Calculating upgrade... Done
+The following packages have been kept back:
+  heldpkg lcos-fixture-pkg
+0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.

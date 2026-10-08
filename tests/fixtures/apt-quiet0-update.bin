@@ -1,0 +1,9 @@
+0% [Working]            Get:1 http://archive.ubuntu.com/ubuntu noble InRelease [256 kB]
+0% [1 InRelease 12.7 kB/256 kB 5%]0% [1 InRelease 195 kB/256 kB 76%]                                  0% [Working]            Err:1 http://archive.ubuntu.com/ubuntu noble InRelease
+  The following signatures couldn't be verified because the public key is not available: NO_PUBKEY 871920D1991BC93C
+0% [Working]            rm: cannot remove '/var/cache/apt/archives/partial/*.deb': Permission denied
+Reading package lists... 0%Reading package lists... 0%Reading package lists... Done
+W: GPG error: http://archive.ubuntu.com/ubuntu noble InRelease: The following signatures couldn't be verified because the public key is not available: NO_PUBKEY 871920D1991BC93C
+E: The repository 'http://archive.ubuntu.com/ubuntu noble InRelease' is not signed.
+N: Updating from such a repository can't be done securely, and is therefore disabled by default.
+N: See apt-secure(8) manpage for repository creation and user configuration details.

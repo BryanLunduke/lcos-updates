@@ -33,6 +33,10 @@ struct SimulateResult {
     std::vector<std::string> removes;
   };
   std::vector<KeptRemoval> kept_removals;
+  /* Kept-back names a probe did not classify. Not "needs extra packages". */
+  std::vector<std::string> unclassified;
+  /* Apt's "Need to get … of archives." line for the reviewed set. Empty if unknown. */
+  std::string download_need;
   /* Updates apt deferred because of phasing. Offered again later. */
   std::vector<std::string> phased;
   /* Packages kept back because dpkg has them on hold. */
@@ -119,6 +123,10 @@ std::string friendly_job_error(const std::string& msg, JobKind kind);
 /* REMOVED and NEW package sections from apt-get -s install. */
 void parse_removal_plan(const std::string& text, std::vector<std::string>& removed,
                         std::vector<std::string>& newly);
+
+/* Apt's "Need to get … of archives." line, or empty when that line is absent.
+ * --print-uris prints it; apt-get -s upgrade does not. */
+std::string parse_download_need(const std::string& text);
 
 /* Sentences Check and Install share for phased, held, removal, and extra packages. */
 std::string describe_remaining(const SimulateResult& result);

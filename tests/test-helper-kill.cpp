@@ -197,6 +197,31 @@ static bool argv_has(int argc, char** argv, const char* flag)
   return false;
 }
 
+static bool is_print_uris(int argc, char** argv)
+{
+  return argv_has(argc, argv, "--print-uris");
+}
+
+/* A read-only per-name probe. Not the real install, which passes -y. */
+static bool is_kept_probe(int argc, char** argv)
+{
+  return argv_has(argc, argv, "-s") && argv_has(argc, argv, "--only-upgrade") &&
+         !argv_has(argc, argv, "-y");
+}
+
+static int count_lines_equal(const std::string& text, const char* token)
+{
+  int n = 0;
+  const std::string needle = std::string("\n") + token + "\n";
+  for (std::string::size_type pos = 0; (pos = text.find(needle, pos)) != std::string::npos;
+       pos += needle.size())
+    ++n;
+  if (text.compare(0, std::strlen(token), token) == 0 &&
+      (text.size() == std::strlen(token) || text[std::strlen(token)] == '\n'))
+    ++n;
+  return n;
+}
+
 static std::string reboot_beside_state()
 {
   const char* state = std::getenv("LCOS_STUB_STATEFILE");
@@ -796,6 +821,136 @@ static int apt_script(const char* script, int argc, char** argv)
                stdout);
     return 0;
   }
+  if (std::strcmp(script, "probe-sleep") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      note_state("probe\n");
+      for (;;)
+        pause();
+    }
+    if (n == 1)
+      return 0;
+    std::fputs("The following packages have been kept back:\n"
+               "  foo\n"
+               "Inst bar [1] (2 Debian:12 [amd64])\n"
+               "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+               stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "probe-removed") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      std::fputs("The following packages will be REMOVED:\n"
+                 "  oldplug\n",
+                 stdout);
+      return 100;
+    }
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  foo\n"
+                 "Inst bar [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "probe-plain") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      std::fputs("E: Failed to fetch http://deb.example/foo  Something went wrong\n", stderr);
+      return 100;
+    }
+    if (n == 1)
+      return 0;
+    std::fputs("The following packages have been kept back:\n"
+               "  foo\n"
+               "Inst bar [1] (2 Debian:12 [amd64])\n"
+               "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+               stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "probe-once") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      note_state("probe\n");
+      return 0;
+    }
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  foo\n"
+                 "Inst bar [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "many-kept") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      note_state("probe\n");
+      std::fputs("The following packages will be REMOVED:\n"
+                 "  oldplug\n",
+                 stdout);
+      return 0;
+    }
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following packages have been kept back:\n ", stdout);
+      for (int i = 1; i <= 40; ++i)
+        std::fprintf(stdout, " pkg%02d", i);
+      std::fputs("\n0 upgraded, 0 newly installed, 0 to remove and 40 not upgraded.\n", stdout);
+      return 0;
+    }
+    return 0;
+  }
+  if (std::strcmp(script, "quick-progress") == 0) {
+    if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      std::fputs("12% [1 linux-image-amd64 4 MB/80 MB 5%]\r", stdout);
+      std::fflush(stdout);
+      /* Far enough apart that the first line is published, and the second is
+       * still inside the 200ms hold when apt exits. */
+      usleep(250000);
+      std::fputs("47% [1 linux-image-amd64 40 MB/80 MB 50%]\r", stdout);
+      std::fflush(stdout);
+      return 0;
+    }
+    std::fputs("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "postinst-fail") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst foo [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    /* Real apt 2.8.3 / dpkg wording from a postinst that exits 1. */
+    std::fputs("Setting up foo (2) ...\n"
+               "dpkg: error processing package foo (--configure):\n"
+               " installed foo package post-installation script subprocess returned error exit status 1\n"
+               "Errors were encountered while processing:\n"
+               " foo\n"
+               "E: Sub-process /usr/bin/dpkg returned an error code (1)\n",
+               stdout);
+    return 100;
+  }
+  if (std::strcmp(script, "with-size") == 0) {
+    if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    std::fputs("Inst foo [1] (2 Debian:12 [amd64])\n"
+               "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+               stdout);
+    return 0;
+  }
   return 2;
 }
 
@@ -803,6 +958,15 @@ static int apt_script(const char* script, int argc, char** argv)
 static int apt_stub(int argc, char** argv)
 {
   record_argv(argc, argv);
+  /* Download size. Does not increment the script counter and does not install.
+   * The sentence is apt 2.8.3's real --print-uris line. */
+  if (is_print_uris(argc, argv)) {
+    std::fputs("Need to get 0 B/478 B of archives.\n", stdout);
+    std::fputs("'file:/tmp/localrepo/./lcos-fixture-pkg_2.0_all.deb' lcos-fixture-pkg_2.0_all.deb 478 "
+               "MD5Sum:3502cb7bee13b76cb4e82fd4ae080673\n",
+               stdout);
+    return 0;
+  }
   const char* script = std::getenv("LCOS_STUB_SCRIPT");
   if (script != nullptr && script[0] != '\0')
     return apt_script(script, argc, argv);
@@ -1282,6 +1446,8 @@ int main(int argc, char** argv)
     expect(read_count(countfile) == 1, "a lock failure does not continue to simulate");
     expect(out.find("STATUS error\n") != std::string::npos, "hard update failure is an error");
     expect(out.find("Could not get lock") != std::string::npos, "hard update failure keeps the apt line");
+    expect(out.find("left unfinished") == std::string::npos,
+           "a lock message stays as apt printed it");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
   }
@@ -1320,6 +1486,11 @@ int main(int argc, char** argv)
            "install keeps --force-confold");
     expect(argv_text.find("dist-upgrade") == std::string::npos, "install argv has no dist-upgrade");
     expect(argv_text.find("full-upgrade") == std::string::npos, "install argv has no full-upgrade");
+    expect(argv_text.find("\nquiet=0\n") != std::string::npos, "update and install pass quiet=0");
+    expect(count_lines_equal(argv_text, "quiet=0") == 2,
+           "quiet=0 is on update and install, not the simulation");
+    expect(argv_text.find("--print-uris") == std::string::npos,
+           "an install does not use the download-size request");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
   }
@@ -2116,6 +2287,10 @@ int main(int argc, char** argv)
     expect(out.find("foo.deb") != std::string::npos, "a full disk names the archive");
     expect(out.find("dpkg --configure -a") == std::string::npos,
            "a full disk does not say to run dpkg --configure -a");
+    expect(out.find("The upgrade stopped with a package left unfinished.") != std::string::npos,
+           "a full disk says the upgrade stopped unfinished");
+    expect(out.find("Free disk space, then finish configuring packages.") != std::string::npos,
+           "a full disk says to free space and finish configuring");
   }
 
   {
@@ -2247,6 +2422,320 @@ int main(int argc, char** argv)
     expect(out.find("REBOOT_ALREADY linux-image-amd64\n") != std::string::npos,
            "touching the same package list does not attribute the restart");
     expect(out.find("\nREBOOT ") == std::string::npos, "an unchanged flag is not this install");
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/probe-cancel.state";
+    pid_t helper_pid = 0;
+    int cancel_write = -1;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/probe-cancel.count";
+    if (run_helper(helper, apt, std::string(dir) + "/probe-cancel.pids", nullptr, &cancel_write,
+                   helper_pid, "probe-sleep", countfile.c_str(), &stdout_read, "simulate", nullptr,
+                   nullptr, nullptr, nullptr, nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for cancel during kept-back probes\n");
+      return 1;
+    }
+    for (int waited = 0; waited < 3000; waited += 20) {
+      if (read_file_all(statefile).find("probe") != std::string::npos)
+        break;
+      poll(nullptr, 0, 20);
+    }
+    expect(read_file_all(statefile).find("probe") != std::string::npos,
+           "the kept-back probe started");
+    if (cancel_write >= 0) {
+      close(cancel_write);
+      cancel_write = -1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits when a kept-back probe is cancelled");
+    expect(out.find("Update check was cancelled") != std::string::npos,
+           "cancelling a check during kept-back probes says the check was cancelled");
+    expect(out.find("STATUS upgrades") == std::string::npos,
+           "a cancelled check is not a finished check");
+    expect(out.find("KEPT ") == std::string::npos,
+           "a cancelled probe is not described as needing extra packages");
+    expect(out.find("Updates are available") == std::string::npos,
+           "a cancelled check does not offer updates");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/probe-install-cancel.state";
+    const std::string argvfile = std::string(dir) + "/probe-install-cancel.argv";
+    const std::vector<std::string> pins = {"bar=2"};
+    pid_t helper_pid = 0;
+    int cancel_write = -1;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/probe-install-cancel.count";
+    if (run_helper(helper, apt, std::string(dir) + "/probe-install-cancel.pids", nullptr, &cancel_write,
+                   helper_pid, "probe-sleep", countfile.c_str(), &stdout_read, "upgrade", &pins,
+                   nullptr, argvfile.c_str(), nullptr, nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for cancel during an install probe\n");
+      return 1;
+    }
+    for (int waited = 0; waited < 3000; waited += 20) {
+      if (read_file_all(statefile).find("probe") != std::string::npos)
+        break;
+      poll(nullptr, 0, 20);
+    }
+    if (cancel_write >= 0) {
+      close(cancel_write);
+      cancel_write = -1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string argv_text = read_file_all(argvfile);
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits when an install probe is cancelled");
+    expect(out.find("Install was cancelled") != std::string::npos,
+           "cancelling during the pre-install probe says the install was cancelled");
+    expect(argv_text.find("\n-y\n") == std::string::npos,
+           "a cancelled pre-install probe does not start the real install");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/probe-plain.count";
+    if (run_helper(helper, apt, std::string(dir) + "/probe-plain.pids", nullptr, nullptr, helper_pid,
+                   "probe-plain", countfile.c_str(), &stdout_read, "simulate") != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a failed kept-back probe\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a kept-back probe that fails");
+    expect(out.find("UNCLASSIFIED foo\n") != std::string::npos,
+           "a probe that does not exit 0 leaves the package unclassified");
+    expect(out.find("KEPT foo\n") == std::string::npos,
+           "a failed probe is not described as needing extra packages");
+    expect(out.find("PKG bar 1 2\n") != std::string::npos, "the other upgrade is still listed");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::vector<std::string> pins = {"bar=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("probe-removed", "probe-removed", pins, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for a removal printed by a failed probe\n");
+      return 1;
+    }
+    expect(exited, "helper exits after a probe that printed a removal and failed");
+    expect(out.find("REMOVE foo oldplug\n") != std::string::npos,
+           "a removal printed before a non-zero probe exit is kept");
+    expect(out.find("KEPT foo\n") == std::string::npos,
+           "that removal is not relabeled as extra packages");
+    expect(out.find("STATUS success\n") != std::string::npos, "the reviewed package is still installed");
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/many-kept.state";
+    const std::string argvfile = std::string(dir) + "/many-kept.argv";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    int stderr_read = -1;
+    const std::string countfile = std::string(dir) + "/many-kept.count";
+    if (run_helper(helper, apt, std::string(dir) + "/many-kept.pids", nullptr, nullptr, helper_pid,
+                   "many-kept", countfile.c_str(), &stdout_read, "simulate", nullptr, &stderr_read,
+                   argvfile.c_str(), nullptr, nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for many kept-back packages\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 20000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    const std::string state = read_file_all(statefile);
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits after classifying many kept-back packages");
+    const auto heading = err.find("The following packages have been kept back:");
+    const auto checking = err.rfind("Checking kept-back packages");
+    expect(checking != std::string::npos && (heading == std::string::npos || checking > heading),
+           "kept-back classification replaces apt's heading");
+    int removes = 0;
+    for (std::string::size_type pos = 0; (pos = out.find("REMOVE pkg", pos)) != std::string::npos;
+         pos += 7)
+      ++removes;
+    expect(removes == 40, "every kept-back name is classified when the budget allows it");
+    expect(out.find("KEPT ") == std::string::npos, "a classified removal is not an extra package");
+    expect(out.find("UNCLASSIFIED ") == std::string::npos, "a finished probe is not left unclassified");
+    int probes = 0;
+    for (std::string::size_type pos = 0; (pos = state.find("probe\n", pos)) != std::string::npos;
+         pos += 6)
+      ++probes;
+    expect(probes == 40, "each name is probed once");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/many-capped.state";
+    setenv("LCOS_UPDATES_KEPT_BUDGET_SEC", "0", 1);
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    int stderr_read = -1;
+    const std::string countfile = std::string(dir) + "/many-capped.count";
+    if (run_helper(helper, apt, std::string(dir) + "/many-capped.pids", nullptr, nullptr, helper_pid,
+                   "many-kept", countfile.c_str(), &stdout_read, "simulate", nullptr, &stderr_read,
+                   nullptr, nullptr, nullptr, statefile.c_str()) != 0) {
+      unsetenv("LCOS_UPDATES_KEPT_BUDGET_SEC");
+      std::fprintf(stderr, "failed to spawn helper for a capped kept-back pass\n");
+      return 1;
+    }
+    unsetenv("LCOS_UPDATES_KEPT_BUDGET_SEC");
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    const std::string state = read_file_all(statefile);
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits when the kept-back budget is already spent");
+    expect(state.find("probe") == std::string::npos, "a spent budget does not start probes");
+    expect(out.find("KEPT ") == std::string::npos,
+           "names past the budget are not called extra packages");
+    expect(out.find("UNCLASSIFIED pkg01\n") != std::string::npos, "the first unprobed name is unclassified");
+    expect(out.find("UNCLASSIFIED pkg40\n") != std::string::npos, "the last unprobed name is unclassified");
+    expect(err.find("Checking kept-back packages") != std::string::npos,
+           "the status says kept-back packages are being checked");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/probe-once.state";
+    const std::vector<std::string> pins = {"bar=2"};
+    std::string out;
+    bool exited = false;
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/probe-once.count";
+    if (run_helper(helper, apt, std::string(dir) + "/probe-once.pids", nullptr, nullptr, helper_pid,
+                   "probe-once", countfile.c_str(), &stdout_read, "upgrade", &pins, nullptr, nullptr,
+                   nullptr, nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a second kept-back pass\n");
+      return 1;
+    }
+    int status = 0;
+    exited = wait_pid(helper_pid, 10000, status);
+    out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    const std::string state = read_file_all(statefile);
+    expect(exited, "helper exits after an install whose kept-back name was already classified");
+    expect(count_lines_equal(state, "probe") == 1,
+           "a name classified before install is not probed again");
+    expect(out.find("KEPT foo\n") != std::string::npos, "the pre-install classification is kept");
+    expect(out.find("STATUS success\n") != std::string::npos, "the reviewed package is installed");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    pid_t helper_pid = 0;
+    int stderr_read = -1;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/quick-progress.count";
+    if (run_helper(helper, apt, std::string(dir) + "/quick-progress.pids", nullptr, nullptr, helper_pid,
+                   "quick-progress", countfile.c_str(), &stdout_read, "simulate", nullptr,
+                   &stderr_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a short progress flush\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits after a short progress burst");
+    expect(err.find("PROGRESS 12% [1 linux-image-amd64") != std::string::npos,
+           "the first percent line is forwarded");
+    expect(err.find("PROGRESS 47% [1 linux-image-amd64") != std::string::npos,
+           "the last percent line is forwarded when apt exits inside the hold");
+    expect(out.find("STATUS up-to-date\n") != std::string::npos,
+           "percent lines do not hide an up-to-date summary");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string argvfile = std::string(dir) + "/with-size.argv";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/with-size.count";
+    if (run_helper(helper, apt, std::string(dir) + "/with-size.pids", nullptr, nullptr, helper_pid,
+                   "with-size", countfile.c_str(), &stdout_read, "simulate", nullptr, nullptr,
+                   argvfile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for download size\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    const std::string argv_text = read_file_all(argvfile);
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after reporting a download size");
+    expect(out.find("STATUS upgrades\n") != std::string::npos, "a sized check still lists upgrades");
+    expect(out.find("NEED Need to get 0 B/478 B of archives.\n") != std::string::npos,
+           "the check reports apt's download size");
+    expect(argv_text.find("\n--print-uris\n") != std::string::npos,
+           "the size comes from print-uris");
+    expect(argv_text.find("\nupgrade\n") != std::string::npos, "print-uris asks apt to upgrade");
+    expect(argv_text.find("dist-upgrade") == std::string::npos, "the size request is not dist-upgrade");
+    expect(argv_text.find("full-upgrade") == std::string::npos, "the size request is not full-upgrade");
+    expect(argv_text.find("\ninstall\n") == std::string::npos, "the size request does not install");
+    expect(argv_text.find("\nquiet=0\n") != std::string::npos, "the check's apt update passes quiet=0");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::vector<std::string> pins = {"foo=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("postinst-fail", "postinst", pins, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for a postinst failure\n");
+      return 1;
+    }
+    expect(exited, "helper exits after a postinst failure");
+    expect(out.find("dpkg: error processing package foo (--configure):") != std::string::npos,
+           "a postinst failure keeps dpkg's header");
+    expect(out.find("post-installation script subprocess returned error exit status 1") != std::string::npos,
+           "a postinst failure keeps the detail line");
+    expect(out.find("Errors were encountered while processing: foo") != std::string::npos,
+           "a postinst failure names the package that failed");
+    expect(out.find("The upgrade stopped with a package left unfinished.") != std::string::npos,
+           "a postinst failure says the upgrade stopped unfinished");
+    expect(out.find("dpkg --configure -a") == std::string::npos,
+           "a script failure is not an interrupted dpkg");
+    expect(out.find("Sub-process /usr/bin/dpkg returned an error code") == std::string::npos,
+           "the generic dpkg subprocess line is not the message");
   }
 
   if (g_fails != 0) {
