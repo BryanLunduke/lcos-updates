@@ -49,9 +49,31 @@ public:
   Glib::ustring cancel_label_for_test() const { return m_cancel.get_label(); }
   bool button_mnemonics_for_test() const
   {
-    return m_check.get_use_underline() && m_install.get_use_underline() && m_cancel.get_use_underline();
+    return m_check.get_use_underline() && m_install.get_use_underline() &&
+           m_cancel.get_use_underline() && m_restart.get_use_underline();
   }
   bool cancel_is_default_for_test() const { return get_default_widget() == &m_cancel; }
+  bool install_is_default_for_test() const { return get_default_widget() == &m_install; }
+  bool check_is_default_for_test() const { return get_default_widget() == &m_check; }
+  bool restart_is_default_for_test() const { return get_default_widget() == &m_restart; }
+  int button_x_for_test(const Gtk::Widget& widget) const;
+  int check_x_for_test() const { return button_x_for_test(m_check); }
+  int install_x_for_test() const { return button_x_for_test(m_install); }
+  int restart_x_for_test() const { return button_x_for_test(m_restart); }
+  bool restart_visible_for_test() const { return m_restart.get_visible(); }
+  bool restart_sensitive_for_test() const { return m_restart.get_sensitive(); }
+  Glib::ustring restart_label_for_test() const { return m_restart.get_label(); }
+  void test_click_restart() { on_restart_clicked(); }
+  void test_confirm_restart();
+  void test_cancel_restart();
+  bool restart_default_is_cancel_for_test() const;
+  int package_rows_for_test() const;
+  Glib::ustring package_at_row_for_test(int row) const;
+  Glib::ustring size_at_row_for_test(int row) const;
+  Glib::ustring security_at_row_for_test(int row) const;
+  bool columns_fit_for_test() const;
+  int column_count_for_test() const { return m_view.get_n_columns(); }
+  bool ask_default_is_cancel_for_test() const;
   bool status_selectable_for_test() const { return m_status.get_selectable(); }
   Glib::ustring notification_text_for_test() const { return m_notification; }
   bool background_for_test() const { return m_background; }
@@ -112,6 +134,12 @@ private:
   /* True when the window should hide now. False when a close dialog is up. */
   bool prepare_close();
   void show_close_dialog();
+  void show_download_dialog();
+  bool install_downloading() const;
+  void order_trailing(Gtk::Button& trailing);
+  void on_restart_clicked();
+  void spawn_reboot();
+  void tune_column(int index, int width, bool expand, bool ellipsize);
   void append_stdout(const char* data, std::size_t n);
   void append_stderr(const char* data, std::size_t n);
   std::string stderr_text() const;
@@ -148,6 +176,7 @@ private:
   Gtk::Button m_cancel{"_Cancel", true};
   Gtk::Button m_check{"_Check for updates", true};
   Gtk::Button m_install{"_Install updates", true};
+  Gtk::Button m_restart{"_Restart", true};
 
   class ModelColumns : public Gtk::TreeModel::ColumnRecord {
   public:
@@ -156,10 +185,14 @@ private:
       add(package);
       add(old_version);
       add(new_version);
+      add(size);
+      add(security);
     }
     Gtk::TreeModelColumn<Glib::ustring> package;
     Gtk::TreeModelColumn<Glib::ustring> old_version;
     Gtk::TreeModelColumn<Glib::ustring> new_version;
+    Gtk::TreeModelColumn<Glib::ustring> size;
+    Gtk::TreeModelColumn<Glib::ustring> security;
   };
 
   ModelColumns m_cols;
@@ -216,8 +249,14 @@ private:
   unsigned m_retry_gen = 0;
   Glib::Pid m_retry_pid = 0;
   Gtk::MessageDialog* m_close_dialog = nullptr;
+  Gtk::MessageDialog* m_restart_dialog = nullptr;
+  bool m_ask_download = false;
+  bool m_download_stop_hides = false;
   Glib::ustring m_close_primary;
   Glib::ustring m_close_secondary;
+  Glib::ustring m_restart_primary;
+  sigc::connection m_reboot_watch;
+  int m_reboot_err_fd = -1;
   Glib::ustring m_notification;
   Glib::ustring m_phase;
   Glib::ustring m_progress_line;

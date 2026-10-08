@@ -11,7 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <fcntl.h>
+#include <sstream>
 #include <poll.h>
 #include <string>
 #include <sys/prctl.h>
@@ -951,6 +953,58 @@ static int apt_script(const char* script, int argc, char** argv)
                stdout);
     return 0;
   }
+  if (std::strcmp(script, "space-clear") == 0) {
+    if (n == 1) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      std::fputs("4% [1 xz-utils 13.0 kB/267 kB 5%]\r", stdout);
+      std::fflush(stdout);
+      usleep(250000);
+      std::fputs("                                        \r", stdout);
+      std::fflush(stdout);
+      usleep(250000);
+      std::fputs("28% [1 xz-utils 80.0 kB/267 kB 30%]\r", stdout);
+      std::fflush(stdout);
+      std::fputs("                                        \r", stdout);
+      std::fflush(stdout);
+      std::fputs("Inst gzip [1] (2 Debian:12 [amd64])\n", stdout);
+      return 0;
+    }
+    std::fputs("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "reuse-snap") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      note_state("probe\n");
+      std::fputs("The following packages will be REMOVED:\n"
+                 "  oldplug\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "update")) {
+      note_state("update\n");
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    const char* state = std::getenv("LCOS_STUB_STATEFILE");
+    const bool mismatch =
+        state != nullptr && access((std::string(state) + ".mismatch").c_str(), F_OK) == 0;
+    if (argv_has(argc, argv, "-s") && argv_has(argc, argv, "upgrade") &&
+        !argv_has(argc, argv, "--only-upgrade")) {
+      std::fputs("The following packages have been kept back:\n", stdout);
+      std::fputs(mismatch ? "  bar\n" : "  foo\n", stdout);
+      std::fputs("Inst bash [1] (2 Debian:12/stable [amd64])\n"
+                 "Inst openssl [1] (2 Debian-Security:12/stable-security [amd64])\n"
+                 "2 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "-y")) {
+      note_state("install\n");
+      std::fputs("2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+      return 0;
+    }
+    return 0;
+  }
   return 2;
 }
 
@@ -962,6 +1016,7 @@ static int apt_stub(int argc, char** argv)
    * The sentence is apt 2.8.3's real --print-uris line. */
   if (is_print_uris(argc, argv)) {
     std::fputs("Need to get 0 B/478 B of archives.\n", stdout);
+    std::fputs("After this operation, 0 B of additional disk space will be used.\n", stdout);
     std::fputs("'file:/tmp/localrepo/./lcos-fixture-pkg_2.0_all.deb' lcos-fixture-pkg_2.0_all.deb 478 "
                "MD5Sum:3502cb7bee13b76cb4e82fd4ae080673\n",
                stdout);
@@ -2703,6 +2758,9 @@ int main(int argc, char** argv)
     expect(out.find("STATUS upgrades\n") != std::string::npos, "a sized check still lists upgrades");
     expect(out.find("NEED Need to get 0 B/478 B of archives.\n") != std::string::npos,
            "the check reports apt's download size");
+    expect(out.find("DISK After this operation, 0 B of additional disk space will be used.\n") !=
+               std::string::npos,
+           "the check keeps the disk-space line");
     expect(argv_text.find("\n--print-uris\n") != std::string::npos,
            "the size comes from print-uris");
     expect(argv_text.find("\nupgrade\n") != std::string::npos, "print-uris asks apt to upgrade");
@@ -2736,6 +2794,161 @@ int main(int argc, char** argv)
            "a script failure is not an interrupted dpkg");
     expect(out.find("Sub-process /usr/bin/dpkg returned an error code") == std::string::npos,
            "the generic dpkg subprocess line is not the message");
+  }
+
+  {
+    /* A carriage return that holds only spaces must not become the progress
+     * line, and an Inst line must not either. The real percentages stay. */
+    pid_t helper_pid = 0;
+    int stderr_read = -1;
+    int stdout_read = -1;
+    const std::vector<std::string> pins = {"bash=2"};
+    const std::string countfile = std::string(dir) + "/space-clear.count";
+    if (run_helper(helper, apt, std::string(dir) + "/space-clear.pids", nullptr, nullptr, helper_pid,
+                   "space-clear", countfile.c_str(), &stdout_read, "upgrade", &pins,
+                   &stderr_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a cleared progress line\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits after a progress line that apt then clears");
+    expect(err.find("PROGRESS 4% [1 xz-utils 13.0 kB/267 kB 5%]\n") != std::string::npos,
+           "the first percent line is forwarded");
+    expect(err.find("PROGRESS 28% [1 xz-utils 80.0 kB/267 kB 30%]\n") != std::string::npos,
+           "a later percent line replaces the cleared one");
+    bool blank_progress = false;
+    bool inst_progress = false;
+    std::istringstream lines(err);
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (line.compare(0, 9, "PROGRESS ") != 0)
+        continue;
+      const std::string body = line.substr(9);
+      if (body.find_first_not_of(" \t\r") == std::string::npos)
+        blank_progress = true;
+      if (body.compare(0, 5, "Inst ") == 0)
+        inst_progress = true;
+    }
+    expect(!blank_progress, "whitespace progress lines are dropped");
+    expect(!inst_progress, "Inst lines are not progress text");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    /* The install reuses a check whose lists have not changed: no second
+     * apt-get update and no second kept-back probe. A changed Release file,
+     * or a kept-back set that no longer matches, falls back and says so. */
+    const std::string lists = std::string(dir) + "/lists";
+    const std::string statedir = std::string(dir) + "/check-state";
+    expect(mkdir(lists.c_str(), 0755) == 0, "lists dir");
+    expect(mkdir(statedir.c_str(), 0755) == 0, "state dir");
+    {
+      std::ofstream rel(lists + "/noble_InRelease");
+      rel << "Origin: Ubuntu\nLabel: Ubuntu\nSuite: noble\n";
+    }
+    setenv("LCOS_UPDATES_LISTS_DIR", lists.c_str(), 1);
+    setenv("LCOS_UPDATES_STATE_DIR", statedir.c_str(), 1);
+
+    auto run_snap = [&](const char* command, const std::vector<std::string>* pins, const char* tag,
+                        std::string& out, std::string& argv_text, std::string& state,
+                        bool& exited) -> bool {
+      pid_t helper_pid = 0;
+      int stdout_read = -1;
+      const std::string argvfile = std::string(dir) + "/" + tag + ".argv";
+      const std::string statefile = std::string(dir) + "/" + tag + ".state";
+      if (run_helper(helper, apt, std::string(dir) + "/" + tag + ".pids", nullptr, nullptr,
+                     helper_pid, "reuse-snap", nullptr, &stdout_read, command, pins, nullptr,
+                     argvfile.c_str(), nullptr, nullptr, statefile.c_str()) != 0)
+        return false;
+      int status = 0;
+      exited = wait_pid(helper_pid, 10000, status);
+      out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+      if (stdout_read >= 0)
+        close(stdout_read);
+      argv_text = read_file_all(argvfile);
+      state = read_file_all(statefile);
+      if (!exited)
+        terminate_process_tree(helper_pid, 200);
+      return true;
+    };
+
+    std::string out;
+    std::string argv_text;
+    std::string state;
+    bool exited = false;
+    if (!run_snap("simulate", nullptr, "reuse-check", out, argv_text, state, exited)) {
+      unsetenv("LCOS_UPDATES_LISTS_DIR");
+      unsetenv("LCOS_UPDATES_STATE_DIR");
+      std::fprintf(stderr, "failed to spawn helper for a reusable check\n");
+      return 1;
+    }
+    expect(exited, "helper exits after a check that can be reused");
+    expect(out.find("SEC openssl\n") != std::string::npos, "security marker from the archive token");
+    expect(out.find("REMOVE foo oldplug\n") != std::string::npos,
+           "check classified the kept-back row");
+    expect(count_lines_equal(argv_text, "update") == 1, "the check still refreshes indexes");
+    expect(count_lines_equal(state, "probe") == 1, "the check probed kept-back once");
+
+    const std::vector<std::string> pins = {"bash=2", "openssl=2"};
+    if (!run_snap("upgrade", &pins, "reuse-install", out, argv_text, state, exited)) {
+      unsetenv("LCOS_UPDATES_LISTS_DIR");
+      unsetenv("LCOS_UPDATES_STATE_DIR");
+      std::fprintf(stderr, "failed to spawn helper for a reused install\n");
+      return 1;
+    }
+    expect(exited, "helper exits after reusing a check");
+    expect(count_lines_equal(argv_text, "update") == 0, "unchanged lists skip apt-get update");
+    expect(state.find("probe") == std::string::npos, "a reused classification is not probed again");
+    expect(count_lines_equal(state, "install") == 1, "the pinned install still runs");
+    expect(out.find("REMOVE foo oldplug\n") != std::string::npos, "the reused removal is reported");
+    expect(out.find("STATUS success\n") != std::string::npos, "reused install succeeds");
+    expect(out.find("Checking again") == std::string::npos, "a match does not announce a fallback");
+
+    /* Lists still match the snapshot. The kept-back name does not. */
+    {
+      std::ofstream flag(std::string(dir) + "/reuse-shift.state.mismatch");
+      flag << "1\n";
+    }
+    if (!run_snap("upgrade", &pins, "reuse-shift", out, argv_text, state, exited)) {
+      unsetenv("LCOS_UPDATES_LISTS_DIR");
+      unsetenv("LCOS_UPDATES_STATE_DIR");
+      std::fprintf(stderr, "failed to spawn helper for a changed kept-back set\n");
+      return 1;
+    }
+    expect(exited, "helper exits after a kept-back set that no longer matches");
+    expect(out.find("WARN Package lists changed since the check. Checking again.\n") !=
+               std::string::npos,
+           "a different kept-back set is not reused");
+    expect(count_lines_equal(argv_text, "update") >= 1, "a different kept-back set refreshes indexes");
+    expect(count_lines_equal(state, "probe") == 1, "the new kept-back name is probed");
+    std::remove((std::string(dir) + "/reuse-shift.state.mismatch").c_str());
+
+    {
+      std::ofstream rel(lists + "/noble_InRelease", std::ios::app);
+      rel << "Date: later\n";
+    }
+    if (!run_snap("upgrade", &pins, "reuse-changed", out, argv_text, state, exited)) {
+      unsetenv("LCOS_UPDATES_LISTS_DIR");
+      unsetenv("LCOS_UPDATES_STATE_DIR");
+      std::fprintf(stderr, "failed to spawn helper for changed package lists\n");
+      return 1;
+    }
+    expect(exited, "helper exits after package lists change");
+    expect(count_lines_equal(argv_text, "update") >= 1, "changed lists refresh indexes again");
+    expect(out.find("WARN Package lists changed since the check. Checking again.\n") !=
+               std::string::npos,
+           "the fallback is announced");
+    expect(count_lines_equal(state, "probe") == 1, "a changed classification is probed");
+
+    unsetenv("LCOS_UPDATES_LISTS_DIR");
+    unsetenv("LCOS_UPDATES_STATE_DIR");
   }
 
   if (g_fails != 0) {

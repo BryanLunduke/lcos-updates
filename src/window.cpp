@@ -8,6 +8,7 @@
 
 #include "timeouts.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
@@ -39,6 +40,20 @@ const char* pkexec_path()
   (void)0;
 #endif
   return kPkexecPath;
+}
+
+/* elogind provides loginctl. The session's own polkit action authorizes it.
+ * This is not a root helper, and a failure is reported here. */
+const char* loginctl_path()
+{
+#ifdef LCOS_UPDATES_TEST
+  const char* env = std::getenv("LCOS_UPDATES_TEST_LOGINCTL");
+  if (env != nullptr && env[0] == '/')
+    return env;
+#else
+  (void)0;
+#endif
+  return "/usr/bin/loginctl";
 }
 
 int gui_timeout_ms(int fallback)
@@ -182,23 +197,62 @@ InhibitHold take_inhibitors(Gtk::Application* app, Gtk::Window& window, const Gl
   return hold;
 }
 
-int leading_percent(const Glib::ustring& line)
+bool apt_plan_line(const Glib::ustring& line)
 {
-  std::size_t i = 0;
-  while (i < line.size() && line[i] == ' ')
-    ++i;
-  if (i >= line.size() || !g_ascii_isdigit(line[i]))
-    return -1;
-  int value = 0;
-  while (i < line.size() && g_ascii_isdigit(line[i])) {
-    value = value * 10 + (line[i] - '0');
-    if (value > 100)
-      return -1;
-    ++i;
+  return line.compare(0, 5, "Inst ") == 0 || line.compare(0, 5, "Conf ") == 0;
+}
+
+bool progress_has_count(const Glib::ustring& line)
+{
+  return line.find('(') != Glib::ustring::npos && line.find(" of ") != Glib::ustring::npos;
+}
+
+Glib::ustring download_package_name(const Glib::ustring& line)
+{
+  const auto bracket = line.find('[');
+  if (bracket != Glib::ustring::npos) {
+    auto i = bracket + 1;
+    while (i < line.size() && line[i] == ' ')
+      ++i;
+    if (i < line.size() && g_ascii_isdigit(line[i])) {
+      while (i < line.size() && g_ascii_isdigit(line[i]))
+        ++i;
+      while (i < line.size() && line[i] == ' ')
+        ++i;
+    }
+    const auto end = line.find_first_of(" ]", i);
+    if (end != Glib::ustring::npos && end > i)
+      return line.substr(i, end - i);
   }
-  if (i >= line.size() || line[i] != '%')
-    return -1;
-  return value;
+  if (line.compare(0, 4, "Get:") == 0) {
+    const auto slash = line.rfind('/');
+    const auto deb = line.find(".deb");
+    if (slash != Glib::ustring::npos && deb != Glib::ustring::npos && deb > slash + 1) {
+      const Glib::ustring file = line.substr(slash + 1, deb - (slash + 1));
+      const auto us = file.find('_');
+      if (us == Glib::ustring::npos)
+        return file;
+      if (us > 0)
+        return file.substr(0, us);
+    }
+  }
+  return {};
+}
+
+Glib::ustring friendly_progress(const Glib::ustring& line, const Glib::ustring& phase)
+{
+  if (line.compare(0, 21, "Reading package lists") == 0)
+    return "Reading package lists…";
+  if (line.compare(0, 19, "Calculating upgrade") == 0)
+    return "Calculating upgrade…";
+  if (line.compare(0, 24, "Building dependency tree") == 0)
+    return "Building dependency tree…";
+  const Glib::ustring pkg = download_package_name(line);
+  if (!pkg.empty() && (line.compare(0, 4, "Get:") == 0 || progress_percent(line) >= 0))
+    return "Downloading " + pkg + "…";
+  if (phase == "download")
+    return "Downloading updates…";
+  return line;
 }
 
 Glib::ustring package_being_configured(const Glib::ustring& line)
@@ -270,7 +324,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_status.set_selectable(true);
   m_status.set_xalign(0.0f);
   m_status.set_yalign(0.0f);
-  m_status.set_text("Check for updates for your Computer.");
+  m_status.set_text("Check for updates.");
 
   /* A long apt error wraps inside the window and scrolls instead of pushing
    * the buttons off the screen. */
@@ -314,8 +368,17 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_view.append_column("Package", m_cols.package);
   m_view.append_column("Old version", m_cols.old_version);
   m_view.append_column("New version", m_cols.new_version);
+  m_view.append_column("Size", m_cols.size);
+  m_view.append_column("Security", m_cols.security);
   m_view.set_headers_visible(true);
   m_view.get_selection()->set_mode(Gtk::SELECTION_NONE);
+  /* Fixed shares keep the versions and the size inside the window. Long
+   * package names ellipsize instead of pushing the new version off screen. */
+  tune_column(0, 160, true, true);
+  tune_column(1, 168, false, false);
+  tune_column(2, 210, false, false);
+  tune_column(3, 96, false, false);
+  tune_column(4, 84, false, false);
 
   m_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
   m_scroller.set_shadow_type(Gtk::SHADOW_IN);
@@ -331,12 +394,18 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_check.set_can_default(true);
   m_cancel.set_sensitive(false);
   m_cancel.set_can_default(true);
+  m_restart.set_no_show_all(true);
+  m_restart.set_sensitive(false);
+  m_restart.hide();
+  m_restart.set_can_default(true);
   m_buttons.pack_start(m_cancel, Gtk::PACK_SHRINK);
   m_buttons.pack_start(m_install, Gtk::PACK_SHRINK);
   m_buttons.pack_start(m_check, Gtk::PACK_SHRINK);
+  m_buttons.pack_start(m_restart, Gtk::PACK_SHRINK);
   m_check.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_check_clicked));
   m_install.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_install_clicked));
   m_cancel.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_cancel_clicked));
+  m_restart.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_restart_clicked));
 
   m_content.set_border_width(12);
   m_content.pack_start(m_status_row, Gtk::PACK_SHRINK);
@@ -379,6 +448,16 @@ UpdatesWindow::~UpdatesWindow()
     Gtk::MessageDialog* dialog = m_close_dialog;
     m_close_dialog = nullptr;
     delete dialog;
+  }
+  if (m_restart_dialog != nullptr) {
+    Gtk::MessageDialog* dialog = m_restart_dialog;
+    m_restart_dialog = nullptr;
+    delete dialog;
+  }
+  m_reboot_watch.disconnect();
+  if (m_reboot_err_fd >= 0) {
+    ::close(m_reboot_err_fd);
+    m_reboot_err_fd = -1;
   }
   /* Once dpkg has started, closing the window must not cancel the install.
    * The helper ignores EOF and SIGTERM for the rest of that apt run. */
@@ -446,6 +525,8 @@ void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
     use_cancel_as_default();
   m_pulse.disconnect();
   if (busy) {
+    m_restart.hide();
+    m_restart.set_sensitive(false);
     m_spinner.show();
     m_spinner.start();
     /* The bar stays hidden until HELPER_READY. During the password dialog
@@ -494,12 +575,20 @@ void UpdatesWindow::show_job_progress()
 
 void UpdatesWindow::show_packages(const std::vector<PackageUpgrade>& packages)
 {
+  std::vector<PackageUpgrade> rows = packages;
+  std::stable_sort(rows.begin(), rows.end(), [](const PackageUpgrade& a, const PackageUpgrade& b) {
+    if (a.security != b.security)
+      return a.security;
+    return a.name < b.name;
+  });
   m_store->clear();
-  for (const auto& pkg : packages) {
+  for (const auto& pkg : rows) {
     Gtk::TreeModel::Row row = *(m_store->append());
     row[m_cols.package] = pkg.name;
     row[m_cols.old_version] = pkg.old_version;
     row[m_cols.new_version] = pkg.new_version;
+    row[m_cols.size] = pkg.size;
+    row[m_cols.security] = pkg.security ? "Yes" : "";
   }
   show_package_list();
 }
@@ -512,7 +601,18 @@ void UpdatesWindow::show_package_list()
   /* gtkmm Box no longer wraps this; expand content so the scroller absorbs growth. */
   gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), TRUE, TRUE, 0,
                             GTK_PACK_START);
-  resize(560, 420);
+  int list_height = 640;
+  if (const auto screen = get_screen()) {
+    const int sh = screen->get_height();
+    if (sh > 200) {
+      list_height = sh - 80;
+      if (list_height > 760)
+        list_height = 760;
+      if (list_height < 520)
+        list_height = 520;
+    }
+  }
+  resize(780, list_height);
   use_install_as_default();
 }
 
@@ -536,8 +636,35 @@ void UpdatesWindow::hide_package_list()
   use_check_as_default();
 }
 
+void UpdatesWindow::tune_column(int index, int width, bool expand, bool ellipsize)
+{
+  Gtk::TreeViewColumn* column = m_view.get_column(index);
+  if (column == nullptr)
+    return;
+  column->set_sizing(Gtk::TREE_VIEW_COLUMN_FIXED);
+  column->set_fixed_width(width);
+  column->set_min_width(width);
+  column->set_resizable(false);
+  column->set_expand(expand);
+  if (auto* cell = dynamic_cast<Gtk::CellRendererText*>(column->get_first_cell()))
+    cell->property_ellipsize() = ellipsize ? Pango::ELLIPSIZE_END : Pango::ELLIPSIZE_NONE;
+}
+
+void UpdatesWindow::order_trailing(Gtk::Button& trailing)
+{
+  Gtk::Button* buttons[] = {&m_cancel, &m_install, &m_check, &m_restart};
+  int pos = 0;
+  for (Gtk::Button* button : buttons) {
+    if (button == &trailing)
+      continue;
+    gtk_box_reorder_child(GTK_BOX(m_buttons.gobj()), GTK_WIDGET(button->gobj()), pos++);
+  }
+  gtk_box_reorder_child(GTK_BOX(m_buttons.gobj()), GTK_WIDGET(trailing.gobj()), pos);
+}
+
 void UpdatesWindow::use_check_as_default()
 {
+  order_trailing(m_check);
   m_check.set_can_default(true);
   set_default(m_check);
   m_check.grab_default();
@@ -545,6 +672,7 @@ void UpdatesWindow::use_check_as_default()
 
 void UpdatesWindow::use_install_as_default()
 {
+  order_trailing(m_install);
   m_install.set_can_default(true);
   set_default(m_install);
   m_install.grab_default();
@@ -801,21 +929,28 @@ void UpdatesWindow::append_stderr(const char* data, std::size_t n)
       const auto idle = m_markers.rfind("DPKG_IDLE\n");
       const bool dpkg_on =
           started != std::string::npos && (idle == std::string::npos || started > idle);
-      if (next != m_phase && !dpkg_on)
+      if (next != m_phase && !dpkg_on) {
         m_phase_mark_us = g_get_monotonic_time();
+        m_progress_percent = -1;
+      }
       m_phase = next;
     }
     else if (line.compare(0, 9, "PROGRESS ") == 0) {
-      m_progress_line = line.substr(9);
-      if (m_progress_line.size() > 240)
-        m_progress_line.resize(240);
-      m_progress_percent = leading_percent(m_progress_line);
-      if (m_progress_percent >= 0 && m_progress.get_visible()) {
-        m_progress.set_show_text(true);
-        m_progress.set_text(std::to_string(m_progress_percent) + "%");
-        m_progress.set_fraction(static_cast<double>(m_progress_percent) / 100.0);
-      } else if (m_progress_percent < 0) {
-        m_progress.set_show_text(false);
+      const Glib::ustring raw(line.substr(9));
+      /* A spaces-only clear-line, or an Inst/Conf plan line, must not blank
+       * the status or drop the percent the bar is already showing. */
+      if (progress_line_visible(raw) && !apt_plan_line(raw)) {
+        m_progress_line = raw;
+        if (m_progress_line.size() > 240)
+          m_progress_line.resize(240);
+        const int pct = progress_percent(std::string(m_progress_line));
+        if (pct >= 0)
+          m_progress_percent = pct;
+        if (m_progress_percent >= 0 && m_progress.get_visible()) {
+          m_progress.set_show_text(true);
+          m_progress.set_text(std::to_string(m_progress_percent) + "%");
+          m_progress.set_fraction(static_cast<double>(m_progress_percent) / 100.0);
+        }
       }
     }
     if (m_stderr_first_error.empty() && line.compare(0, 2, "E:") == 0) {
@@ -915,6 +1050,7 @@ void UpdatesWindow::maybe_note_dpkg()
     return;
   m_dpkg_started = on;
   if (on) {
+    m_progress_percent = -1;
     if (m_job == Job::Install)
       m_install_committed = true;
     m_timeout.disconnect();
@@ -953,6 +1089,28 @@ void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector
   set_idle_status(outcome.status);
   m_check.set_sensitive(outcome.check_enabled);
   m_install.set_sensitive(outcome.install_enabled);
+  if (outcome.offer_restart) {
+    m_restart.show();
+    m_restart.set_sensitive(true);
+    order_trailing(m_restart);
+    m_restart.set_can_default(true);
+    set_default(m_restart);
+    m_restart.grab_default();
+    queue_resize();
+    int min_h = 0;
+    int nat_h = 0;
+    get_preferred_height(min_h, nat_h);
+    int width = 0;
+    int height = 0;
+    get_size(width, height);
+    if (width < 560)
+      width = 560;
+    if (nat_h > height)
+      resize(width, nat_h);
+  } else {
+    m_restart.set_sensitive(false);
+    m_restart.hide();
+  }
 }
 
 void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
@@ -1153,8 +1311,20 @@ bool UpdatesWindow::prepare_close()
     show_close_dialog();
     return false;
   }
+  if (install_downloading() && !m_background) {
+    m_closing = true;
+    m_download_stop_hides = true;
+    show_download_dialog();
+    return false;
+  }
   m_closing = true;
   return true;
+}
+
+bool UpdatesWindow::install_downloading() const
+{
+  return m_job == Job::Install && m_have_pid && !m_dpkg_started && !m_install_committed &&
+         m_phase == "download";
 }
 
 void UpdatesWindow::show_close_dialog()
@@ -1203,6 +1373,113 @@ void UpdatesWindow::show_close_dialog()
   dialog->show_all();
 }
 
+void UpdatesWindow::show_download_dialog()
+{
+  if (m_close_dialog != nullptr)
+    return;
+  m_ask_download = true;
+  m_close_primary = "Stop downloading?";
+  m_close_secondary = "Nothing will be installed.";
+  auto* dialog = new Gtk::MessageDialog(*this, m_close_primary, false, Gtk::MESSAGE_QUESTION,
+                                        Gtk::BUTTONS_NONE, true);
+  dialog->set_secondary_text(m_close_secondary);
+  dialog->add_button("_Keep installing", Gtk::RESPONSE_CANCEL);
+  dialog->add_button("_Stop downloading", Gtk::RESPONSE_CLOSE);
+  dialog->set_default_response(Gtk::RESPONSE_CANCEL);
+  m_close_dialog = dialog;
+  dialog->signal_response().connect([this](int response) {
+    Gtk::MessageDialog* dying = m_close_dialog;
+    m_close_dialog = nullptr;
+    const bool hide_window = m_download_stop_hides;
+    m_download_stop_hides = false;
+    m_ask_download = false;
+    if (dying != nullptr)
+      dying->hide();
+    Glib::signal_idle().connect_once([dying]() { delete dying; });
+    if (response != Gtk::RESPONSE_CLOSE) {
+      m_closing = false;
+      if (m_check_after_job && m_job == Job::None && !m_have_pid)
+        request_check();
+      return;
+    }
+    request_stop();
+    if (!hide_window) {
+      m_closing = false;
+      return;
+    }
+    m_leave_helper_running = false;
+    m_background = true;
+    if (auto app = get_application()) {
+      app->hold();
+      m_app_held = true;
+    }
+    hide();
+  });
+  dialog->show_all();
+}
+
+void UpdatesWindow::on_restart_clicked()
+{
+  if (!m_restart.get_sensitive() || m_restart_dialog != nullptr || m_job != Job::None)
+    return;
+  m_restart_primary = "Restart now?";
+  auto* dialog = new Gtk::MessageDialog(*this, m_restart_primary, false, Gtk::MESSAGE_QUESTION,
+                                        Gtk::BUTTONS_NONE, true);
+  dialog->add_button("_Cancel", Gtk::RESPONSE_CANCEL);
+  dialog->add_button("_Restart", Gtk::RESPONSE_OK);
+  dialog->set_default_response(Gtk::RESPONSE_CANCEL);
+  m_restart_dialog = dialog;
+  dialog->signal_response().connect([this](int response) {
+    Gtk::MessageDialog* dying = m_restart_dialog;
+    m_restart_dialog = nullptr;
+    if (dying != nullptr)
+      dying->hide();
+    Glib::signal_idle().connect_once([dying]() { delete dying; });
+    if (response == Gtk::RESPONSE_OK)
+      spawn_reboot();
+  });
+  dialog->show_all();
+}
+
+void UpdatesWindow::spawn_reboot()
+{
+  m_restart.set_sensitive(false);
+  const char* bin = loginctl_path();
+  std::vector<std::string> argv;
+  argv.emplace_back(bin);
+  argv.emplace_back("reboot");
+  int err_fd = -1;
+  Glib::Pid pid = 0;
+  try {
+    Glib::spawn_async_with_pipes(std::string(), argv, Glib::SPAWN_DO_NOT_REAP_CHILD,
+                                 sigc::slot<void>(), &pid, nullptr, nullptr, &err_fd);
+  } catch (const Glib::Error&) {
+    m_status.set_text("Could not restart this computer.");
+    m_restart.set_sensitive(true);
+    return;
+  }
+  if (m_reboot_err_fd >= 0)
+    ::close(m_reboot_err_fd);
+  m_reboot_err_fd = err_fd;
+  m_status.set_text("Restarting…");
+  m_reboot_watch.disconnect();
+  m_reboot_watch = Glib::signal_child_watch().connect(
+      [this](Glib::Pid child, int wait_status) {
+        Glib::spawn_close_pid(child);
+        m_reboot_watch.disconnect();
+        if (m_reboot_err_fd >= 0) {
+          ::close(m_reboot_err_fd);
+          m_reboot_err_fd = -1;
+        }
+        const bool ok = WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0;
+        if (!ok) {
+          m_status.set_text("Could not restart this computer.");
+          m_restart.set_sensitive(true);
+        }
+      },
+      pid);
+}
+
 void UpdatesWindow::on_quit()
 {
   if (!prepare_close())
@@ -1221,6 +1498,13 @@ void UpdatesWindow::on_cancel_clicked()
 {
   if (m_job == Job::None && !m_have_pid)
     return;
+  if (m_close_dialog != nullptr)
+    return;
+  if (install_downloading()) {
+    m_download_stop_hides = false;
+    show_download_dialog();
+    return;
+  }
   request_stop();
 }
 
@@ -1357,8 +1641,8 @@ void UpdatesWindow::apply_phase_status()
       text = "Configuring packages…";
     else
       text = "Configuring " + pkg + "…";
-  } else if (!m_progress_line.empty())
-    text = m_progress_line;
+  } else if (progress_line_visible(m_progress_line) && !apt_plan_line(m_progress_line))
+    text = friendly_progress(m_progress_line, m_phase);
   else if (m_phase == "refresh")
     text = "Refreshing package lists…";
   else if (m_phase == "download")
@@ -1367,7 +1651,8 @@ void UpdatesWindow::apply_phase_status()
     text = m_job == Job::Install ? "Checking the package list…" : "Checking for updates…";
   else
     return;
-  text += phase_age_suffix();
+  if (!progress_has_count(text))
+    text += phase_age_suffix();
   m_status.set_text(text);
   refresh_commit_note();
 }
@@ -1541,5 +1826,104 @@ bool UpdatesWindow::buttons_inside_window_for_test() const
                                         m_buttons.get_allocated_height(), nullptr, &bottom))
     return false;
   return bottom <= get_allocated_height() + 2;
+}
+
+int UpdatesWindow::button_x_for_test(const Gtk::Widget& widget) const
+{
+  int x = 0;
+  int y = 0;
+  if (!gtk_widget_translate_coordinates(GTK_WIDGET(widget.gobj()), GTK_WIDGET(gobj()), 0, 0, &x, &y))
+    return -1;
+  return x;
+}
+
+void UpdatesWindow::test_confirm_restart()
+{
+  if (m_restart_dialog != nullptr)
+    m_restart_dialog->response(Gtk::RESPONSE_OK);
+}
+
+void UpdatesWindow::test_cancel_restart()
+{
+  if (m_restart_dialog != nullptr)
+    m_restart_dialog->response(Gtk::RESPONSE_CANCEL);
+}
+
+bool UpdatesWindow::restart_default_is_cancel_for_test() const
+{
+  if (m_restart_dialog == nullptr)
+    return false;
+  auto* def = dynamic_cast<Gtk::Button*>(m_restart_dialog->get_default_widget());
+  return def != nullptr && def->get_label() == "_Cancel";
+}
+
+int UpdatesWindow::package_rows_for_test() const
+{
+  return static_cast<int>(m_store->children().size());
+}
+
+Glib::ustring UpdatesWindow::package_at_row_for_test(int row) const
+{
+  const auto children = m_store->children();
+  if (row < 0 || row >= static_cast<int>(children.size()))
+    return {};
+  return (*children[static_cast<std::size_t>(row)])[m_cols.package];
+}
+
+Glib::ustring UpdatesWindow::size_at_row_for_test(int row) const
+{
+  const auto children = m_store->children();
+  if (row < 0 || row >= static_cast<int>(children.size()))
+    return {};
+  return (*children[static_cast<std::size_t>(row)])[m_cols.size];
+}
+
+Glib::ustring UpdatesWindow::security_at_row_for_test(int row) const
+{
+  const auto children = m_store->children();
+  if (row < 0 || row >= static_cast<int>(children.size()))
+    return {};
+  return (*children[static_cast<std::size_t>(row)])[m_cols.security];
+}
+
+bool UpdatesWindow::columns_fit_for_test() const
+{
+  const int tree = m_view.get_allocated_width();
+  if (tree < 200)
+    return false;
+  const auto hadj = m_scroller.get_hadjustment();
+  if (!hadj || hadj->get_page_size() + 1 < hadj->get_upper())
+    return false;
+  const int n = m_view.get_n_columns();
+  if (n < 5)
+    return false;
+  for (int i = 0; i < n; ++i) {
+    const Gtk::TreeViewColumn* column = m_view.get_column(i);
+    if (column == nullptr || column->get_width() <= 0)
+      return false;
+    if (column->get_x_offset() + column->get_width() > tree + 2)
+      return false;
+    const auto* cell = dynamic_cast<const Gtk::CellRendererText*>(column->get_first_cell());
+    if (cell == nullptr)
+      return false;
+    if (i == 0) {
+      if (cell->property_ellipsize() != Pango::ELLIPSIZE_END)
+        return false;
+    } else if (cell->property_ellipsize() != Pango::ELLIPSIZE_NONE) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool UpdatesWindow::ask_default_is_cancel_for_test() const
+{
+  if (m_close_dialog == nullptr)
+    return false;
+  auto* def = dynamic_cast<Gtk::Button*>(m_close_dialog->get_default_widget());
+  if (def == nullptr)
+    return false;
+  const Glib::ustring label = def->get_label();
+  return label == "_Keep installing" || label == "_Keep open";
 }
 #endif

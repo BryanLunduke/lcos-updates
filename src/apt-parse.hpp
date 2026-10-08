@@ -17,6 +17,12 @@ struct PackageUpgrade {
   std::string name;
   std::string old_version;
   std::string new_version;
+  /* Archive token from the Inst line, such as "Debian-Security:12/stable-security". */
+  std::string archive;
+  /* Display size from apt's --print-uris line. Empty when apt did not name one. */
+  std::string size;
+  /* True when the archive or a Release file marks a security origin or suite. */
+  bool security = false;
 };
 
 struct SimulateResult {
@@ -37,6 +43,8 @@ struct SimulateResult {
   std::vector<std::string> unclassified;
   /* Apt's "Need to get … of archives." line for the reviewed set. Empty if unknown. */
   std::string download_need;
+  /* Apt's "After this operation, …" line. Empty when that line was absent. */
+  std::string disk_use;
   /* Updates apt deferred because of phasing. Offered again later. */
   std::vector<std::string> phased;
   /* Packages kept back because dpkg has them on hold. */
@@ -76,8 +84,34 @@ struct CaptureBuf {
 void capture_append(CaptureBuf& cap, const char* data, std::size_t n);
 std::string capture_text(const CaptureBuf& cap);
 
-/* Parse one apt-get -s "Inst name [old] (new ...)" or "Inst name (new ...)" line. */
+/* Parse one apt-get -s "Inst name [old] (new ...)" or "Inst name (new ...)" line.
+ * A security archive token on that line sets PackageUpgrade::security. */
 bool parse_inst_line(const std::string& line, PackageUpgrade& out);
+
+/* An apt progress segment that is empty or only whitespace is the clear-line
+ * apt writes before the next percent. It is not a status. */
+bool progress_line_visible(const std::string& line);
+
+/* Leading "28%" or a trailing "Reading package lists... 59%". -1 when absent. */
+int progress_percent(const std::string& line);
+
+/* True for a Release/InRelease body whose Origin is Debian-Security, or whose
+ * Label, Suite, or Codename ends in -security. */
+bool release_text_is_security(const std::string& text);
+
+/* Security suite, codename, origin, and label values from Release text. */
+void collect_security_ids(const std::string& text, std::vector<std::string>& ids);
+
+/* Mark packages whose Inst archive is a security pocket, or names an id. */
+void apply_security_ids(std::vector<PackageUpgrade>& packages, const std::vector<std::string>& ids);
+
+/* Fill download_need, disk_use, and per-package sizes from --print-uris text.
+ * download_need stays apt's own line. */
+void apply_download_details(SimulateResult& result, const std::string& text);
+
+/* The sentence shown for apt's "Need to get" line. A cached "0 B/N" download
+ * says the packages are already downloaded and names N. */
+std::string present_download_need(const std::string& text);
 
 /* Parse full apt-get -s upgrade text. E: lines become Error.
  * A kept-back section or a non-zero "not upgraded" summary is not up to date. */
@@ -140,6 +174,7 @@ struct JobOutcome {
   std::string status;
   bool check_enabled = true;
   bool install_enabled = false;
+  bool offer_restart = false;
   PackageListAction packages = PackageListAction::Keep;
 };
 
