@@ -27,18 +27,28 @@ struct SimulateResult {
   std::vector<PackageUpgrade> packages;
   /* Packages apt will not upgrade because they need extra packages. */
   std::vector<std::string> kept_back;
+  /* Classic kept-back packages that would remove another package (Breaks). */
+  struct KeptRemoval {
+    std::string package;
+    std::vector<std::string> removes;
+  };
+  std::vector<KeptRemoval> kept_removals;
   /* Updates apt deferred because of phasing. Offered again later. */
   std::vector<std::string> phased;
   /* Packages kept back because dpkg has them on hold. */
   std::vector<std::string> held;
   /* Conffiles dpkg left at the locally modified contents. */
   std::vector<std::string> conffiles_kept;
-  /* Packages named in reboot-required.pkgs after a finished install. */
+  /* Packages this install added to reboot-required.pkgs. */
   std::vector<std::string> reboot_pkgs;
+  /* Packages already listed before this install. */
+  std::vector<std::string> reboot_pending_pkgs;
   /* Post-update simulation did not match the reviewed set, so nothing was installed. */
   bool install_skipped = false;
-  /* /var/run/reboot-required exists after the install. */
+  /* This install created or grew reboot-required. */
   bool reboot_required = false;
+  /* reboot-required was already present and this install did not add packages. */
+  bool reboot_already = false;
   /* The install log had no apt summary line, so kept-back packages are unknown. */
   bool summary_missing = false;
   /* From the apt summary line. -1 when that line was not present. */
@@ -95,14 +105,38 @@ void apply_held_packages(SimulateResult& result, const std::string& status_text)
 std::string format_protocol(const SimulateResult& result);
 SimulateResult parse_protocol(const std::string& text);
 
-/* Check and install failures are worded separately. Resolve failures and an
- * unreachable network use the offline sentence. "unable to connect" and
- * "connection timed out" say that a proxy has to be set in apt's
- * configuration. A partial index failure (some indexes were skipped) is not
- * rewritten into either sentence. Other apt lines (404, hash mismatch,
- * NO_PUBKEY) are left as apt wrote them. A multi-line message is mapped one
- * line at a time so one timeout does not discard the other lines. */
+/* Check and install failures are worded separately. Apt's Err:, W:, and E:
+ * lines are kept, including the URL. A connect timeout or refusal adds the
+ * proxy sentence as a second hint. A resolve failure or an unreachable
+ * network adds the offline sentence and still shows the hostname. A partial
+ * index failure (some indexes were skipped) is not given either hint. A
+ * helper timeout sentence is still mapped to the check or install wording.
+ * A multi-line message is mapped one line at a time so one timeout does not
+ * discard the other lines. */
 enum class JobKind { Check, Install };
 std::string friendly_job_error(const std::string& msg, JobKind kind);
+
+/* REMOVED and NEW package sections from apt-get -s install. */
+void parse_removal_plan(const std::string& text, std::vector<std::string>& removed,
+                        std::vector<std::string>& newly);
+
+/* Sentences Check and Install share for phased, held, removal, and extra packages. */
+std::string describe_remaining(const SimulateResult& result);
+std::string kept_headline(const SimulateResult& result);
+
+/* One model for the text the window and the notification show, and for
+ * whether Check and Install are available afterwards. */
+enum class PackageListAction { Hide, Show, Keep };
+
+struct JobOutcome {
+  std::string status;
+  bool check_enabled = true;
+  bool install_enabled = false;
+  PackageListAction packages = PackageListAction::Keep;
+};
+
+JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_rows);
+JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool have_rows);
+JobOutcome outcome_timeout(bool installing, bool helper_ready, bool have_rows);
 
 #endif

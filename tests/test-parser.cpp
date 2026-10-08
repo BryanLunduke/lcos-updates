@@ -38,6 +38,15 @@ static void expect(bool ok, const char* what)
   }
 }
 
+static int count_phrase(const std::string& hay, const char* needle)
+{
+  int n = 0;
+  const std::string nd(needle);
+  for (std::string::size_type pos = 0; (pos = hay.find(nd, pos)) != std::string::npos; pos += nd.size())
+    ++n;
+  return n;
+}
+
 int main(int argc, char** argv)
 {
   const std::string dir = (argc > 1) ? argv[1] : "tests/fixtures";
@@ -124,11 +133,24 @@ int main(int argc, char** argv)
     expect(friendly_job_error("Timed out while installing updates", JobKind::Install) ==
                install_timeout,
            "install timeout is not rewritten as a check timeout");
-    expect(friendly_job_error("Connection timed out", JobKind::Check) == proxy,
-           "connection timed out mentions a proxy, not the offline sentence");
-    expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease Connection timed out",
-                              JobKind::Install) == proxy,
-           "connection timed out on a fetch line mentions a proxy");
+    {
+      const std::string got = friendly_job_error("Connection timed out", JobKind::Check);
+      expect(got.find("Connection timed out") != std::string::npos,
+             "connection timed out keeps apt's words");
+      expect(got.find(proxy) != std::string::npos,
+             "connection timed out mentions a proxy as a second hint");
+      expect(got.find(offline) == std::string::npos,
+             "connection timed out is not the offline sentence");
+    }
+    {
+      const std::string line =
+          "E: Failed to fetch http://deb.example/InRelease Connection timed out";
+      const std::string got = friendly_job_error(line, JobKind::Install);
+      expect(got.find(line) != std::string::npos, "a fetch timeout keeps the apt line and URL");
+      expect(got.find(proxy) != std::string::npos,
+             "connection timed out on a fetch line mentions a proxy");
+      expect(got.find(offline) == std::string::npos, "a fetch timeout is not the offline sentence");
+    }
     expect(friendly_job_error("E: Failed to fetch http://deb.example/InRelease", JobKind::Check) ==
                "E: Failed to fetch http://deb.example/InRelease",
            "failed to fetch without a network failure stays the apt line");
@@ -143,14 +165,33 @@ int main(int argc, char** argv)
     expect(friendly_job_error("NO_PUBKEY 1234567890ABCDEF", JobKind::Check) ==
                "NO_PUBKEY 1234567890ABCDEF",
            "NO_PUBKEY stays the apt line");
-    expect(friendly_job_error("Temporary failure resolving 'deb.example'", JobKind::Check) == offline,
-           "resolve failure is offline");
-    expect(friendly_job_error("Network is unreachable", JobKind::Install) == offline,
-           "unreachable network is offline");
-    expect(friendly_job_error("E: Unable to connect to deb.example:80", JobKind::Check) == proxy,
-           "unable to connect mentions a proxy");
-    expect(friendly_job_error("Could not connect to 192.0.2.1:80", JobKind::Install) == proxy,
-           "could not connect mentions a proxy");
+    {
+      const std::string line = "Temporary failure resolving 'deb.example'";
+      const std::string got = friendly_job_error(line, JobKind::Check);
+      expect(got.find(line) != std::string::npos, "a resolve failure keeps the hostname");
+      expect(got.find(offline) != std::string::npos, "resolve failure adds the offline sentence");
+      expect(got.find(proxy) == std::string::npos, "a resolve failure is not a proxy hint");
+    }
+    {
+      const std::string line = "Network is unreachable";
+      const std::string got = friendly_job_error(line, JobKind::Install);
+      expect(got.find(line) != std::string::npos, "an unreachable network keeps apt's words");
+      expect(got.find(offline) != std::string::npos, "unreachable network adds the offline sentence");
+    }
+    {
+      const std::string line = "E: Unable to connect to deb.example:80";
+      const std::string got = friendly_job_error(line, JobKind::Check);
+      expect(got.find(line) != std::string::npos, "unable to connect keeps the apt line");
+      expect(got.find(proxy) != std::string::npos, "unable to connect mentions a proxy");
+    }
+    {
+      const std::string line = "Could not connect to 192.0.2.1:80";
+      const std::string got = friendly_job_error(line, JobKind::Install);
+      expect(got.find(line) != std::string::npos, "could not connect keeps the address");
+      expect(got.find(proxy) != std::string::npos, "could not connect mentions a proxy");
+      expect(got.find("Connection refused") == std::string::npos || got.find(line) != std::string::npos,
+             "could not connect is not replaced");
+    }
     expect(friendly_job_error("E: Unable to correct problems, you have held broken packages.",
                               JobKind::Install) ==
                "E: Unable to correct problems, you have held broken packages.",
@@ -242,6 +283,10 @@ int main(int argc, char** argv)
     expect(dead_fetch.kind == UpdateFetchKind::Total, "a dead mirror with no Hit is a total failure");
     expect(dead_fetch.detail.find("/etc/apt/apt.conf.d") != std::string::npos,
            "a dead mirror names the apt proxy config");
+    expect(dead_fetch.detail.find("http://deb.example/InRelease") != std::string::npos,
+           "a dead mirror keeps apt's URL");
+    expect(dead_fetch.detail.find("Connection timed out") != std::string::npos,
+           "a dead mirror keeps the timeout words");
     expect(dead_fetch.detail.find("No network connection") == std::string::npos,
            "a connection timeout is not the offline sentence");
     const UpdateFetch offline_fetch =
@@ -249,7 +294,29 @@ int main(int argc, char** argv)
                             "  Temporary failure resolving 'deb.example'\n");
     expect(offline_fetch.kind == UpdateFetchKind::Total &&
                offline_fetch.detail.find("No network connection") != std::string::npos,
-           "a resolve failure with nothing fetched is the offline sentence");
+           "a resolve failure with nothing fetched adds the offline sentence");
+    expect(offline_fetch.detail.find("deb.example") != std::string::npos,
+           "a resolve failure still shows the hostname");
+    const UpdateFetch refused =
+        classify_apt_update("Err:1 http://127.0.0.1:9/debian stable InRelease\n"
+                            "  Could not connect to 127.0.0.1:9 (127.0.0.1). - connect (111: "
+                            "Connection refused)\n");
+    expect(refused.kind == UpdateFetchKind::Total, "connection refused with nothing fetched is total");
+    expect(refused.detail.find("Connection refused") != std::string::npos,
+           "connection refused keeps apt's words");
+    expect(refused.detail.find("127.0.0.1:9") != std::string::npos, "connection refused keeps the URL");
+    expect(refused.detail.find("/etc/apt/apt.conf.d") != std::string::npos,
+           "connection refused adds the proxy hint");
+    const UpdateFetch release =
+        classify_apt_update("E: The repository 'http://deb.example stable' does not have a Release "
+                            "file.\n");
+    expect(release.kind == UpdateFetchKind::Total, "a missing Release file is a total failure");
+    expect(release.detail.find("does not have a Release file") != std::string::npos,
+           "a missing Release file keeps apt's E: line");
+    expect(release.detail.find("could not be refreshed") == std::string::npos,
+           "a missing Release file is not the generic sentence");
+    expect(release.detail.find("/etc/apt/apt.conf.d") == std::string::npos,
+           "a missing Release file is not a proxy hint");
   }
 
   {
@@ -279,8 +346,10 @@ int main(int argc, char** argv)
     const std::string got = friendly_job_error(blob, JobKind::Check);
     expect(got.find("404 Not Found") != std::string::npos,
            "a timeout on a later line does not discard the 404");
+    expect(got.find("E: Connection timed out") != std::string::npos,
+           "the timeout line is kept");
     expect(got.find("/etc/apt/apt.conf.d") != std::string::npos,
-           "the timeout line is mapped to the proxy sentence on its own");
+           "the timeout line adds the proxy sentence once");
     expect(got.find("No network connection") == std::string::npos,
            "that timeout line is not the offline sentence");
     const std::string skipped =
@@ -294,6 +363,8 @@ int main(int argc, char** argv)
            "a skipped index is not called offline");
     expect(skipped.find("Some index files failed") != std::string::npos,
            "a skipped index keeps apt's own summary");
+    expect(skipped.find("/etc/apt/apt.conf.d") == std::string::npos,
+           "a skipped index does not add the proxy sentence");
   }
 
   {
@@ -417,6 +488,151 @@ int main(int argc, char** argv)
     expect(p.reboot_required && p.reboot_pkgs.size() == 1 && p.reboot_pkgs[0] == "linux-image-amd64",
            "REBOOT round trip");
     expect(p.summary_missing, "SUMMARY_MISSING round trip");
+  }
+
+  {
+    SimulateResult r;
+    r.status = SimulateResult::Success;
+    r.reboot_already = true;
+    r.reboot_pending_pkgs.push_back("linux-image-amd64");
+    r.kept_removals.push_back(SimulateResult::KeptRemoval{"foo", {"oldplug"}});
+    const std::string proto = format_protocol(r);
+    expect(proto.find("REBOOT_ALREADY linux-image-amd64\n") != std::string::npos,
+           "REBOOT_ALREADY protocol line");
+    expect(proto.find("\nREBOOT ") == std::string::npos, "an old flag is not this install's REBOOT");
+    expect(proto.find("REMOVE foo oldplug\n") != std::string::npos, "REMOVE protocol line");
+    const SimulateResult p = parse_protocol(proto);
+    expect(p.reboot_already && !p.reboot_required, "REBOOT_ALREADY round trip");
+    expect(p.reboot_pending_pkgs.size() == 1 && p.reboot_pending_pkgs[0] == "linux-image-amd64",
+           "REBOOT_ALREADY names the old package");
+    expect(p.kept_removals.size() == 1 && p.kept_removals[0].package == "foo", "REMOVE package");
+    expect(p.kept_removals[0].removes.size() == 1 && p.kept_removals[0].removes[0] == "oldplug",
+           "REMOVE names the package that would be removed");
+    std::vector<std::string> removed;
+    std::vector<std::string> newly;
+    parse_removal_plan("The following packages will be REMOVED:\n"
+                       "  oldplug\n"
+                       "The following NEW packages will be installed:\n"
+                       "  extralib\n",
+                       removed, newly);
+    expect(removed.size() == 1 && removed[0] == "oldplug", "removal plan names the removed package");
+    expect(newly.size() == 1 && newly[0] == "extralib", "removal plan names a new dependency");
+  }
+
+  {
+    const char* restart = "Restart to finish installing updates.";
+    SimulateResult clean;
+    clean.status = SimulateResult::Success;
+    clean.upgraded_count = 1;
+    const JobOutcome empty = outcome_install(clean, 0, false);
+    expect(empty.status == "Updates installed. You're up to date.",
+           "a finished install with nothing left says updates installed and up to date");
+    expect(empty.check_enabled && !empty.install_enabled, "a finished install enables Check only");
+    expect(count_phrase(empty.status, restart) == 0, "a clean install has no restart sentence");
+
+    SimulateResult reboot = clean;
+    reboot.reboot_required = true;
+    reboot.reboot_pkgs.push_back("linux-image-amd64");
+    const JobOutcome once = outcome_install(reboot, 0, false);
+    expect(once.status.find("Updates installed.") == 0, "a restart still starts with Updates installed");
+    expect(count_phrase(once.status, restart) == 1, "the restart sentence is printed once");
+    expect(once.status.find("linux-image-amd64") != std::string::npos, "the restart names the package");
+    expect(once.status.find("You're up to date.") == std::string::npos,
+           "a restart is not the up-to-date sentence");
+
+    SimulateResult phased = clean;
+    phased.phased.push_back("shim-signed");
+    const JobOutcome waiting = outcome_install(phased, 0, false);
+    expect(waiting.status.find("Updates installed.") == 0, "phased leftovers start with Updates installed");
+    expect(waiting.status.find("will be offered later: shim-signed.") != std::string::npos,
+           "phased leftovers use the Check sentence");
+    expect(waiting.status.find("You're up to date.") == std::string::npos,
+           "phased leftovers are not up to date");
+
+    SimulateResult held = clean;
+    held.held.push_back("vim");
+    const JobOutcome hold = outcome_install(held, 0, false);
+    expect(hold.status.find("These packages are held: vim.") != std::string::npos,
+           "held leftovers use the Check sentence");
+    expect(hold.status.find("You're up to date.") == std::string::npos, "holds are not up to date");
+
+    SimulateResult extra = clean;
+    extra.kept_back.push_back("foo");
+    const JobOutcome needs = outcome_install(extra, 0, false);
+    expect(needs.status.find("need extra packages: foo.") != std::string::npos,
+           "a new dependency stays the extra-packages sentence");
+
+    SimulateResult removal = clean;
+    removal.kept_removals.push_back(SimulateResult::KeptRemoval{"foo", {"oldplug"}});
+    const JobOutcome breaks = outcome_install(removal, 0, false);
+    expect(breaks.status.find("would remove packages: foo (would remove oldplug).") != std::string::npos,
+           "a Breaks keep-back names the package that would be removed");
+    expect(breaks.status.find("need extra packages") == std::string::npos,
+           "a removal is not described as extra packages");
+
+    SimulateResult conf = clean;
+    conf.conffiles_kept.push_back("/etc/ssh/sshd_config");
+    const JobOutcome kept_conf = outcome_install(conf, 0, false);
+    expect(count_phrase(kept_conf.status, "Existing configuration was kept") == 1,
+           "a kept conffile is named once");
+    expect(kept_conf.status.find("Updates installed.") == 0, "a conffile success starts with Updates installed");
+
+    SimulateResult pending = clean;
+    pending.reboot_already = true;
+    pending.reboot_pending_pkgs.push_back("linux-image-amd64");
+    const JobOutcome old_flag = outcome_install(pending, 0, false);
+    expect(old_flag.status.find("Updates installed.") == 0, "an old reboot flag still says Updates installed");
+    expect(old_flag.status.find("A restart was already pending. linux-image-amd64.") != std::string::npos,
+           "an old reboot flag is a separate sentence");
+    expect(old_flag.status.find(restart) == std::string::npos,
+           "an old reboot flag does not use the restart sentence");
+
+    SimulateResult grew = pending;
+    grew.reboot_required = true;
+    grew.reboot_pkgs.push_back("linux-image-amd64");
+    grew.reboot_pending_pkgs = {"bash"};
+    const JobOutcome both = outcome_install(grew, 0, false);
+    expect(count_phrase(both.status, restart) == 1, "a grown reboot flag restarts once");
+    expect(both.status.find("A restart was already pending. bash.") != std::string::npos,
+           "packages already pending stay on the old-flag sentence");
+
+    SimulateResult missing = clean;
+    missing.summary_missing = true;
+    const JobOutcome no_summary = outcome_install(missing, 0, false);
+    expect(no_summary.status.find("did not report whether any packages were kept back") !=
+               std::string::npos,
+           "a missing summary is named");
+    expect(no_summary.status.find("You're up to date.") == std::string::npos,
+           "a missing summary is not up to date");
+
+    SimulateResult failed;
+    failed.status = SimulateResult::Error;
+    failed.error_msg = "E: Sub-process /usr/bin/dpkg returned an error code (1)";
+    const JobOutcome err = outcome_install(failed, 100, true);
+    expect(err.check_enabled && err.install_enabled, "a failed install leaves Check and Install");
+    expect(err.packages == PackageListAction::Keep, "a failed install keeps the package list");
+    expect(err.status.find("returned an error code") != std::string::npos, "a failure keeps the apt line");
+
+    const JobOutcome check_timeout = outcome_timeout(false, true, false);
+    expect(check_timeout.status.find("Timed out waiting for the update check") != std::string::npos,
+           "a check timeout uses the check sentence");
+    expect(check_timeout.check_enabled, "a timeout enables Check");
+    const JobOutcome install_timeout = outcome_timeout(true, true, true);
+    expect(install_timeout.status == "Timed out while installing updates.",
+           "an install timeout uses the install sentence");
+    expect(install_timeout.check_enabled && install_timeout.install_enabled,
+           "an install timeout enables Check and Install");
+    const JobOutcome auth_timeout = outcome_timeout(true, false, false);
+    expect(auth_timeout.status.find("Timed out waiting for authentication") != std::string::npos,
+           "an authentication timeout says so");
+
+    SimulateResult check_phased;
+    check_phased.status = SimulateResult::KeptBack;
+    check_phased.phased.push_back("shim-signed");
+    const JobOutcome check_only = outcome_check(check_phased, 0, false);
+    expect(check_only.status == "These updates are waiting and will be offered later: shim-signed.",
+           "Check names a phased update without the kept-back headline");
+    expect(check_only.check_enabled && !check_only.install_enabled, "a phased-only check has no Install");
   }
 
   {

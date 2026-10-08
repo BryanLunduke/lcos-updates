@@ -38,8 +38,10 @@ const char kSimNoteVal[] = "APT::Get::Show-User-Simulation-Note=false";
 const char kConfdef[] = "Dpkg::Options::=--force-confdef";
 const char kConfold[] = "Dpkg::Options::=--force-confold";
 const char kDpkgRecovery[] =
-    "The package installer was interrupted or is still running. "
+    "The package installer was interrupted. "
     "Run dpkg --configure -a to finish configuring packages.";
+const char kDpkgStillRunning[] =
+    "The package installer was interrupted and is still running.";
 const char kSafePath[] = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 volatile sig_atomic_t g_stop = 0;
@@ -193,7 +195,7 @@ void restore_env(const char* key, const std::string& value)
  * configuring dpkg latches only for the install invocation, and only while
  * that dpkg is still alive. */
 int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, std::string& out,
-            std::string& err, bool watch_configure)
+            std::string& err, bool watch_configure, bool forward_progress = true)
 {
   int out_pipe[2] = {-1, -1};
   int err_pipe[2] = {-1, -1};
@@ -304,6 +306,8 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   bool did_scan = false;
   bool did_progress = false;
   std::string progress_hold;
+  std::string progress_pending;
+  std::vector<DpkgNote> dpkg_seen;
 
   auto elapsed_ms = [](const struct timespec& from) -> long {
     struct timespec now {};
@@ -360,25 +364,21 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     write_all_fd(STDERR_FILENO, configuring ? "DPKG_STARTED\n" : "DPKG_IDLE\n");
   };
 
-  auto note_apt_output = [&](const char* data, std::size_t n) {
+  auto emit_progress = [&](const std::string& clean) {
+    if (!forward_progress || clean.empty())
+      return;
     struct timespec now {};
     clock_gettime(CLOCK_MONOTONIC, &now);
-    last_output = now;
-    progress_hold.append(data, n);
-    if (progress_hold.size() > 8192)
-      progress_hold.erase(0, progress_hold.size() - 1024);
-    const std::string::size_type nl = progress_hold.rfind('\n');
-    if (nl == std::string::npos)
+    if (did_progress && elapsed_ms(last_progress) < 200) {
+      progress_pending = clean;
       return;
-    std::string chunk = progress_hold.substr(0, nl);
-    progress_hold.erase(0, nl + 1);
-    const std::string::size_type prev = chunk.rfind('\n');
-    std::string line = prev == std::string::npos ? chunk : chunk.substr(prev + 1);
-    const std::string::size_type cr = line.rfind('\r');
-    if (cr != std::string::npos)
-      line = line.substr(cr + 1);
-    if (!line.empty() && line.back() == '\r')
-      line.pop_back();
+    }
+    did_progress = true;
+    last_progress = now;
+    progress_pending.clear();
+    write_all_fd(STDERR_FILENO, "PROGRESS " + clean + "\n");
+  };
+  auto clean_progress = [](const std::string& line) {
     std::string clean;
     for (char ch : line) {
       const unsigned char c = static_cast<unsigned char>(ch);
@@ -388,13 +388,31 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       if (clean.size() >= 240)
         break;
     }
-    if (clean.empty())
-      return;
-    if (did_progress && elapsed_ms(last_progress) < 200)
-      return;
-    did_progress = true;
-    last_progress = now;
-    write_all_fd(STDERR_FILENO, "PROGRESS " + clean + "\n");
+    return clean;
+  };
+  auto flush_progress = [&]() { emit_progress(progress_pending); };
+  /* A carriage return ends an apt percent line the same way a newline does.
+   * Lines are rate-limited; the newest one is kept until the limit allows it. */
+  auto note_apt_output = [&](const char* data, std::size_t n) {
+    struct timespec now {};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    last_output = now;
+    progress_hold.append(data, n);
+    if (progress_hold.size() > 8192)
+      progress_hold.erase(0, progress_hold.size() - 1024);
+    for (;;) {
+      const std::string::size_type cr = progress_hold.find('\r');
+      const std::string::size_type nl = progress_hold.find('\n');
+      if (cr == std::string::npos && nl == std::string::npos)
+        break;
+      const std::string::size_type cut = cr < nl ? cr : nl;
+      emit_progress(clean_progress(progress_hold.substr(0, cut)));
+      progress_hold.erase(0, cut + 1);
+    }
+  };
+  auto interrupted_code = [&]() -> int {
+    remember_configuring_dpkg(pid, dpkg_seen);
+    return configuring_dpkg_alive(dpkg_seen) ? -6 : -5;
   };
 
   /* /proc is walked at most once a second unless we are about to signal. */
@@ -411,7 +429,10 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     }
     did_scan = true;
     last_scan = now;
-    publish_cfg(process_tree_contains_dpkg(pid));
+    const bool now_cfg = process_tree_contains_dpkg(pid);
+    if (now_cfg)
+      remember_configuring_dpkg(pid, dpkg_seen);
+    publish_cfg(now_cfg);
   };
 
   auto reap_after_kill = [&](int code) -> int {
@@ -438,14 +459,18 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   for (;;) {
     while (out_open || err_open) {
       scan_configure(false);
-      if (g_dpkg_committed)
+      flush_progress();
+      if (g_dpkg_committed) {
         cancelled = false;
+        timed_out = false;
+      }
       /* Before dpkg starts, latch cancel but do not act on it while a
        * configuring dpkg is still alive. After it has started, EOF is not
-       * a cancel. The deadline is paused while that dpkg is alive. */
+       * a cancel, and neither the idle clock nor the hard cap kills apt. */
       if (stop_requested())
         cancelled = true;
-      if (!configuring) {
+      const bool clocks = !configuring && !g_dpkg_committed;
+      if (clocks) {
         if (cancelled)
           break;
         if (budget_ms() <= 0) {
@@ -480,7 +505,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
         nfd++;
       }
       int slice = 1000;
-      if (!configuring) {
+      if (clocks) {
         const int remain = budget_ms();
         if (remain <= 0) {
           timed_out = true;
@@ -522,18 +547,34 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       drain(err_i, err_pipe[0], err_open, err_cap);
     }
 
+    flush_progress();
     if (stop_requested())
       cancelled = true;
-    if (g_dpkg_committed)
+    if (g_dpkg_committed) {
       cancelled = false;
+      timed_out = false;
+    }
     if (!(timed_out || cancelled))
       break;
-    scan_configure(true);
-    if (g_dpkg_committed)
+    /* Once this install's dpkg has started, the apt run finishes on its own.
+     * Idle and hard budgets do not signal it, including after DPKG_IDLE. */
+    if (g_dpkg_committed) {
+      timed_out = false;
       cancelled = false;
+      if (!out_open && !err_open)
+        break;
+      continue;
+    }
+    scan_configure(true);
+    if (g_dpkg_committed) {
+      cancelled = false;
+      timed_out = false;
+      if (!out_open && !err_open)
+        break;
+      continue;
+    }
     if (configuring) {
-      /* Do not close apt's pipes and do not return. Wait until apt exits.
-       * A cancel stays latched so the result is still a cancel, not success. */
+      /* Do not close apt's pipes and do not return. Wait until apt exits. */
       timed_out = false;
       if (!out_open && !err_open)
         break;
@@ -544,6 +585,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (!gone) {
       /* Configuring dpkg is in the tree. Keep the pipes open so apt does not
        * take SIGPIPE, and leave this process alive until apt itself exits. */
+      remember_configuring_dpkg(pid, dpkg_seen);
       if (signaled)
         interrupted = true;
       scan_configure(true);
@@ -555,7 +597,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       continue;
     }
     if (interrupted)
-      return reap_after_kill(-5);
+      return reap_after_kill(interrupted_code());
     return reap_after_kill(timed_out && !cancelled ? -2 : -3);
   }
 
@@ -571,19 +613,24 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (got == pid)
       break;
     if (got < 0 && errno == EINTR) {
+      if (g_dpkg_committed) {
+        cancelled = false;
+        continue;
+      }
       if (!configuring && stop_requested()) {
         cancelled = true;
         scan_configure(true);
-        if (!configuring) {
+        if (!configuring && !g_dpkg_committed) {
           bool signaled = false;
           const bool gone = terminate_process_tree(pid, kTermGraceMs, &signaled);
           if (!gone) {
+            remember_configuring_dpkg(pid, dpkg_seen);
             if (signaled)
               interrupted = true;
             continue;
           }
           publish();
-          return interrupted ? -5 : -3;
+          return interrupted ? interrupted_code() : -3;
         }
       }
       continue;
@@ -594,8 +641,13 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     return -1;
   }
   publish();
+  flush_progress();
+  if (g_dpkg_committed) {
+    cancelled = false;
+    timed_out = false;
+  }
   if (interrupted)
-    return -5;
+    return interrupted_code();
   if (cancelled)
     return -3;
   if (timed_out)
@@ -605,11 +657,37 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   return -1;
 }
 
+static std::string lower_copy(std::string text)
+{
+  for (char& ch : text)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return text;
+}
+
+static bool is_generic_dpkg_line(const std::string& line)
+{
+  const std::string lower = lower_copy(line);
+  return lower.find("sub-process") != std::string::npos && lower.find("dpkg") != std::string::npos &&
+         lower.find("returned an error code") != std::string::npos;
+}
+
+static bool apt_says_dpkg_interrupted(const std::string& text)
+{
+  const std::string lower = lower_copy(text);
+  return lower.find("dpkg was interrupted") != std::string::npos ||
+         lower.find("received a signal") != std::string::npos ||
+         lower.find("terminated by signal") != std::string::npos ||
+         lower.find("exited unexpectedly") != std::string::npos;
+}
+
 std::string first_error_line(const std::string& out, const std::string& err)
 {
   const std::string text = err.empty() ? out : err + "\n" + out;
   std::istringstream in(text);
   std::string line;
+  std::string dpkg_error;
+  std::string space;
+  std::string cause;
   std::string first_e;
   std::string first_err;
   std::string last;
@@ -619,11 +697,33 @@ std::string first_error_line(const std::string& out, const std::string& err)
     if (line.empty())
       continue;
     last = line;
+    const std::string lower = lower_copy(line);
+    const bool no_space = lower.find("no space left on device") != std::string::npos ||
+                          lower.find("read-only file system") != std::string::npos;
+    const bool dpkg_cause = lower.find("dpkg: error") != std::string::npos ||
+                            lower.find("error processing") != std::string::npos ||
+                            lower.find("dpkg was interrupted") != std::string::npos;
+    if (space.empty() && no_space)
+      space = line;
+    if (dpkg_error.empty() && dpkg_cause && !is_generic_dpkg_line(line))
+      dpkg_error = line;
+    if (cause.empty() && (no_space || dpkg_cause) && !is_generic_dpkg_line(line))
+      cause = line;
     if (first_e.empty() && line.compare(0, 2, "E:") == 0)
       first_e = line;
     if (first_err.empty() && line.compare(0, 4, "Err:") == 0)
       first_err = line;
   }
+  /* Apt prints the generic subprocess E: after dpkg has already said why.
+   * Keep the package line and the "no space left" continuation together. */
+  if (!dpkg_error.empty() && !space.empty() && dpkg_error.find(space) == std::string::npos)
+    cause = dpkg_error + "\n" + space;
+  if (!cause.empty() && (first_e.empty() || is_generic_dpkg_line(first_e)))
+    return cause;
+  if (!first_e.empty() && !is_generic_dpkg_line(first_e))
+    return first_e;
+  if (!cause.empty())
+    return cause;
   if (!first_e.empty())
     return first_e;
   if (!first_err.empty())
@@ -646,6 +746,10 @@ bool refresh_package_lists(const char* cancel_msg, const char* timeout_msg, std:
   const int rc = run_apt(update_argv, clock.idle_sec, clock.hard_sec, out, err, false);
   if (rc == -5) {
     emit_error(kDpkgRecovery);
+    return false;
+  }
+  if (rc == -6) {
+    emit_error(kDpkgStillRunning);
     return false;
   }
   if (rc == -3) {
@@ -753,6 +857,10 @@ int fail_apt(int rc, const std::string& out, const std::string& err, const char*
     emit_error(kDpkgRecovery);
     return 1;
   }
+  if (rc == -6) {
+    emit_error(kDpkgStillRunning);
+    return 1;
+  }
   if (rc == -3) {
     emit_error(cancel_msg);
     return 1;
@@ -763,6 +871,10 @@ int fail_apt(int rc, const std::string& out, const std::string& err, const char*
   }
   if (rc != 0) {
     std::string msg = first_error_line(out, err);
+    /* configure -a only after an interrupted dpkg has actually exited.
+     * A full disk or a lock is the apt line by itself. */
+    if (apt_says_dpkg_interrupted(err + "\n" + out))
+      msg += "\n" + std::string(kDpkgRecovery);
     if (!update_warning.empty())
       msg = update_warning + "\n" + msg;
     emit_error(msg);
@@ -804,26 +916,182 @@ void note_holds(SimulateResult& result)
   apply_held_packages(result, read_limited(dpkg_status_path(), 8 * 1024 * 1024));
 }
 
-void note_reboot(SimulateResult& result)
+const char* reboot_file_path()
 {
-  const char* path = "/var/run/reboot-required";
   if (geteuid() != 0) {
     const char* env = std::getenv("LCOS_UPDATES_REBOOT_FILE");
     if (env != nullptr && env[0] == '/')
-      path = env;
+      return env;
   }
-  if (access(path, R_OK) != 0)
-    return;
-  result.reboot_required = true;
-  const std::string pkgs = read_limited((std::string(path) + ".pkgs").c_str(), 64 * 1024);
-  std::istringstream in(pkgs);
+  return "/var/run/reboot-required";
+}
+
+struct RebootSnap {
+  bool present = false;
+  long long mtime_sec = 0;
+  long long mtime_nsec = 0;
+  std::vector<std::string> pkgs;
+};
+
+std::vector<std::string> read_reboot_pkgs(const char* path)
+{
+  std::vector<std::string> pkgs;
+  const std::string text = read_limited((std::string(path) + ".pkgs").c_str(), 64 * 1024);
+  std::istringstream in(text);
   std::string line;
   while (std::getline(in, line)) {
     if (!line.empty() && line.back() == '\r')
       line.pop_back();
     if (!line.empty())
-      result.reboot_pkgs.push_back(line);
+      pkgs.push_back(line);
   }
+  return pkgs;
+}
+
+RebootSnap snapshot_reboot()
+{
+  RebootSnap snap;
+  const char* path = reboot_file_path();
+  struct stat st {};
+  if (stat(path, &st) != 0)
+    return snap;
+  snap.present = true;
+  snap.mtime_sec = static_cast<long long>(st.st_mtim.tv_sec);
+  snap.mtime_nsec = static_cast<long long>(st.st_mtim.tv_nsec);
+  snap.pkgs = read_reboot_pkgs(path);
+  return snap;
+}
+
+void note_reboot_delta(SimulateResult& result, const RebootSnap& before)
+{
+  const RebootSnap after = snapshot_reboot();
+  if (!after.present)
+    return;
+  std::vector<std::string> added;
+  for (const auto& name : after.pkgs) {
+    bool seen = false;
+    for (const auto& old : before.pkgs) {
+      if (old == name)
+        seen = true;
+    }
+    if (!seen)
+      added.push_back(name);
+  }
+  /* Presence, mtime, and .pkgs were snapshotted. Growth is a new package
+   * name. A file that was already there, even if apt touched it, is not
+   * this install's restart. */
+  const bool appeared = !before.present;
+  const bool grew = before.present && !added.empty();
+  (void)after.mtime_sec;
+  (void)after.mtime_nsec;
+  (void)before.mtime_sec;
+  (void)before.mtime_nsec;
+  if (appeared) {
+    result.reboot_required = true;
+    result.reboot_pkgs = after.pkgs;
+    return;
+  }
+  if (grew) {
+    result.reboot_required = true;
+    result.reboot_pkgs = added;
+    result.reboot_already = true;
+    result.reboot_pending_pkgs = before.pkgs;
+    return;
+  }
+  result.reboot_already = true;
+  result.reboot_pending_pkgs = after.pkgs;
+}
+
+void append_unique(std::vector<std::string>& dst, const std::vector<std::string>& src)
+{
+  for (const auto& name : src) {
+    bool seen = false;
+    for (const auto& have : dst) {
+      if (have == name)
+        seen = true;
+    }
+    if (!seen)
+      dst.push_back(name);
+  }
+}
+
+void carry_simulation(SimulateResult& result, const SimulateResult& sim)
+{
+  append_unique(result.phased, sim.phased);
+  append_unique(result.held, sim.held);
+  append_unique(result.kept_back, sim.kept_back);
+  for (const auto& removal : sim.kept_removals) {
+    bool seen = false;
+    for (const auto& have : result.kept_removals) {
+      if (have.package == removal.package)
+        seen = true;
+    }
+    if (!seen)
+      result.kept_removals.push_back(removal);
+  }
+  std::vector<std::string> still;
+  for (const auto& name : result.kept_back) {
+    bool drop = false;
+    for (const auto& held : result.held) {
+      if (held == name)
+        drop = true;
+    }
+    for (const auto& phased : result.phased) {
+      if (phased == name)
+        drop = true;
+    }
+    for (const auto& removal : result.kept_removals) {
+      if (removal.package == name)
+        drop = true;
+    }
+    if (!drop)
+      still.push_back(name);
+  }
+  result.kept_back.swap(still);
+}
+
+/* apt-get -s upgrade does not say whether a kept-back package needs a new
+ * dependency or would remove one. A read-only install simulation of that
+ * one package does. */
+void classify_kept_removals(SimulateResult& result)
+{
+  if (result.kept_back.empty())
+    return;
+  const std::string apt = apt_get_path();
+  std::vector<std::string> extra;
+  std::size_t probed = 0;
+  for (const auto& name : result.kept_back) {
+    if (probed >= 32 || !valid_pin(name + "=1")) {
+      extra.push_back(name);
+      continue;
+    }
+    ++probed;
+    const std::vector<const char*> argv = {apt.c_str(), "-s", "-q", "install", "--only-upgrade",
+                                           name.c_str()};
+    std::string out;
+    std::string err;
+    const AptClock clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+    const sig_atomic_t saved_commit = g_dpkg_committed;
+    g_dpkg_committed = 0;
+    const int rc = run_apt(argv, clock.idle_sec, clock.hard_sec, out, err, false, false);
+    g_dpkg_committed = saved_commit;
+    if (rc != 0) {
+      extra.push_back(name);
+      continue;
+    }
+    std::vector<std::string> removed;
+    std::vector<std::string> newly;
+    parse_removal_plan(out + "\n" + err, removed, newly);
+    if (removed.empty()) {
+      extra.push_back(name);
+      continue;
+    }
+    SimulateResult::KeptRemoval removal;
+    removal.package = name;
+    removal.removes = removed;
+    result.kept_removals.push_back(removal);
+  }
+  result.kept_back.swap(extra);
 }
 
 std::string pin_for_message(const char* raw)
@@ -872,6 +1140,7 @@ int do_simulate()
 
   SimulateResult result = parse_apt_simulate(out + "\n" + err);
   note_holds(result);
+  classify_kept_removals(result);
   if (!update_warning.empty())
     result.warning = update_warning;
   emit(result);
@@ -912,6 +1181,7 @@ int do_upgrade(const std::vector<std::string>& pins)
 
   SimulateResult sim = parse_apt_simulate(out + "\n" + err);
   note_holds(sim);
+  classify_kept_removals(sim);
   if (sim.status == SimulateResult::Error) {
     std::string msg = sim.error_msg.empty() ? first_error_line(out, err) : sim.error_msg;
     if (!update_warning.empty())
@@ -954,6 +1224,7 @@ int do_upgrade(const std::vector<std::string>& pins)
   out.clear();
   err.clear();
   emit_phase("download");
+  const RebootSnap reboot_before = snapshot_reboot();
   const AptClock up_clock = apt_clock(kUpgradeIdleSec, kUpgradeHardCapSec);
   rc = run_apt(up_argv, up_clock.idle_sec, up_clock.hard_sec, out, err, true);
   if (fail_apt(rc, out, err, "Install was cancelled", "Timed out while installing updates",
@@ -966,6 +1237,8 @@ int do_upgrade(const std::vector<std::string>& pins)
   result.phased = parsed.phased;
   result.held = parsed.held;
   note_holds(result);
+  carry_simulation(result, sim);
+  classify_kept_removals(result);
   result.not_upgraded_count = parsed.not_upgraded_count;
   result.upgraded_count = parsed.upgraded_count;
   result.conffiles_kept = parsed.conffiles_kept;
@@ -974,12 +1247,12 @@ int do_upgrade(const std::vector<std::string>& pins)
   const bool summary_seen = parsed.upgraded_count >= 0 || parsed.not_upgraded_count >= 0;
   result.summary_missing = !summary_seen;
   const bool kept = !result.kept_back.empty() || !result.phased.empty() || !result.held.empty() ||
-                    result.not_upgraded_count > 0;
+                    !result.kept_removals.empty() || result.not_upgraded_count > 0;
   if (kept && parsed.upgraded_count <= 0 && parsed.packages.empty())
     result.status = SimulateResult::KeptBack;
   else
     result.status = SimulateResult::Success;
-  note_reboot(result);
+  note_reboot_delta(result, reboot_before);
   emit(result);
   return 0;
 }

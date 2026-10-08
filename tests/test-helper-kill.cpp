@@ -188,10 +188,82 @@ static int count_and_mark(const char* count_path)
   return n;
 }
 
-static int apt_script(const char* script)
+static bool argv_has(int argc, char** argv, const char* flag)
+{
+  for (int i = 1; i < argc; ++i) {
+    if (argv[i] != nullptr && std::strcmp(argv[i], flag) == 0)
+      return true;
+  }
+  return false;
+}
+
+static std::string reboot_beside_state()
+{
+  const char* state = std::getenv("LCOS_STUB_STATEFILE");
+  if (state == nullptr || state[0] == '\0')
+    return {};
+  const std::string path(state);
+  return path + ".reboot";
+}
+
+static void write_reboot_pkgs(const std::string& path, const char* pkgs)
+{
+  if (path.empty())
+    return;
+  FILE* file = std::fopen(path.c_str(), "w");
+  if (file != nullptr) {
+    std::fputs("*** System restart required ***\n", file);
+    std::fclose(file);
+  }
+  file = std::fopen((path + ".pkgs").c_str(), "w");
+  if (file != nullptr) {
+    std::fputs(pkgs, file);
+    std::fclose(file);
+  }
+}
+
+static void note_state(const char* text)
+{
+  const char* path = std::getenv("LCOS_STUB_STATEFILE");
+  if (path == nullptr)
+    return;
+  FILE* file = std::fopen(path, "a");
+  if (file == nullptr)
+    return;
+  std::fputs(text, file);
+  std::fclose(file);
+}
+
+/* Keep a configuring dpkg visible long enough for the 1 Hz scan, then reap it. */
+static void configure_then_exit(int alive_ms)
+{
+  signal(SIGTERM, SIG_IGN);
+  setpgid(0, 0);
+  const pid_t child = spawn_hold({"--configure", "pkg"}, true);
+  if (child > 1) {
+    setpgid(child, child);
+    poll(nullptr, 0, alive_ms);
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
+  }
+  note_state("dpkg-exited\n");
+}
+
+static int apt_script(const char* script, int argc, char** argv)
 {
   const char* count_path = std::getenv("LCOS_STUB_COUNTFILE");
   const int n = count_and_mark(count_path);
+  /* A read-only probe of one kept-back name. Checked before the n-based
+   * branches so it does not look like the install. */
+  if (std::strcmp(script, "removal-kept") == 0 && argv_has(argc, argv, "-s") &&
+      argv_has(argc, argv, "--only-upgrade") && !argv_has(argc, argv, "-y")) {
+    std::fputs("The following packages will be REMOVED:\n"
+               "  oldplug\n"
+               "0 upgraded, 0 newly installed, 1 to remove and 0 not upgraded.\n",
+               stdout);
+    return 0;
+  }
   if (std::strcmp(script, "partial-update") == 0) {
     if (n == 1) {
       std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
@@ -258,6 +330,37 @@ static int apt_script(const char* script)
     /* Stay alive long enough that an early helper return is visible, then
      * exit so the helper can waitpid and report recovery. */
     poll(nullptr, 0, 1500);
+    _exit(0);
+  }
+  if (std::strcmp(script, "dpkg-term-gone") == 0) {
+    signal(SIGTERM, on_stub_term);
+    setpgid(0, 0);
+    const char* path = std::getenv("LCOS_STUB_PIDFILE");
+    if (path != nullptr) {
+      FILE* file = std::fopen(path, "w");
+      if (file != nullptr) {
+        std::fprintf(file, "%d 0\n", static_cast<int>(getpid()));
+        std::fclose(file);
+      }
+    }
+    while (!g_got_term)
+      pause();
+    const pid_t child = spawn_hold({"--configure", "pkg"}, true);
+    if (child <= 1)
+      _exit(1);
+    if (path != nullptr) {
+      FILE* file = std::fopen(path, "w");
+      if (file != nullptr) {
+        std::fprintf(file, "%d %d\n", static_cast<int>(getpid()), static_cast<int>(child));
+        std::fclose(file);
+      }
+    }
+    signal(SIGTERM, SIG_IGN);
+    poll(nullptr, 0, 300);
+    kill(child, SIGKILL);
+    int status = 0;
+    waitpid(child, &status, 0);
+    poll(nullptr, 0, 200);
     _exit(0);
   }
   if (std::strncmp(script, "print-dpkg:", 11) == 0) {
@@ -435,6 +538,169 @@ static int apt_script(const char* script)
     std::fwrite(junk.data(), 1, junk.size(), stdout);
     return 0;
   }
+  if (std::strcmp(script, "carry-phased") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following upgrades have been deferred due to phasing:\n"
+                 "  shim-signed\n"
+                 "Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "carry-held") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  vim\n"
+                 "Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "carry-kept") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  foo\n"
+                 "Inst bar [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "removal-kept") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  foo\n"
+                 "Inst bar [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "stall-after-idle") == 0 || std::strcmp(script, "stall-hard") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst libc6 [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    configure_then_exit(2200);
+    if (std::strcmp(script, "stall-hard") == 0) {
+      for (int i = 0; i < 20; ++i) {
+        std::fputs("still working\n", stdout);
+        std::fflush(stdout);
+        poll(nullptr, 0, 250);
+      }
+    } else {
+      poll(nullptr, 0, 4000);
+    }
+    note_state("finished\n");
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "disk-full") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst foo [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    std::fputs("dpkg: error processing archive foo.deb (--unpack):\n"
+               " No space left on device\n"
+               "E: Sub-process /usr/bin/dpkg returned an error code (1)\n",
+               stdout);
+    return 100;
+  }
+  if (std::strcmp(script, "connect-refused") == 0) {
+    std::fputs("Err:1 http://192.0.2.1/debian stable InRelease\n"
+               "  Could not connect to 192.0.2.1:80 (192.0.2.1). - connect (111: Connection refused)\n",
+               stderr);
+    return 0;
+  }
+  if (std::strcmp(script, "release-missing") == 0) {
+    std::fputs("E: The repository 'http://deb.example stable' does not have a Release file.\n", stderr);
+    return 0;
+  }
+  if (std::strcmp(script, "cr-progress") == 0) {
+    if (n == 1) {
+      const char* lines[] = {
+          "Get:1 http://deb.example stable/main amd64 linux-image-amd64 amd64 6.1 [12%]",
+          "Get:1 http://deb.example stable/main amd64 linux-image-amd64 amd64 6.1 [100%]",
+      };
+      for (const char* line : lines) {
+        std::fputs(line, stdout);
+        std::fputc('\r', stdout);
+        std::fflush(stdout);
+        poll(nullptr, 0, 300);
+      }
+      std::fputs("\nHit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    std::fputs("Inst libc6 [1] (2 Debian:12 [amd64])\n"
+               "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+               stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "reboot-during") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst bash [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    write_reboot_pkgs(reboot_beside_state(), "linux-image-amd64\n");
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "reboot-grow") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst bash [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    write_reboot_pkgs(reboot_beside_state(), "bash\nlinux-image-amd64\n");
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
+  if (std::strcmp(script, "reboot-touch") == 0) {
+    if (n == 1)
+      return 0;
+    if (n == 2) {
+      std::fputs("Inst bash [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    write_reboot_pkgs(reboot_beside_state(), "linux-image-amd64\n");
+    std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+    return 0;
+  }
   if (std::strcmp(script, "no-summary") == 0) {
     if (n == 1)
       return 0;
@@ -539,7 +805,7 @@ static int apt_stub(int argc, char** argv)
   record_argv(argc, argv);
   const char* script = std::getenv("LCOS_STUB_SCRIPT");
   if (script != nullptr && script[0] != '\0')
-    return apt_script(script);
+    return apt_script(script, argc, argv);
   signal(SIGTERM, SIG_IGN);
   setpgid(0, 0);
   const pid_t child = fork();
@@ -963,8 +1229,10 @@ int main(int argc, char** argv)
     expect(exited, "helper exits only after apt has exited");
     expect(dead(leader), "apt has exited before the helper returns");
     expect(!dead(dpkg), "dpkg is still alive after the helper exits");
-    expect(out.find("dpkg --configure -a") != std::string::npos,
-           "interrupted dpkg tells the user to run dpkg --configure -a");
+    expect(out.find("still running") != std::string::npos,
+           "an interrupted dpkg that is still alive does not offer configure -a");
+    expect(out.find("dpkg --configure -a") == std::string::npos,
+           "configure -a is withheld while that dpkg process is still alive");
     if (!dead(dpkg))
       kill(dpkg, SIGKILL);
     if (!dead(leader))
@@ -1344,6 +1612,9 @@ int main(int argc, char** argv)
     expect(out.find("STATUS error\n") != std::string::npos, "a dead mirror is an error");
     expect(out.find("STATUS up-to-date\n") == std::string::npos, "a dead mirror is not up to date");
     expect(out.find("/etc/apt/apt.conf.d") != std::string::npos, "a dead mirror mentions the apt proxy");
+    expect(out.find("http://deb.example/InRelease") != std::string::npos,
+           "a dead mirror keeps apt's URL");
+    expect(out.find("Connection timed out") != std::string::npos, "a dead mirror keeps the timeout words");
     expect(out.find("No network connection") == std::string::npos,
            "a connection timeout is not reported as no network");
     if (!exited)
@@ -1367,6 +1638,7 @@ int main(int argc, char** argv)
     expect(exited, "helper exits after a resolve failure");
     expect(read_count(countfile) == 1, "a resolve failure does not simulate");
     expect(out.find("No network connection") != std::string::npos, "a resolve failure is offline");
+    expect(out.find("deb.example") != std::string::npos, "a resolve failure still shows the hostname");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
   }
@@ -1537,9 +1809,11 @@ int main(int argc, char** argv)
     if (stdout_read >= 0)
       close(stdout_read);
     expect(exited, "helper exits after an install that needs a restart");
-    expect(out.find("STATUS success\n") != std::string::npos, "a reboot flag is still a success");
-    expect(out.find("REBOOT linux-image-amd64\n") != std::string::npos,
-           "a reboot flag names the package");
+    expect(out.find("STATUS success\n") != std::string::npos, "an old reboot flag is still a success");
+    expect(out.find("REBOOT_ALREADY linux-image-amd64\n") != std::string::npos,
+           "a reboot flag that was already there is not this install");
+    expect(out.find("\nREBOOT ") == std::string::npos && out.find("\nREBOOT\n") == std::string::npos,
+           "an old reboot flag is not reported as this install's restart");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
   }
@@ -1665,6 +1939,314 @@ int main(int argc, char** argv)
     expect(out.find("cancelled") == std::string::npos, "a committed install is not cancelled");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string pidfile = std::string(dir) + "/dpkg-gone.pids";
+    pid_t helper_pid = 0;
+    int cancel_write = -1;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, pidfile, nullptr, &cancel_write, helper_pid, "dpkg-term-gone", nullptr,
+                   &stdout_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for dpkg-term-gone\n");
+      return 1;
+    }
+    pid_t leader = 0;
+    expect(wait_for_leader(pidfile, leader, 2000), "dpkg-term-gone stub is running");
+    if (cancel_write >= 0) {
+      close(cancel_write);
+      cancel_write = -1;
+    }
+    pid_t dpkg = 0;
+    expect(wait_for_pids(pidfile, leader, dpkg, 4000), "dpkg pid was recorded after SIGTERM");
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after the interrupted dpkg is gone");
+    expect(dead(dpkg), "the interrupted dpkg has exited");
+    expect(out.find("dpkg --configure -a") != std::string::npos,
+           "configure -a is mentioned only after the interrupted dpkg is gone");
+    expect(out.find("still running") == std::string::npos,
+           "a gone dpkg is not described as still running");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  auto run_upgrade = [&](const char* script, const char* tag, const std::vector<std::string>& pins,
+                         const char* timeout_sec, const char* hard_cap, const char* statefile,
+                         const char* reboot_file, const char* dpkg_status, int* stderr_read,
+                         std::string& out, bool& exited) -> pid_t {
+    const std::string countfile = std::string(dir) + "/" + tag + ".count";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/" + tag + ".pids", timeout_sec, nullptr,
+                   helper_pid, script, countfile.c_str(), &stdout_read, "upgrade", &pins, stderr_read,
+                   nullptr, nullptr, hard_cap, statefile, reboot_file, dpkg_status) != 0)
+      return -1;
+    int status = 0;
+    const int budget = hard_cap != nullptr ? 20000 : 10000;
+    exited = wait_pid(helper_pid, budget, status);
+    out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+    return helper_pid;
+  };
+
+  {
+    const std::vector<std::string> pins = {"libc6=2"};
+    std::string out;
+    bool exited = false;
+    const std::string statefile = std::string(dir) + "/stall-idle.state";
+    if (run_upgrade("stall-after-idle", "stall-idle", pins, "2", "30", statefile.c_str(), nullptr,
+                    nullptr, nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for stall after idle\n");
+      return 1;
+    }
+    const std::string state = read_file_all(statefile);
+    expect(exited, "helper exits after DPKG_IDLE without killing apt");
+    expect(state.find("dpkg-exited") != std::string::npos, "configure was allowed to finish");
+    expect(state.find("finished") != std::string::npos,
+           "idle budget after DPKG_STARTED does not kill the rest of apt");
+    expect(out.find("STATUS success\n") != std::string::npos, "the stalled-idle install still succeeds");
+    expect(out.find("Timed out") == std::string::npos, "no timeout after DPKG_STARTED");
+  }
+
+  {
+    const std::vector<std::string> pins = {"libc6=2"};
+    std::string out;
+    bool exited = false;
+    const std::string statefile = std::string(dir) + "/stall-hard.state";
+    if (run_upgrade("stall-hard", "stall-hard", pins, "1", "3", statefile.c_str(), nullptr, nullptr,
+                    nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for stall hard cap\n");
+      return 1;
+    }
+    const std::string state = read_file_all(statefile);
+    expect(exited, "helper exits under a hard cap after DPKG_STARTED");
+    expect(state.find("finished") != std::string::npos,
+           "the hard cap after DPKG_STARTED does not kill apt");
+    expect(out.find("Timed out") == std::string::npos, "hard cap after DPKG_STARTED is not a timeout");
+    expect(out.find("STATUS success\n") != std::string::npos, "progress after DPKG_IDLE still finishes");
+  }
+
+  {
+    const std::vector<std::string> pins = {"libc6=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("carry-phased", "carry-phased", pins, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for carried phasing\n");
+      return 1;
+    }
+    expect(exited, "helper exits after an install that had phased updates");
+    expect(out.find("STATUS success\n") != std::string::npos, "installed packages are a success");
+    expect(out.find("PHASED shim-signed\n") != std::string::npos,
+           "phasing from the pre-install simulation is kept");
+    expect(out.find("STATUS up-to-date\n") == std::string::npos, "phased leftovers are not up to date");
+  }
+
+  {
+    const std::vector<std::string> pins = {"libc6=2"};
+    std::string out;
+    bool exited = false;
+    const std::string status_path = std::string(dir) + "/carry-held.status";
+    {
+      FILE* file = std::fopen(status_path.c_str(), "w");
+      if (file != nullptr) {
+        std::fputs("Package: vim\nStatus: hold ok installed\nArchitecture: amd64\n\n", file);
+        std::fclose(file);
+      }
+    }
+    if (run_upgrade("carry-held", "carry-held", pins, nullptr, nullptr, nullptr, nullptr,
+                    status_path.c_str(), nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for carried holds\n");
+      return 1;
+    }
+    expect(exited, "helper exits after an install that had a hold");
+    expect(out.find("HELD vim\n") != std::string::npos, "a hold from the pre-install simulation is kept");
+    expect(out.find("STATUS success\n") != std::string::npos, "the installed package is still a success");
+  }
+
+  {
+    const std::vector<std::string> pins = {"bar=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("carry-kept", "carry-kept", pins, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for carried kept-back\n");
+      return 1;
+    }
+    expect(exited, "helper exits after an install that left a package kept back");
+    expect(out.find("KEPT foo\n") != std::string::npos,
+           "a kept-back name from the pre-install simulation is kept");
+    expect(out.find("STATUS success\n") != std::string::npos, "the installed package is a success");
+  }
+
+  {
+    const std::vector<std::string> pins = {"bar=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("removal-kept", "removal", pins, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for a removal keep-back\n");
+      return 1;
+    }
+    expect(exited, "helper exits after classifying a removal keep-back");
+    expect(out.find("REMOVE foo oldplug\n") != std::string::npos,
+           "a Breaks keep-back names the package that would be removed");
+    expect(out.find("KEPT foo\n") == std::string::npos, "a removal is not a classic kept-back");
+    expect(out.find("STATUS success\n") != std::string::npos, "the other package is still installed");
+  }
+
+  {
+    const std::vector<std::string> pins = {"foo=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("disk-full", "disk", pins, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for a full disk\n");
+      return 1;
+    }
+    expect(exited, "helper exits after a full disk");
+    expect(out.find("No space left on device") != std::string::npos, "a full disk shows the cause");
+    expect(out.find("foo.deb") != std::string::npos, "a full disk names the archive");
+    expect(out.find("dpkg --configure -a") == std::string::npos,
+           "a full disk does not say to run dpkg --configure -a");
+  }
+
+  {
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/refused.count";
+    if (run_helper(helper, apt, std::string(dir) + "/refused.pids", nullptr, nullptr, helper_pid,
+                   "connect-refused", countfile.c_str(), &stdout_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for connection refused\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after connection refused");
+    expect(out.find("Connection refused") != std::string::npos, "connection refused keeps apt's words");
+    expect(out.find("192.0.2.1") != std::string::npos, "connection refused keeps the address");
+    expect(out.find("/etc/apt/apt.conf.d") != std::string::npos, "connection refused adds the proxy hint");
+    expect(out.find("could not be refreshed") == std::string::npos,
+           "connection refused is not the generic sentence");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/release.count";
+    if (run_helper(helper, apt, std::string(dir) + "/release.pids", nullptr, nullptr, helper_pid,
+                   "release-missing", countfile.c_str(), &stdout_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a missing Release file\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    expect(exited, "helper exits after a missing Release file");
+    expect(out.find("does not have a Release file") != std::string::npos,
+           "a missing Release file keeps apt's E: line");
+    expect(out.find("could not be refreshed") == std::string::npos,
+           "a missing Release file is not the generic sentence");
+    expect(out.find("/etc/apt/apt.conf.d") == std::string::npos,
+           "a missing Release file is not a proxy hint");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    pid_t helper_pid = 0;
+    int stderr_read = -1;
+    int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/cr.count";
+    if (run_helper(helper, apt, std::string(dir) + "/cr.pids", nullptr, nullptr, helper_pid,
+                   "cr-progress", countfile.c_str(), &stdout_read, "simulate", nullptr,
+                   &stderr_read) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for carriage-return progress\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string err = stderr_read >= 0 ? read_all_fd(stderr_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    if (stderr_read >= 0)
+      close(stderr_read);
+    expect(exited, "helper exits after carriage-return progress");
+    expect(err.find("PROGRESS ") != std::string::npos, "a carriage return emits PROGRESS");
+    expect(err.find("linux-image-amd64") != std::string::npos, "progress names the package");
+    expect(err.find("[12%]") != std::string::npos || err.find("[100%]") != std::string::npos,
+           "progress includes a percent");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/reboot-new.state";
+    const std::string reboot = statefile + ".reboot";
+    const std::vector<std::string> pins = {"bash=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("reboot-during", "reboot-new", pins, nullptr, nullptr, statefile.c_str(),
+                    reboot.c_str(), nullptr, nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for a new reboot flag\n");
+      return 1;
+    }
+    expect(exited, "helper exits after this install creates reboot-required");
+    expect(out.find("REBOOT linux-image-amd64\n") != std::string::npos,
+           "a flag created by this install says to restart");
+    expect(out.find("REBOOT_ALREADY") == std::string::npos, "a new flag was not already pending");
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/reboot-grew.state";
+    const std::string reboot = statefile + ".reboot";
+    write_reboot_pkgs(reboot, "bash\n");
+    const std::vector<std::string> pins = {"bash=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("reboot-grow", "reboot-grew", pins, nullptr, nullptr, statefile.c_str(),
+                    reboot.c_str(), nullptr, nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for a grown reboot flag\n");
+      return 1;
+    }
+    expect(exited, "helper exits after reboot-required grows");
+    expect(out.find("REBOOT linux-image-amd64\n") != std::string::npos,
+           "a new package on the flag is this install's restart");
+    expect(out.find("REBOOT_ALREADY bash\n") != std::string::npos,
+           "packages already listed stay on the old flag");
+    expect(out.find("REBOOT bash\n") == std::string::npos, "an old package is not a new restart");
+  }
+
+  {
+    const std::string statefile = std::string(dir) + "/reboot-same.state";
+    const std::string reboot = statefile + ".reboot";
+    write_reboot_pkgs(reboot, "linux-image-amd64\n");
+    const std::vector<std::string> pins = {"bash=2"};
+    std::string out;
+    bool exited = false;
+    if (run_upgrade("reboot-touch", "reboot-same", pins, nullptr, nullptr, statefile.c_str(),
+                    reboot.c_str(), nullptr, nullptr, out, exited) < 0) {
+      std::fprintf(stderr, "failed to spawn helper for an unchanged reboot flag\n");
+      return 1;
+    }
+    expect(exited, "helper exits after an unchanged reboot flag");
+    expect(out.find("REBOOT_ALREADY linux-image-amd64\n") != std::string::npos,
+           "touching the same package list does not attribute the restart");
+    expect(out.find("\nREBOOT ") == std::string::npos, "an unchanged flag is not this install");
   }
 
   if (g_fails != 0) {
