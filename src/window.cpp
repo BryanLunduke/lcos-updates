@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <fcntl.h>
+#include <gio/gio.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -24,6 +25,7 @@ const char kPkexecPath[] = "/usr/bin/pkexec";
  * eat the budget. Restarted again when a configuring dpkg exits. */
 const int kCheckTimeoutMs = kCheckTimeoutSec * 1000;
 const int kInstallTimeoutMs = kInstallTimeoutSec * 1000;
+const int kAuthTimeoutMs = kAuthTimeoutSec * 1000;
 const int kPulseIntervalMs = 100;
 
 const char* pkexec_path()
@@ -84,17 +86,39 @@ std::string join_names(const std::vector<std::string>& names)
   return out;
 }
 
-Glib::ustring kept_sentence(const SimulateResult& result)
+Glib::ustring explain_lists(const SimulateResult& result)
 {
-  if (!result.kept_back.empty()) {
-    Glib::ustring sentence("This tool will not install updates that need extra packages: ");
-    sentence += join_names(result.kept_back);
+  Glib::ustring out;
+  auto add = [&](const Glib::ustring& sentence) {
+    if (sentence.empty())
+      return;
+    if (!out.empty())
+      out += " ";
+    out += sentence;
+  };
+  if (!result.phased.empty())
+    add("These updates are waiting and will be offered later: " + join_names(result.phased) + ".");
+  if (!result.held.empty())
+    add("These packages are held: " + join_names(result.held) + ".");
+  if (!result.kept_back.empty())
+    add("This tool will not install updates that need extra packages: " + join_names(result.kept_back) +
+        ".");
+  else if (result.phased.empty() && result.held.empty() && result.not_upgraded_count > 0)
+    add("This tool will not install updates that need extra packages.");
+  return out;
+}
+
+Glib::ustring reboot_sentence(const SimulateResult& result)
+{
+  if (!result.reboot_required)
+    return {};
+  Glib::ustring sentence("Restart to finish installing updates.");
+  if (!result.reboot_pkgs.empty()) {
+    sentence += " ";
+    sentence += join_names(result.reboot_pkgs);
     sentence += ".";
-    return sentence;
   }
-  if (result.not_upgraded_count > 0)
-    return "This tool will not install updates that need extra packages.";
-  return {};
+  return sentence;
 }
 
 Glib::ustring conf_sentence(const SimulateResult& result)
@@ -110,20 +134,91 @@ Glib::ustring conf_sentence(const SimulateResult& result)
 bool result_has_kept(const SimulateResult& result)
 {
   return result.status == SimulateResult::KeptBack || !result.kept_back.empty() ||
-         result.not_upgraded_count > 0;
+         !result.phased.empty() || !result.held.empty() || result.not_upgraded_count > 0;
 }
 
-Glib::ustring append_warning(Glib::ustring status, const std::string& warning, JobKind kind)
+/* Index warnings go above the headline so a partial refresh is not "up to date" first. */
+Glib::ustring with_warning(Glib::ustring status, const std::string& warning, JobKind kind)
 {
   if (warning.empty())
     return status;
   const std::string shown = friendly_job_error(warning, kind);
   if (shown.empty())
     return status;
-  if (!status.empty())
-    status += "\n";
-  status += shown;
-  return status;
+  if (status.empty())
+    return shown;
+  return Glib::ustring(shown) + "\n" + status;
+}
+
+struct InhibitHold {
+  int logind_fd = -1;
+  guint cookie = 0;
+};
+
+/* elogind's login1 block inhibitor, plus Gtk's session inhibit. Either may
+ * fail; the caller shows a logout warning when both do. */
+InhibitHold take_inhibitors(Gtk::Application* app, Gtk::Window& window, const Glib::ustring& reason)
+{
+  InhibitHold hold;
+  try {
+    auto conn = Gio::DBus::Connection::get_sync(Gio::DBus::BUS_TYPE_SYSTEM);
+    auto proxy = Gio::DBus::Proxy::create_sync(conn, "org.freedesktop.login1",
+                                               "/org/freedesktop/login1",
+                                               "org.freedesktop.login1.Manager");
+    GError* error = nullptr;
+    GUnixFDList* out_fds = nullptr;
+    GVariant* result = g_dbus_proxy_call_with_unix_fd_list_sync(
+        G_DBUS_PROXY(proxy->gobj()), "Inhibit",
+        g_variant_new("(ssss)", "shutdown:sleep", "LCOS Updates", reason.c_str(), "block"),
+        G_DBUS_CALL_FLAGS_NONE, 3000, nullptr, &out_fds, nullptr, &error);
+    if (error != nullptr) {
+      g_error_free(error);
+    } else if (result != nullptr && out_fds != nullptr) {
+      gint32 index = -1;
+      g_variant_get(result, "(h)", &index);
+      if (index >= 0)
+        hold.logind_fd = g_unix_fd_list_get(out_fds, index, nullptr);
+    }
+    if (result != nullptr)
+      g_variant_unref(result);
+    if (out_fds != nullptr)
+      g_object_unref(out_fds);
+  } catch (const Glib::Error&) {
+  }
+  if (app != nullptr) {
+    try {
+      hold.cookie = app->inhibit(window, Gtk::APPLICATION_INHIBIT_LOGOUT | Gtk::APPLICATION_INHIBIT_SUSPEND,
+                                 reason);
+    } catch (const Glib::Error&) {
+      hold.cookie = 0;
+    }
+  }
+  return hold;
+}
+
+std::string authentication_message(const std::string& err, int exit_code)
+{
+  const Glib::ustring lower = Glib::ustring(err).lowercase();
+  const std::string text(lower);
+  auto has = [&](const char* needle) { return text.find(needle) != std::string::npos; };
+  if (has("no authentication agent") || has("authentication agent found"))
+    return "No authentication agent is running. Start xfce-polkit or lxpolkit, then try again.";
+  if (has("not authorized") || has("not authorised"))
+    return "The password was not accepted, or this account cannot administer this computer.";
+  if (has("dismiss"))
+    return "Authentication was cancelled.";
+  if ((exit_code == 127 || exit_code == 126) && err.find_first_not_of(" \t\r\n") == std::string::npos)
+    return "Could not run the update helper (pkexec).";
+  return {};
+}
+
+Glib::ustring skipped_headline(const SimulateResult& result)
+{
+  const bool only_phased = !result.phased.empty() && result.kept_back.empty() && result.held.empty();
+  const bool only_held = !result.held.empty() && result.kept_back.empty() && result.phased.empty();
+  if (only_phased || only_held)
+    return explain_lists(result);
+  return "Some updates were kept back. " + explain_lists(result);
 }
 }
 
@@ -156,14 +251,44 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_menubar.show_all();
 
   m_status.set_line_wrap(true);
+  m_status.set_line_wrap_mode(Pango::WRAP_WORD_CHAR);
+  m_status.set_max_width_chars(64);
+  m_status.set_selectable(true);
   m_status.set_xalign(0.0f);
+  m_status.set_yalign(0.0f);
   m_status.set_text("Check for updates for your Computer.");
+
+  /* A long apt error wraps inside the window and scrolls instead of pushing
+   * the buttons off the screen. */
+  m_status_scroll.set_policy(Gtk::POLICY_NEVER, Gtk::POLICY_AUTOMATIC);
+  m_status_scroll.set_shadow_type(Gtk::SHADOW_NONE);
+  m_status_scroll.set_propagate_natural_height(true);
+  m_status_scroll.set_max_content_height(160);
+  m_status_scroll.add(m_status);
+  m_status_scroll.signal_size_allocate().connect([this](Gtk::Allocation& allocation) {
+    const int width = allocation.get_width() > 80 ? allocation.get_width() : 80;
+    if (m_status.get_allocated_width() != width)
+      m_status.set_size_request(width, -1);
+  });
+
+  m_commit_note.set_line_wrap(true);
+  m_commit_note.set_xalign(0.0f);
+  m_commit_note.set_max_width_chars(64);
+  m_commit_note.set_no_show_all(true);
+  m_commit_note.set_text("This install will finish on its own.");
+  m_commit_note.hide();
+
+  m_warning.set_line_wrap(true);
+  m_warning.set_xalign(0.0f);
+  m_warning.set_max_width_chars(64);
+  m_warning.set_no_show_all(true);
+  m_warning.hide();
 
   /* Spinner lives beside status (not in ButtonBox — GtkButtonBox is for buttons). */
   m_spinner.set_no_show_all(true);
   m_spinner.set_size_request(18, 18);
   m_status_row.pack_start(m_spinner, Gtk::PACK_SHRINK, 0);
-  m_status_row.pack_start(m_status, Gtk::PACK_EXPAND_WIDGET, 0);
+  m_status_row.pack_start(m_status_scroll, Gtk::PACK_EXPAND_WIDGET, 0);
 
   m_progress.set_no_show_all(true);
   m_progress.set_show_text(false);
@@ -191,6 +316,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_install.set_can_default(true);
   m_check.set_can_default(true);
   m_cancel.set_sensitive(false);
+  m_cancel.set_can_default(true);
   m_buttons.pack_start(m_cancel, Gtk::PACK_SHRINK);
   m_buttons.pack_start(m_install, Gtk::PACK_SHRINK);
   m_buttons.pack_start(m_check, Gtk::PACK_SHRINK);
@@ -200,6 +326,8 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 
   m_content.set_border_width(12);
   m_content.pack_start(m_status_row, Gtk::PACK_SHRINK);
+  m_content.pack_start(m_commit_note, Gtk::PACK_SHRINK);
+  m_content.pack_start(m_warning, Gtk::PACK_SHRINK);
   m_content.pack_start(m_progress, Gtk::PACK_SHRINK);
   m_content.pack_start(m_scroller, Gtk::PACK_EXPAND_WIDGET);
   m_content.pack_start(m_buttons, Gtk::PACK_SHRINK);
@@ -219,20 +347,27 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 
 UpdatesWindow::~UpdatesWindow()
 {
+  m_leave_idle.disconnect();
   m_check_idle.disconnect();
   m_check_queued = false;
   m_retry.disconnect();
   ++m_spawn_gen;
   m_timeout.disconnect();
   m_pulse.disconnect();
+  release_inhibitors();
+  if (m_app_held) {
+    if (auto app = get_application())
+      app->release();
+    m_app_held = false;
+  }
   if (m_close_dialog != nullptr) {
     Gtk::MessageDialog* dialog = m_close_dialog;
     m_close_dialog = nullptr;
     delete dialog;
   }
-  /* Configuring packages. Closing the window must not signal that dpkg.
-   * The helper ignores cancel while configuration is in progress. */
-  if (m_leave_helper_running || m_dpkg_started) {
+  /* Once dpkg has started, closing the window must not cancel the install.
+   * The helper ignores EOF and SIGTERM for the rest of that apt run. */
+  if (m_leave_helper_running || m_install_committed || m_dpkg_started) {
     release_job_io();
     if (m_cancel_fd >= 0) {
       ::close(m_cancel_fd);
@@ -289,9 +424,11 @@ void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
   /* Always replace prior error/status text — never leave a stale string. */
   m_status.set_text(status);
   m_check.set_sensitive(!busy);
-  m_cancel.set_sensitive(busy);
+  m_cancel.set_sensitive(busy && !m_install_committed);
   if (busy)
     m_install.set_sensitive(false);
+  if (busy && !m_install_committed)
+    use_cancel_as_default();
   m_pulse.disconnect();
   if (busy) {
     m_spinner.show();
@@ -391,6 +528,15 @@ void UpdatesWindow::use_install_as_default()
   m_install.grab_default();
 }
 
+void UpdatesWindow::use_cancel_as_default()
+{
+  if (!m_cancel.get_sensitive())
+    return;
+  m_cancel.set_can_default(true);
+  set_default(m_cancel);
+  m_cancel.grab_default();
+}
+
 void UpdatesWindow::release_job_io()
 {
   m_timeout.disconnect();
@@ -413,15 +559,15 @@ void UpdatesWindow::release_job_io()
 void UpdatesWindow::request_stop()
 {
   m_timeout.disconnect();
-  if (m_dpkg_started) {
-    /* Configuration is in progress. Closing the pipe does not stop dpkg. */
-    if (m_cancel_fd >= 0) {
-      ::close(m_cancel_fd);
-      m_cancel_fd = -1;
-    }
+  if (m_install_committed || m_dpkg_started) {
+    /* dpkg has started. Do not close the pipe: that used to cancel the rest
+     * of the install after the current package finished configuring. */
+    m_cancel.set_sensitive(false);
     m_check.set_sensitive(false);
     m_install.set_sensitive(false);
-    m_status.set_text("Packages are being configured. Cancel will not stop the installer.");
+    m_commit_note.show();
+    if (m_dpkg_started)
+      m_status.set_text("Configuring packages…");
     return;
   }
   /* Closing the pipe is the cancel. The helper stops apt-get during
@@ -430,7 +576,7 @@ void UpdatesWindow::request_stop()
     ::close(m_cancel_fd);
     m_cancel_fd = -1;
   }
-  const Job job = m_stopped_job != Job::None ? m_stopped_job : m_job;
+  const Job job = m_job;
   m_check.set_sensitive(false);
   m_install.set_sensitive(false);
   m_status.set_text(job == Job::Install ? "Stopping the update…" : "Stopping the update check…");
@@ -464,9 +610,16 @@ void UpdatesWindow::finish_job()
   m_job = Job::None;
   m_helper_ready = false;
   m_dpkg_started = false;
+  m_install_committed = false;
   m_stop_was_timeout = false;
+  m_stopped_job = Job::None;
   m_markers.clear();
   m_err_partial.clear();
+  m_phase.clear();
+  m_progress_line.clear();
+  m_commit_note.hide();
+  release_inhibitors();
+  update_logout_warning();
 }
 
 void UpdatesWindow::arm_job_timeout()
@@ -494,7 +647,11 @@ void UpdatesWindow::start_helper(const std::vector<std::string>& helper_args, Jo
   m_stderr_first_error.clear();
   m_helper_ready = false;
   m_dpkg_started = false;
+  m_install_committed = false;
   m_stop_was_timeout = false;
+  m_phase.clear();
+  m_progress_line.clear();
+  m_commit_note.hide();
   m_job = job;
 
   int cancel_pipe[2] = {-1, -1};
@@ -596,6 +753,13 @@ void UpdatesWindow::append_stderr(const char* data, std::size_t n)
       line.pop_back();
     if (line == "HELPER_READY" || line == "DPKG_STARTED" || line == "DPKG_IDLE")
       m_markers += line + "\n";
+    else if (line.compare(0, 6, "PHASE ") == 0)
+      m_phase = line.substr(6);
+    else if (line.compare(0, 9, "PROGRESS ") == 0) {
+      m_progress_line = line.substr(9);
+      if (m_progress_line.size() > 240)
+        m_progress_line.resize(240);
+    }
     if (m_stderr_first_error.empty() && line.compare(0, 2, "E:") == 0) {
       if (line.size() > 2048)
         line.resize(2048);
@@ -656,6 +820,8 @@ bool UpdatesWindow::on_stderr(Glib::IOCondition cond)
     if (n > 0) {
       maybe_rearm_job_timeout();
       maybe_note_dpkg();
+      apply_phase_status();
+      note_helper_activity();
     }
     if (st == Glib::IO_STATUS_AGAIN)
       return true;
@@ -673,7 +839,10 @@ void UpdatesWindow::maybe_rearm_job_timeout()
     return;
   m_helper_ready = true;
   show_job_progress();
-  if (m_dpkg_started)
+  if (!m_dpkg_started && m_phase.empty() && m_progress_line.empty())
+    m_status.set_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
+  apply_phase_status();
+  if (m_dpkg_started || m_install_committed)
     return;
   arm_job_timeout();
 }
@@ -687,16 +856,26 @@ void UpdatesWindow::maybe_note_dpkg()
     return;
   m_dpkg_started = on;
   if (on) {
+    if (m_job == Job::Install)
+      m_install_committed = true;
     m_timeout.disconnect();
     m_retry.disconnect();
     m_stop_was_timeout = false;
     m_status.set_text("Configuring packages…");
+    if (m_install_committed) {
+      m_cancel.set_sensitive(false);
+      m_commit_note.show();
+    }
     return;
   }
   if (m_job != Job::Check && m_job != Job::Install)
     return;
+  if (m_install_committed)
+    m_cancel.set_sensitive(false);
   arm_job_timeout();
-  m_status.set_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
+  apply_phase_status();
+  if (m_progress_line.empty() && m_phase.empty())
+    m_status.set_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
 }
 
 void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
@@ -721,9 +900,11 @@ bool UpdatesWindow::on_timeout()
 {
   if (m_job == Job::None && !m_have_pid)
     return false;
-  if (m_dpkg_started) {
-    m_status.set_text(
-        "Packages are being configured. Closing this window will not stop the installer.");
+  if (m_dpkg_started || m_install_committed) {
+    m_cancel.set_sensitive(false);
+    m_commit_note.show();
+    if (m_dpkg_started)
+      m_status.set_text("Configuring packages…");
     return false;
   }
   m_stopped_job = m_job == Job::None ? m_stopped_job : m_job;
@@ -804,14 +985,12 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
 
   SimulateResult parsed = parse_protocol(out);
   if (parsed.status == SimulateResult::Error && parsed.error_msg == "No STATUS from helper") {
-    if (!err.empty()) {
+    const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+    const std::string auth = authentication_message(err, exit_code);
+    if (!auth.empty())
+      parsed.error_msg = auth;
+    else if (!err.empty())
       parsed.error_msg = err;
-      /* pkexec cancel / dismiss */
-      const Glib::ustring el = Glib::ustring(err).lowercase();
-      if (el.find("dismiss") != Glib::ustring::npos || el.find("not authorized") != Glib::ustring::npos ||
-          el.find("authentication") != Glib::ustring::npos)
-        parsed.error_msg = "Authentication was cancelled or failed.";
-    }
   }
 
   if (job == Job::Check)
@@ -820,6 +999,11 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
     apply_install_result(parsed, wait_status);
   else
     set_idle_status(m_status.get_text());
+
+  if (m_background) {
+    notify_and_leave(m_status.get_text());
+    return;
+  }
 
   if (check_again) {
     if (m_closing)
@@ -837,7 +1021,7 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
     hide_package_list();
     m_install.set_sensitive(false);
     /* Clear any prior error; show a definite idle/success string. */
-    set_idle_status(append_warning("You're up to date.", result.warning, JobKind::Check));
+    set_idle_status(with_warning("You're up to date.", result.warning, JobKind::Check));
     m_check.set_sensitive(true);
     return;
   }
@@ -845,10 +1029,10 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
     show_packages(result.packages);
     m_install.set_sensitive(true);
     Glib::ustring status = "Updates are available.";
-    const Glib::ustring kept = kept_sentence(result);
+    const Glib::ustring kept = explain_lists(result);
     if (!kept.empty())
       status += " " + kept;
-    set_idle_status(append_warning(status, result.warning, JobKind::Check));
+    set_idle_status(with_warning(status, result.warning, JobKind::Check));
     m_check.set_sensitive(true);
     return;
   }
@@ -856,8 +1040,8 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
       (result.packages.empty() && result_has_kept(result))) {
     hide_package_list();
     m_install.set_sensitive(false);
-    Glib::ustring status = "Some updates were kept back. " + kept_sentence(result);
-    set_idle_status(append_warning(status, result.warning, JobKind::Check));
+    Glib::ustring status = skipped_headline(result);
+    set_idle_status(with_warning(status, result.warning, JobKind::Check));
     m_check.set_sensitive(true);
     return;
   }
@@ -868,8 +1052,11 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
     hide_package_list();
   std::string msg = result.error_msg;
   if (msg.empty() || msg == "No STATUS from helper") {
-    if (exit_code == 127 || exit_code == 126)
-      msg = "Could not run the update helper (pkexec). Authentication may have been cancelled.";
+    const std::string auth = authentication_message({}, exit_code);
+    if (!auth.empty())
+      msg = auth;
+    else if (exit_code == 127 || exit_code == 126)
+      msg = "Could not run the update helper (pkexec).";
     else
       msg = "The update check failed.";
   }
@@ -887,61 +1074,76 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
     if (result.status == SimulateResult::Upgrades && !result.packages.empty()) {
       show_packages(result.packages);
       m_install.set_sensitive(true);
-      const Glib::ustring kept = kept_sentence(result);
+      const Glib::ustring kept = explain_lists(result);
       if (!kept.empty())
         status += " " + kept;
       if (!conf.empty())
         status += " " + conf;
-      set_idle_status(append_warning(status, result.warning, JobKind::Install));
+      set_idle_status(with_warning(status, result.warning, JobKind::Install));
       m_check.set_sensitive(true);
       return;
     }
     hide_package_list();
     m_install.set_sensitive(false);
     if (result_has_kept(result))
-      status += " " + kept_sentence(result);
+      status += " " + explain_lists(result);
     else if (result.status == SimulateResult::UpToDate || result.status == SimulateResult::Success)
       status += " You're up to date.";
     if (!conf.empty())
       status += " " + conf;
-    set_idle_status(append_warning(status, result.warning, JobKind::Install));
+    set_idle_status(with_warning(status, result.warning, JobKind::Install));
     m_check.set_sensitive(true);
+    return;
+  }
+  const Glib::ustring reboot = reboot_sentence(result);
+  auto finish_installed = [&](Glib::ustring status) {
+    if (!reboot.empty()) {
+      if (!status.empty())
+        status += " ";
+      status += reboot;
+    }
+    hide_package_list();
+    m_install.set_sensitive(false);
+    set_idle_status(with_warning(status, result.warning, JobKind::Install));
+    m_check.set_sensitive(true);
+  };
+  if (result.summary_missing && result.status != SimulateResult::Error) {
+    Glib::ustring status =
+        "Updates installed. Apt did not report whether any packages were kept back.";
+    if (!conf.empty())
+      status += " " + conf;
+    finish_installed(status);
     return;
   }
   if (result.status != SimulateResult::Error && result_has_kept(result)) {
-    hide_package_list();
-    m_install.set_sensitive(false);
-    Glib::ustring status = result.status == SimulateResult::Success
-                               ? "Updates installed. "
-                               : "Some updates were kept back. ";
-    status += kept_sentence(result);
+    Glib::ustring status = result.status == SimulateResult::Success ? "Updates installed. "
+                                                                    : skipped_headline(result);
+    if (result.status == SimulateResult::Success)
+      status += explain_lists(result);
     if (!conf.empty())
       status += " " + conf;
-    set_idle_status(append_warning(status, result.warning, JobKind::Install));
-    m_check.set_sensitive(true);
+    finish_installed(status);
     return;
   }
   if (!conf.empty() && result.status != SimulateResult::Error) {
-    hide_package_list();
-    m_install.set_sensitive(false);
-    set_idle_status(append_warning("Updates installed. " + conf, result.warning, JobKind::Install));
-    m_check.set_sensitive(true);
+    finish_installed("Updates installed. " + conf);
     return;
   }
   if (result.status == SimulateResult::Success || result.status == SimulateResult::UpToDate ||
       (result.status != SimulateResult::Error && exit_code == 0)) {
-    hide_package_list();
-    m_install.set_sensitive(false);
-    /* Clear any prior error left from a failed check/install. */
-    set_idle_status(append_warning("Updates installed successfully. You're up to date.",
-                                   result.warning, JobKind::Install));
-    m_check.set_sensitive(true);
+    if (!reboot.empty())
+      finish_installed(reboot);
+    else
+      finish_installed("Updates installed successfully. You're up to date.");
     return;
   }
   std::string msg = result.error_msg;
   if (msg.empty() || msg == "No STATUS from helper") {
-    if (exit_code == 127 || exit_code == 126)
-      msg = "Could not run the update helper (pkexec). Authentication may have been cancelled.";
+    const std::string auth = authentication_message({}, exit_code);
+    if (!auth.empty())
+      msg = auth;
+    else if (exit_code == 127 || exit_code == 126)
+      msg = "Could not run the update helper (pkexec).";
     else
       msg = "apt-get upgrade failed.";
   }
@@ -974,7 +1176,7 @@ bool UpdatesWindow::prepare_close()
   m_check_queued = false;
   if (m_close_dialog != nullptr)
     return false;
-  if (m_dpkg_started && m_have_pid && !m_leave_helper_running) {
+  if ((m_install_committed || m_dpkg_started) && m_have_pid && !m_background) {
     m_closing = true;
     show_close_dialog();
     return false;
@@ -987,11 +1189,11 @@ void UpdatesWindow::show_close_dialog()
 {
   if (m_close_dialog != nullptr)
     return;
-  auto* dialog = new Gtk::MessageDialog(*this, "Packages are being configured.", false,
-                                        Gtk::MESSAGE_WARNING, Gtk::BUTTONS_NONE, true);
-  dialog->set_secondary_text(
-      "Closing this window will not stop the installer. "
-      "If the install is interrupted, run dpkg --configure -a.");
+  m_close_primary = "The install will keep running.";
+  m_close_secondary = "It will finish in the background.";
+  auto* dialog = new Gtk::MessageDialog(*this, m_close_primary, false, Gtk::MESSAGE_WARNING,
+                                        Gtk::BUTTONS_NONE, true);
+  dialog->set_secondary_text(m_close_secondary);
   dialog->add_button("_Keep open", Gtk::RESPONSE_CANCEL);
   dialog->add_button("_Close", Gtk::RESPONSE_CLOSE);
   dialog->set_default_response(Gtk::RESPONSE_CANCEL);
@@ -1004,6 +1206,11 @@ void UpdatesWindow::show_close_dialog()
     Glib::signal_idle().connect_once([dying]() { delete dying; });
     if (response == Gtk::RESPONSE_CLOSE) {
       m_leave_helper_running = true;
+      m_background = true;
+      if (auto app = get_application()) {
+        app->hold();
+        m_app_held = true;
+      }
       hide();
       return;
     }
@@ -1039,9 +1246,13 @@ void UpdatesWindow::on_check_clicked()
 {
   if (m_closing || m_job != Job::None || m_have_pid)
     return;
-  /* Keep the current rows until this check returns a definitive result. */
-  set_busy(true, "Checking for updates…");
-  start_helper({"simulate"}, Job::Check, gui_timeout_ms(kCheckTimeoutMs));
+  /* Keep the current rows until this check returns a definitive result.
+   * The password dialog is not the check yet. */
+  set_busy(true, "Waiting for authentication…");
+  start_helper({"simulate"}, Job::Check, gui_timeout_ms(kAuthTimeoutMs));
+  if (m_job != Job::None)
+    acquire_inhibitors("Checking for updates");
+  update_logout_warning();
 }
 
 void UpdatesWindow::on_install_clicked()
@@ -1060,6 +1271,123 @@ void UpdatesWindow::on_install_clicked()
   }
   if (args.size() < 2)
     return;
-  set_busy(true, "Installing updates…");
-  start_helper(args, Job::Install, gui_timeout_ms(kInstallTimeoutMs));
+  set_busy(true, "Waiting for authentication…");
+  start_helper(args, Job::Install, gui_timeout_ms(kAuthTimeoutMs));
+  if (m_job != Job::None)
+    acquire_inhibitors("Installing updates");
+  update_logout_warning();
 }
+
+void UpdatesWindow::acquire_inhibitors(const Glib::ustring& reason)
+{
+  release_inhibitors();
+  Gtk::Application* app = nullptr;
+  const auto ref = get_application();
+  if (ref)
+    app = ref.operator->();
+  const InhibitHold hold = take_inhibitors(app, *this, reason);
+  m_logind_fd = hold.logind_fd;
+  m_inhibit_cookie = hold.cookie;
+}
+
+void UpdatesWindow::release_inhibitors()
+{
+  if (m_logind_fd >= 0) {
+    ::close(m_logind_fd);
+    m_logind_fd = -1;
+  }
+  if (m_inhibit_cookie != 0) {
+    if (auto app = get_application())
+      app->uninhibit(m_inhibit_cookie);
+    m_inhibit_cookie = 0;
+  }
+}
+
+void UpdatesWindow::update_logout_warning()
+{
+  const bool show = m_job == Job::Install && m_logind_fd < 0 && m_inhibit_cookie == 0;
+  if (show) {
+    m_warning.set_text("Don't log out or shut down until the install finishes.");
+    m_warning.show();
+  } else {
+    m_warning.hide();
+  }
+}
+
+void UpdatesWindow::apply_phase_status()
+{
+  if (m_job == Job::None || m_dpkg_started || !m_helper_ready)
+    return;
+  if (!m_progress_line.empty()) {
+    m_status.set_text(m_progress_line);
+    return;
+  }
+  if (m_phase == "refresh")
+    m_status.set_text("Refreshing package lists…");
+  else if (m_phase == "download")
+    m_status.set_text("Downloading updates…");
+  else if (m_phase == "simulate")
+    m_status.set_text(m_job == Job::Install ? "Checking the package list…" : "Checking for updates…");
+}
+
+void UpdatesWindow::note_helper_activity()
+{
+  if (!m_helper_ready || m_dpkg_started || (m_job != Job::Check && m_job != Job::Install))
+    return;
+  if (m_phase.empty() && m_progress_line.empty())
+    return;
+  arm_job_timeout();
+}
+
+void UpdatesWindow::notify_and_leave(const Glib::ustring& body)
+{
+  m_notification = body;
+  if (auto app = get_application()) {
+    try {
+      auto note = Gio::Notification::create(lcos_updates::kProductName);
+      note->set_body(body);
+      app->send_notification("lcos-updates-finished", note);
+    } catch (const Glib::Error&) {
+    }
+  }
+  release_inhibitors();
+  update_logout_warning();
+  if (m_app_held) {
+    if (auto app = get_application())
+      app->release();
+    m_app_held = false;
+  }
+  m_leave_idle.disconnect();
+  m_leave_idle = Glib::signal_idle().connect([this]() {
+    m_background = false;
+    if (auto app = get_application())
+      app->quit();
+    return false;
+  });
+}
+
+bool UpdatesWindow::on_key_press_event(GdkEventKey* event)
+{
+  if (event != nullptr && event->keyval == GDK_KEY_Escape && m_cancel.get_sensitive()) {
+    on_cancel_clicked();
+    return true;
+  }
+  return Gtk::ApplicationWindow::on_key_press_event(event);
+}
+
+#ifdef LCOS_UPDATES_TEST
+void UpdatesWindow::test_confirm_close()
+{
+  if (m_close_dialog != nullptr)
+    m_close_dialog->response(Gtk::RESPONSE_CLOSE);
+}
+
+bool UpdatesWindow::buttons_inside_window_for_test() const
+{
+  int bottom = 0;
+  if (!gtk_widget_translate_coordinates(GTK_WIDGET(m_buttons.gobj()), GTK_WIDGET(gobj()), 0,
+                                        m_buttons.get_allocated_height(), nullptr, &bottom))
+    return false;
+  return bottom <= get_allocated_height() + 2;
+}
+#endif

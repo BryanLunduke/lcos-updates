@@ -30,6 +30,9 @@ public:
   /* Start a check for this launch. A later call is not implied by an earlier one. */
   void request_check();
 
+  /* True while a committed install is finishing with the window hidden. */
+  bool retains_background_job() const { return m_background; }
+
 #ifdef LCOS_UPDATES_TEST
   Glib::ustring status_text_for_test() const { return m_status.get_text(); }
   bool progress_visible_for_test() const { return m_progress.get_visible(); }
@@ -40,6 +43,27 @@ public:
   void test_click_install() { on_install_clicked(); }
   void test_click_cancel() { on_cancel_clicked(); }
   void test_quit() { on_quit(); }
+  void test_confirm_close();
+  Glib::ustring check_label_for_test() const { return m_check.get_label(); }
+  Glib::ustring install_label_for_test() const { return m_install.get_label(); }
+  Glib::ustring cancel_label_for_test() const { return m_cancel.get_label(); }
+  bool button_mnemonics_for_test() const
+  {
+    return m_check.get_use_underline() && m_install.get_use_underline() && m_cancel.get_use_underline();
+  }
+  bool cancel_is_default_for_test() const { return get_default_widget() == &m_cancel; }
+  bool status_selectable_for_test() const { return m_status.get_selectable(); }
+  Glib::ustring notification_text_for_test() const { return m_notification; }
+  bool background_for_test() const { return m_background; }
+  bool warning_visible_for_test() const { return m_warning.get_visible(); }
+  Glib::ustring warning_text_for_test() const { return m_warning.get_text(); }
+  Glib::ustring commit_note_for_test() const { return m_commit_note.get_text(); }
+  bool commit_note_visible_for_test() const { return m_commit_note.get_visible(); }
+  Glib::ustring close_primary_for_test() const { return m_close_primary; }
+  Glib::ustring close_secondary_for_test() const { return m_close_secondary; }
+  int allocated_height_for_test() const { return get_allocated_height(); }
+  int allocated_width_for_test() const { return get_allocated_width(); }
+  bool buttons_inside_window_for_test() const;
 #endif
 
 protected:
@@ -47,6 +71,7 @@ protected:
   void on_install_clicked();
   void on_about();
   bool on_delete_event(GdkEventAny* event) override;
+  bool on_key_press_event(GdkEventKey* event) override;
 
 private:
   enum class Job { None, Check, Install };
@@ -86,20 +111,30 @@ private:
   std::string stderr_text() const;
   void show_job_progress();
   void arm_job_timeout();
+  void acquire_inhibitors(const Glib::ustring& reason);
+  void release_inhibitors();
+  void update_logout_warning();
+  void apply_phase_status();
+  void note_helper_activity();
+  void notify_and_leave(const Glib::ustring& body);
+  void use_cancel_as_default();
 
   Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 0};
   Gtk::MenuBar m_menubar;
   Gtk::Box m_content{Gtk::ORIENTATION_VERTICAL, 10};
   Gtk::Box m_status_row{Gtk::ORIENTATION_HORIZONTAL, 8};
   Gtk::Spinner m_spinner;
+  Gtk::ScrolledWindow m_status_scroll;
   Gtk::Label m_status;
+  Gtk::Label m_commit_note;
+  Gtk::Label m_warning;
   Gtk::ProgressBar m_progress;
   Gtk::ScrolledWindow m_scroller;
   Gtk::TreeView m_view;
   Gtk::ButtonBox m_buttons{Gtk::ORIENTATION_HORIZONTAL};
-  Gtk::Button m_cancel{"Cancel"};
-  Gtk::Button m_check{"Check for updates"};
-  Gtk::Button m_install{"Install updates"};
+  Gtk::Button m_cancel{"_Cancel", true};
+  Gtk::Button m_check{"_Check for updates", true};
+  Gtk::Button m_install{"_Install updates", true};
 
   class ModelColumns : public Gtk::TreeModel::ColumnRecord {
   public:
@@ -131,6 +166,7 @@ private:
   sigc::connection m_pulse;
   sigc::connection m_retry;
   sigc::connection m_check_idle;
+  sigc::connection m_leave_idle;
   std::string m_stdout;
   std::string m_stderr;
   CaptureBuf m_out_cap;
@@ -140,7 +176,13 @@ private:
   int m_cancel_fd = -1;
   bool m_helper_ready = false;
   bool m_dpkg_started = false;
+  /* Latched the first time this install's dpkg starts. Cancel stays off. */
+  bool m_install_committed = false;
   bool m_leave_helper_running = false;
+  bool m_background = false;
+  bool m_app_held = false;
+  int m_logind_fd = -1;
+  guint m_inhibit_cookie = 0;
   bool m_check_queued = false;
   bool m_check_after_job = false;
   bool m_stop_was_timeout = false;
@@ -150,6 +192,11 @@ private:
   unsigned m_retry_gen = 0;
   Glib::Pid m_retry_pid = 0;
   Gtk::MessageDialog* m_close_dialog = nullptr;
+  Glib::ustring m_close_primary;
+  Glib::ustring m_close_secondary;
+  Glib::ustring m_notification;
+  Glib::ustring m_phase;
+  Glib::ustring m_progress_line;
 };
 
 #endif

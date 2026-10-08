@@ -229,6 +229,95 @@ case "$mode" in
     python3 -c 'import sys; sys.stdout.buffer.write(b"x" * (2 * 1024 * 1024))'
     printf '\nSTATUS error\nMSG capped-ok\n'
     ;;
+  agent)
+    echo 'Error executing command as another user: No authentication agent found.' >&2
+    exit 127
+    ;;
+  notauth)
+    echo 'Not authorized' >&2
+    exit 126
+    ;;
+  never-ready)
+    wait_sec 60
+    ;;
+  hang-check)
+    echo HELPER_READY >&2
+    echo 'PHASE refresh' >&2
+    wait_sec 60
+    ;;
+  hang-install)
+    echo HELPER_READY >&2
+    echo 'PHASE download' >&2
+    wait_sec 60
+    ;;
+  many-lines)
+    echo HELPER_READY >&2
+    printf 'STATUS error\n'
+    i=1
+    while [ "$i" -le 26 ]; do
+      printf 'MSG E: Failed to fetch http://mirror%s.example/debian/dists/stable/main/binary-amd64/Packages.xz 404 Not Found\n' "$i"
+      i=$((i + 1))
+    done
+    ;;
+  phased)
+    echo HELPER_READY >&2
+    printf 'STATUS kept-back\nPHASED shim-signed\nPHASED grub-efi-amd64-signed\n'
+    ;;
+  held)
+    echo HELPER_READY >&2
+    printf 'STATUS kept-back\nHELD vim\n'
+    ;;
+  mixed-kept)
+    echo HELPER_READY >&2
+    printf 'STATUS kept-back\nKEPT linux-image-amd64\nPHASED firefox\nHELD vim\n'
+    ;;
+  warn-uptodate)
+    echo HELPER_READY >&2
+    printf 'STATUS up-to-date\n'
+    printf 'WARN E: Failed to fetch http://deb.example/InRelease  Connection timed out\n'
+    printf 'WARN E: Some index files failed to download. They have been ignored, or old ones used instead.\n'
+    ;;
+  summary-missing)
+    echo HELPER_READY >&2
+    printf 'STATUS success\nSUMMARY_MISSING\n'
+    ;;
+  phases)
+    echo HELPER_READY >&2
+    echo 'PHASE refresh' >&2
+    wait_sec 0.25
+    echo 'PROGRESS Hit:1 http://deb.example stable InRelease' >&2
+    wait_sec 0.25
+    printf 'STATUS up-to-date\n'
+    ;;
+  list-or-hang)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      wait_sec 60
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
+  list-then-reboot)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      printf 'STATUS success\nREBOOT linux-image-amd64\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
+  list-then-commit)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      echo DPKG_STARTED >&2
+      while [ ! -e "$release" ]; do
+        wait_sec 0.05
+      done
+      echo DPKG_IDLE >&2
+      printf 'STATUS success\nCONFKEPT /etc/ssh/sshd_config\nREBOOT linux-image-amd64\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
   *)
     echo HELPER_READY >&2
     printf 'STATUS up-to-date\n'
@@ -238,6 +327,7 @@ esac
 
 int main()
 {
+  setvbuf(stdout, nullptr, _IOLBF, 0);
   int argc = 1;
   char arg0[] = "test-window";
   char* argv[] = {arg0, nullptr};
@@ -290,11 +380,15 @@ int main()
     UpdatesWindow* window = new_window();
     window->test_click_check();
     pump_for(80);
+    expect(contains(window->status_text_for_test(), "Waiting for authentication"),
+           "the password wait says it is waiting for authentication");
     expect(window->cancel_sensitive_for_test(), "cancel is sensitive while the check is running");
     expect(!window->check_sensitive_for_test(), "check is insensitive while the check is running");
     expect(!window->progress_visible_for_test(), "progress stays hidden until HELPER_READY");
     const bool shown = pump_until(1500, [&]() { return window->progress_visible_for_test(); });
     expect(shown, "progress appears after HELPER_READY");
+    expect(contains(window->status_text_for_test(), "Checking for updates"),
+           "after authentication the status names the check");
     const bool done = pump_until(2000, [&]() {
       return contains(window->status_text_for_test(), "You're up to date.");
     });
@@ -389,8 +483,10 @@ int main()
     window->test_click_check();
     const bool done = pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
     expect(done, "dismissed auth returns to idle");
-    expect(contains(window->status_text_for_test(), "Authentication was cancelled or failed."),
-           "pkexec dismiss is an authentication failure");
+    expect(contains(window->status_text_for_test(), "Authentication was cancelled."),
+           "a dismissed dialog says authentication was cancelled");
+    expect(!contains(window->status_text_for_test(), "or failed"),
+           "a dismissed dialog is not an authentication failure");
     destroy_window(window, pidfile);
   }
 
@@ -407,6 +503,8 @@ int main()
            "exit 127 names the helper");
     expect(status.find("could not create a pipe") == std::string::npos,
            "exit 127 is not a pipe failure");
+    expect(status.find("cancelled") == std::string::npos,
+           "an empty exit 127 is not an authentication cancel");
     destroy_window(window, pidfile);
   }
 
@@ -573,6 +671,329 @@ int main()
     });
     expect(done, "a multi-megabyte helper stream still delivers the tail");
     expect(window->check_sensitive_for_test(), "the window stays usable after a huge stream");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("agent");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    expect(done, "a missing agent returns to idle");
+    expect(contains(window->status_text_for_test(), "No authentication agent is running"),
+           "a missing agent names the agent");
+    expect(contains(window->status_text_for_test(), "xfce-polkit"),
+           "a missing agent says which agent to start");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("notauth");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    expect(done, "a rejected password returns to idle");
+    expect(contains(window->status_text_for_test(), "password was not accepted"),
+           "a rejected password says the password or the account");
+    expect(!contains(window->status_text_for_test(), "Authentication was cancelled"),
+           "a rejected password is not a dismissed dialog");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("never-ready");
+    set_timeout_ms(400);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Timed out waiting for authentication");
+    });
+    expect(done, "authentication has its own short timeout");
+    expect(!contains(window->status_text_for_test(), "Timed out waiting for the update check"),
+           "an unanswered password is not a check timeout");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("phases");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool refreshing = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Refreshing package lists");
+    });
+    expect(refreshing, "a check says it is refreshing package lists");
+    const bool line = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Hit:1");
+    });
+    expect(line, "the window shows the last apt line");
+    pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("many-lines");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "mirror26.example");
+    });
+    expect(done, "a long apt error is still shown");
+    pump_for(100);
+    expect(window->status_selectable_for_test(), "the status text can be selected");
+    expect(window->allocated_height_for_test() < 700, "a long error does not grow past the screen");
+    expect(window->allocated_width_for_test() < 900, "a long URL does not widen the window");
+    expect(window->buttons_inside_window_for_test(), "the buttons stay inside the window");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("phased");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    expect(window->button_mnemonics_for_test(), "the action buttons use mnemonics");
+    expect(contains(window->check_label_for_test(), "_Check for updates"), "Check has an underline");
+    expect(contains(window->install_label_for_test(), "_Install updates"), "Install has an underline");
+    expect(contains(window->cancel_label_for_test(), "_Cancel"), "Cancel has an underline");
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "will be offered later");
+    });
+    expect(done, "phased updates say they will be offered later");
+    expect(contains(window->status_text_for_test(), "shim-signed"), "phased updates are named");
+    expect(!contains(window->status_text_for_test(), "need extra packages"),
+           "phased updates are not described as extra packages");
+    expect(!window->install_sensitive_for_test(), "phased-only updates cannot be installed");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("held");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "These packages are held");
+    });
+    expect(done, "a held package says it is held");
+    expect(contains(window->status_text_for_test(), "vim"), "a held package is named");
+    expect(!contains(window->status_text_for_test(), "need extra packages"),
+           "a held package is not described as an extra package");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("mixed-kept");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Some updates were kept back");
+    });
+    expect(done, "a mix of skipped updates uses the kept-back headline");
+    const std::string status = window->status_text_for_test();
+    expect(status.find("will be offered later") != std::string::npos, "the mix names the phased update");
+    expect(status.find("These packages are held") != std::string::npos, "the mix names the hold");
+    expect(status.find("need extra packages") != std::string::npos, "the mix names the classic kept-back");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("warn-uptodate");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "You're up to date.");
+    });
+    expect(done, "a partial refresh still reports the lists");
+    const std::string status = window->status_text_for_test();
+    const auto warn = status.find("Connection timed out");
+    const auto head = status.find("You're up to date.");
+    expect(warn != std::string::npos && head != std::string::npos && warn < head,
+           "a partial refresh warning is above the headline");
+    expect(status.find("No network connection") == std::string::npos,
+           "one skipped mirror is not called no network");
+    expect(!window->warning_visible_for_test(), "a check does not show the logout warning");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("summary-missing");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    /* Install needs a reviewed row. Seed one, then replace the mode. */
+    destroy_window(window, pidfile);
+    set_mode("list-then-reboot");
+    window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "reboot test listed a package");
+    set_mode("summary-missing");
+    window->test_click_install();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "did not report whether any packages were kept back");
+    });
+    expect(done, "a missing summary does not say the system is up to date");
+    expect(!contains(window->status_text_for_test(), "You're up to date."),
+           "a missing summary is not the up-to-date sentence");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("list-then-reboot");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "a package is offered before the reboot install");
+    window->test_click_install();
+    const bool done = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Restart to finish installing updates.");
+    });
+    expect(done, "a reboot flag says to restart");
+    expect(contains(window->status_text_for_test(), "linux-image-amd64"), "a reboot flag names the package");
+    expect(!contains(window->status_text_for_test(), "You're up to date."),
+           "a reboot flag is not up to date");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("hang-check");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool ready = pump_until(2000, [&]() { return window->progress_visible_for_test(); });
+    expect(ready, "hang-check reaches the helper");
+    expect(window->cancel_is_default_for_test(), "Cancel is the default while a check is running");
+    const pid_t pid = read_pid(pidfile);
+    GdkEventKey key {};
+    key.type = GDK_KEY_PRESS;
+    key.window = gtk_widget_get_window(GTK_WIDGET(window->gobj()));
+    key.keyval = GDK_KEY_Escape;
+    key.send_event = 1;
+    gtk_widget_event(GTK_WIDGET(window->gobj()), reinterpret_cast<GdkEvent*>(&key));
+    expect(contains(window->status_text_for_test(), "Stopping the update check"),
+           "Escape cancels a running check");
+    pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    expect(!alive(pid), "Escape stops the check it was aimed at");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("list-or-hang");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "finding 13 listed a package");
+    set_timeout_ms(600);
+    window->test_click_install();
+    const bool timed = pump_until(3000, [&]() {
+      return contains(window->status_text_for_test(), "Timed out while installing updates");
+    });
+    expect(timed, "the install times out");
+    set_mode("hang-check");
+    set_timeout_ms(8000);
+    unlink(pidfile.c_str());
+    window->test_click_check();
+    const bool ready = pump_until(2000, [&]() { return window->progress_visible_for_test(); });
+    expect(ready, "the later check is running");
+    window->test_click_cancel();
+    expect(contains(window->status_text_for_test(), "Stopping the update check"),
+           "cancelling a check says it is stopping the check");
+    pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("list-then-commit");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    /* The close path holds the application so the process outlives the
+     * window. Register and start the test application once so add_window
+     * is legal, then this window can take that hold. */
+    static bool app_started = false;
+    if (!app_started) {
+      GError* error = nullptr;
+      g_application_register(G_APPLICATION(app->gobj()), nullptr, &error);
+      if (error != nullptr)
+        g_error_free(error);
+      g_signal_emit_by_name(app->gobj(), "startup");
+      app_started = true;
+    }
+    app->add_window(*window);
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "commit test listed a package");
+    expect(!window->warning_visible_for_test(), "the logout warning is hidden during a check");
+    window->test_click_install();
+    const bool configuring = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Configuring packages");
+    });
+    expect(configuring, "install reports that packages are being configured");
+    expect(!window->cancel_sensitive_for_test(), "Cancel is insensitive once dpkg has started");
+    expect(window->commit_note_visible_for_test(), "the window says the install will finish");
+    expect(contains(window->commit_note_for_test(), "This install will finish on its own."),
+           "the commit note matches the behavior");
+    expect(window->warning_visible_for_test(), "install shows the logout warning when nothing inhibits");
+    expect(contains(window->warning_text_for_test(),
+                    "Don't log out or shut down until the install finishes."),
+           "the logout warning is the fallback sentence");
+    const pid_t pid = read_pid(pidfile);
+    window->test_click_cancel();
+    pump_for(100);
+    expect(alive(pid), "Cancel after dpkg does not stop the helper");
+    expect(contains(window->status_text_for_test(), "Configuring packages"),
+           "Cancel after dpkg leaves the configuring status");
+    window->test_quit();
+    pump_for(80);
+    expect(window->get_visible(), "close during install asks before hiding");
+    expect(contains(window->close_primary_for_test(), "The install will keep running."),
+           "the close dialog says the install keeps running");
+    expect(contains(window->close_secondary_for_test(), "It will finish in the background."),
+           "the close dialog says the install finishes in the background");
+    window->test_confirm_close();
+    pump_for(80);
+    expect(!window->get_visible(), "confirming close hides the window");
+    expect(window->background_for_test(), "the hidden window keeps the install");
+    expect(alive(pid), "hiding the window leaves the helper running");
+    {
+      std::ofstream out(release);
+      out << "go\n";
+    }
+    const bool noted = pump_until(3000, [&]() {
+      return contains(window->notification_text_for_test(), "Restart to finish installing updates.");
+    });
+    expect(noted, "the notification says a restart is needed");
+    const std::string note = window->notification_text_for_test();
+    expect(note.find("Existing configuration was kept") != std::string::npos,
+           "the notification names the kept conffile");
+    expect(note.find("linux-image-amd64") != std::string::npos, "the notification names the reboot package");
+    expect(note.find("You're up to date.") == std::string::npos,
+           "the notification does not say the system is up to date");
+    pump_until(1000, [&]() { return !alive(pid); });
+    app->remove_window(*window);
     destroy_window(window, pidfile);
   }
 

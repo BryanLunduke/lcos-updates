@@ -1,3 +1,33 @@
+lcos-updates (0.9-4) unstable; urgency=medium
+
+  * A package-list refresh that fetched nothing is an error, not "up to
+    date". A partial refresh (some indexes arrived) still continues, and
+    that warning is shown above the result.
+  * Once dpkg has started unpacking or configuring, Cancel is disabled and
+    the install runs to completion. Closing the window hides it and a
+    notification reports the real outcome. Before that phase, Cancel and
+    Close still stop the job.
+  * Phased updates and held packages are named for what they are. A
+    name:arch pin is accepted, and a refused pin is named.
+  * The apt capture keeps the summary, kept-back and phasing sections, and
+    conffile notes. A missing summary is not reported as up to date.
+  * Apt's idle clock restarts while output is still arriving. The window
+    shows the phase and the last apt line. A hard cap still applies.
+  * Logout and shutdown are inhibited when the session provides a way.
+    Otherwise the install window says not to log out or shut down.
+  * A reboot-required flag after install says to restart and names the
+    packages.
+  * Authentication failures name a missing agent, a rejected password, or
+    a dismissed dialog. The password wait says it is waiting, and times
+    out on its own.
+  * The status area scrolls so a long error leaves the buttons on screen.
+    The action buttons have mnemonics, and Escape cancels before dpkg.
+  * Cancelling a check says so, even after an install timed out.
+  * A connection failure says to set a proxy in /etc/apt/apt.conf.d. The
+    apt child's environment stays cleared.
+
+ -- LCOS <lcos@lunduke.com>  Thu, 08 Oct 2026 08:10:00 +0000
+
 lcos-updates (0.9-3) unstable; urgency=medium
 
   * Only a live dpkg --unpack/--configure/--install/--remove/--triggers-only
