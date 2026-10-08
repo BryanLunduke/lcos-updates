@@ -1,3 +1,11 @@
+lcos-updates (0.9-8) unstable; urgency=medium
+
+  * Purge removes /var/lib/lcos-updates, the helper's last-check state.
+    remove, upgrade, and failed-upgrade do nothing, so the saved check
+    survives upgrades.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 17:21:00 +0000
+
 lcos-updates (0.9-7) unstable; urgency=medium
 
   * Download progress no longer blanks when apt clears the line, and the
