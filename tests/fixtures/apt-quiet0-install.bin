@@ -1,0 +1,23 @@
+Reading package lists... 0%Reading package lists... 0%Reading package lists... 95%Reading package lists... 95%Reading package lists... 95%Reading package lists... Done
+Building dependency tree... 0%Building dependency tree... 0%Building dependency tree... 50%Building dependency tree... 50%Building dependency tree... Done
+The following packages will be upgraded:
+  lcos-simple
+1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+Need to get 0 B/574 B of archives.
+After this operation, 0 B of additional disk space will be used.
+0% [Working]            Get:1 file:/tmp/localrepo ./ lcos-simple 2.0 [574 B]
+100% [Working]              debconf: delaying package configuration, since apt-utils is not installed
+dpkg: warning: parsing file '/tmp/aptroot/var/lib/dpkg/status' near line 5 package 'lcos-simple':
+ missing 'Description' field
+dpkg: warning: parsing file '/tmp/aptroot/var/lib/dpkg/status' near line 5 package 'lcos-simple':
+ missing 'Maintainer' field
+(Reading database ... (Reading database ... 100%(Reading database ... 0 files and directories currently installed.)
+Preparing to unpack ..././lcos-simple_2.0_all.deb ...
+Unpacking lcos-simple (2.0) over (1.0) ...
+Setting up lcos-simple (2.0) ...
+installed lcos-simple package post-installation script subprocess returned error exit status 1
+dpkg: error processing package lcos-simple (--configure):
+ installed lcos-simple package post-installation script subprocess returned error exit status 1
+Errors were encountered while processing:
+ lcos-simple
+E: Sub-process /usr/bin/dpkg returned an error code (1)

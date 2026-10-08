@@ -16,6 +16,25 @@ static std::string trim_cr(std::string line)
   return line;
 }
 
+/* Apt percent lines end with a carriage return. Treat that as a line break
+ * so a later summary, kept-back name, or E: line is not glued to the percent.
+ * A CRLF pair is one break, not a blank line. */
+static std::string normalize_breaks(std::string text)
+{
+  std::string out;
+  out.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '\r') {
+      out.push_back('\n');
+      if (i + 1 < text.size() && text[i + 1] == '\n')
+        ++i;
+      continue;
+    }
+    out.push_back(text[i]);
+  }
+  return out;
+}
+
 static std::string lower_copy(std::string text)
 {
   for (char& ch : text)
@@ -154,7 +173,7 @@ SimulateResult parse_apt_simulate(const std::string& text)
   SimulateResult result;
   result.status = SimulateResult::UpToDate;
 
-  std::istringstream in(text);
+  std::istringstream in(normalize_breaks(text));
   std::string line;
   enum class Section { None, Kept, Phased };
   Section section = Section::None;
@@ -299,7 +318,7 @@ UpdateFetch classify_apt_update(const std::string& text)
   std::string apt_lines;
   bool keep_next = false;
 
-  std::istringstream in(text);
+  std::istringstream in(normalize_breaks(text));
   std::string line;
   while (std::getline(in, line)) {
     line = trim_cr(line);
@@ -366,7 +385,7 @@ static bool is_index_warning_line(const std::string& line)
 
 std::string apt_index_warning(const std::string& text)
 {
-  std::istringstream in(text);
+  std::istringstream in(normalize_breaks(text));
   std::string line;
   std::string warning;
   while (std::getline(in, line)) {
@@ -402,6 +421,17 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
     out << "NOT_UPGRADED " << result.not_upgraded_count << "\n";
   for (const auto& name : result.kept_back)
     out << "KEPT " << name << "\n";
+  for (const auto& name : result.unclassified)
+    out << "UNCLASSIFIED " << name << "\n";
+  if (!result.download_need.empty()) {
+    std::istringstream needs(result.download_need);
+    std::string need;
+    while (std::getline(needs, need)) {
+      need = trim_cr(need);
+      if (!need.empty())
+        out << "NEED " << need << "\n";
+    }
+  }
   for (const auto& name : result.phased)
     out << "PHASED " << name << "\n";
   for (const auto& name : result.held)
@@ -525,6 +555,18 @@ SimulateResult parse_protocol(const std::string& text)
       const std::string name = line.substr(5);
       if (!name.empty())
         result.kept_back.push_back(name);
+    } else if (line.compare(0, 13, "UNCLASSIFIED ") == 0) {
+      const std::string name = line.substr(13);
+      if (!name.empty())
+        result.unclassified.push_back(name);
+    } else if (line.compare(0, 5, "NEED ") == 0) {
+      const std::string need = line.substr(5);
+      if (!need.empty()) {
+        if (result.download_need.empty())
+          result.download_need = need;
+        else
+          result.download_need += "\n" + need;
+      }
     } else if (line.compare(0, 7, "PHASED ") == 0) {
       const std::string name = line.substr(7);
       if (!name.empty())
@@ -749,6 +791,19 @@ void capture_append(CaptureBuf& cap, const char* data, std::size_t n)
 {
   if (data == nullptr || n == 0)
     return;
+  std::string normalized;
+  normalized.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    if (data[i] == '\r') {
+      normalized.push_back('\n');
+      if (i + 1 < n && data[i + 1] == '\n')
+        ++i;
+      continue;
+    }
+    normalized.push_back(data[i]);
+  }
+  data = normalized.data();
+  n = normalized.size();
   std::size_t off = 0;
   while (off < n) {
     if (cap.pending.size() >= 8192) {
@@ -824,7 +879,7 @@ void parse_removal_plan(const std::string& text, std::vector<std::string>& remov
 {
   removed.clear();
   newly.clear();
-  std::istringstream in(text);
+  std::istringstream in(normalize_breaks(text));
   std::string line;
   enum class Section { None, Removed, New };
   Section section = Section::None;
@@ -851,6 +906,18 @@ void parse_removal_plan(const std::string& text, std::vector<std::string>& remov
         append_tokens(line.substr(colon + 1), newly);
     }
   }
+}
+
+std::string parse_download_need(const std::string& text)
+{
+  std::istringstream in(normalize_breaks(text));
+  std::string line;
+  while (std::getline(in, line)) {
+    line = trim_cr(line);
+    if (line.compare(0, 12, "Need to get ") == 0 && line.find("of archives") != std::string::npos)
+      return line;
+  }
+  return {};
 }
 
 static std::string join_names(const std::vector<std::string>& names)
@@ -899,11 +966,13 @@ std::string describe_remaining(const SimulateResult& result)
   if (!result.held.empty())
     add("These packages are held: " + join_names(result.held) + ".");
   add(removal_sentence(result));
+  if (!result.unclassified.empty())
+    add("Some kept-back packages were not classified: " + join_names(result.unclassified) + ".");
   if (!result.kept_back.empty())
     add("This tool will not install updates that need extra packages: " + join_names(result.kept_back) +
         ".");
   else if (result.phased.empty() && result.held.empty() && result.kept_removals.empty() &&
-           result.not_upgraded_count > 0)
+           result.unclassified.empty() && result.not_upgraded_count > 0)
     add("This tool will not install updates that need extra packages.");
   return out;
 }
@@ -911,19 +980,22 @@ std::string describe_remaining(const SimulateResult& result)
 static bool has_remaining(const SimulateResult& result)
 {
   return !result.kept_back.empty() || !result.phased.empty() || !result.held.empty() ||
-         !result.kept_removals.empty() || result.not_upgraded_count > 0;
+         !result.kept_removals.empty() || !result.unclassified.empty() || result.not_upgraded_count > 0;
 }
 
 std::string kept_headline(const SimulateResult& result)
 {
   const bool only_phased = !result.phased.empty() && result.kept_back.empty() && result.held.empty() &&
-                           result.kept_removals.empty();
+                           result.kept_removals.empty() && result.unclassified.empty();
   const bool only_held = !result.held.empty() && result.kept_back.empty() && result.phased.empty() &&
-                         result.kept_removals.empty();
+                         result.kept_removals.empty() && result.unclassified.empty();
   const bool only_removal = !result.kept_removals.empty() && result.kept_back.empty() &&
-                            result.phased.empty() && result.held.empty();
+                            result.phased.empty() && result.held.empty() && result.unclassified.empty();
+  const bool only_unclassified = !result.unclassified.empty() && result.kept_back.empty() &&
+                                 result.phased.empty() && result.held.empty() &&
+                                 result.kept_removals.empty();
   const std::string detail = describe_remaining(result);
-  if (only_phased || only_held || only_removal)
+  if (only_phased || only_held || only_removal || only_unclassified)
     return detail;
   if (detail.empty())
     return "Some updates were kept back.";
@@ -993,6 +1065,8 @@ JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_
     out.packages = PackageListAction::Show;
     out.install_enabled = true;
     std::string status = "Updates are available.";
+    if (!result.download_need.empty())
+      status += " " + result.download_need;
     const std::string kept = describe_remaining(result);
     if (!kept.empty())
       status += " " + kept;

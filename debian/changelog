@@ -1,3 +1,23 @@
+lcos-updates (0.9-6) unstable; urgency=medium
+
+  * Cancelling a check while kept-back packages are classified says the
+    check was cancelled. A probe that does not succeed is not described as
+    needing extra packages.
+  * A maintainer-script failure keeps dpkg's detail line. An unpack or
+    configure failure says the upgrade stopped with a package unfinished.
+  * Kept-back classification has a short budget inside the check deadline,
+    shows "Checking kept-back packages…", and does not call unprobed names
+    extra packages.
+  * Apt update and install pass quiet=0 so download percents reach the
+    window. The last progress line is shown when apt exits.
+  * A check shows how much will be downloaded.
+  * Configuring names the package. After dpkg goes idle the note says
+    downloading.
+  * A hidden install notifies at 10 minutes without progress, and again
+    when shutdown is no longer blocked.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 14:30:00 +0000
+
 lcos-updates (0.9-5) unstable; urgency=medium
 
   * Closing after an install that already finished reports that result and

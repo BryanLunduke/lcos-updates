@@ -112,11 +112,18 @@ int main(int argc, char** argv)
   }
 
   {
-    static_assert(kCheckTimeoutSec >= kUpdateTimeoutSec + kSimulateTimeoutSec,
-                  "GUI check budget must cover helper update + simulate");
-    static_assert(kInstallTimeoutSec >=
-                      kUpdateTimeoutSec + kSimulateTimeoutSec + kUpgradeTimeoutSec,
-                  "GUI install budget must cover helper update + resimulate + upgrade");
+    static_assert(kCheckTimeoutSec >= kUpdateTimeoutSec + kSimulateTimeoutSec + kKeptClassifySec +
+                                     kDownloadSizeHardSec,
+                  "GUI check budget must cover update, simulate, kept-back probes, and size");
+    static_assert(kInstallTimeoutSec >= kUpdateTimeoutSec + kSimulateTimeoutSec + kKeptClassifySec +
+                                        kUpgradeTimeoutSec,
+                  "GUI install budget must cover update, probes, resimulate, and upgrade");
+    expect(kCheckTimeoutSec >= kUpdateTimeoutSec + kSimulateTimeoutSec + kKeptClassifySec +
+                                   kDownloadSizeHardSec,
+           "check deadline includes kept-back classification and the download size");
+    expect(kInstallTimeoutSec >=
+               kUpdateTimeoutSec + kSimulateTimeoutSec + kKeptClassifySec + kUpgradeTimeoutSec,
+           "install deadline includes kept-back classification");
     const char* check_timeout =
         "Timed out waiting for the update check. Check your network and try again.";
     const char* install_timeout = "Timed out while installing updates.";
@@ -660,6 +667,177 @@ int main(int argc, char** argv)
     expect(r.kept_back.size() == 1 && r.not_upgraded_count == 1, "a long log still parses kept-back");
     expect(!r.conffiles_kept.empty() && r.conffiles_kept[0] == "/etc/ssh/sshd_config",
            "a long log still parses the conffile");
+  }
+
+  {
+    /* Real apt 2.8.3 output with -o quiet=0. Percent lines use a carriage
+     * return. Every parser path has to keep working on that text. */
+    const std::string kept = read_file(dir + "/apt-quiet0-kept.bin");
+    const SimulateResult r = parse_apt_simulate(kept);
+    expect(r.status == SimulateResult::KeptBack, "quiet=0 kept-back is not up to date");
+    expect(r.packages.empty(), "quiet=0 percent lines are not Inst packages");
+    expect(r.kept_back.size() == 2, "quiet=0 kept-back names both packages");
+    expect(r.not_upgraded_count == 2, "quiet=0 kept-back summary count");
+    if (r.kept_back.size() >= 2) {
+      expect(r.kept_back[0] == "heldpkg", "quiet=0 kept-back pkg0");
+      expect(r.kept_back[1] == "lcos-fixture-pkg", "quiet=0 kept-back pkg1");
+    }
+    bool percent_name = false;
+    for (const auto& name : r.kept_back) {
+      if (name.find('%') != std::string::npos)
+        percent_name = true;
+    }
+    expect(!percent_name, "quiet=0 percent lines are not package names");
+    expect(kept.find('\r') != std::string::npos, "quiet=0 kept-back fixture has carriage returns");
+
+    SimulateResult held = r;
+    apply_held_packages(held, "Package: heldpkg\nStatus: hold ok installed\nArchitecture: all\n");
+    expect(held.held.size() == 1 && held.held[0] == "heldpkg",
+           "quiet=0 kept-back still moves a held package");
+    expect(held.kept_back.size() == 1 && held.kept_back[0] == "lcos-fixture-pkg",
+           "quiet=0 a package that is not held stays kept back");
+
+    const std::string::size_type plan = kept.find("The following packages have been kept back:");
+    expect(plan != std::string::npos, "quiet=0 kept-back fixture has the apt heading");
+    const std::string phased_text =
+        kept.substr(0, plan) +
+        "The following upgrades have been deferred due to phasing:\n"
+        "  shim-signed grub-efi-amd64-signed\n"
+        "0 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.\n";
+    const SimulateResult phased = parse_apt_simulate(phased_text);
+    expect(phased.phased.size() == 2 && phased.phased[0] == "shim-signed" &&
+               phased.phased[1] == "grub-efi-amd64-signed",
+           "quiet=0 percent lines do not disturb a phased list");
+    expect(phased.kept_back.empty() && phased.packages.empty(),
+           "quiet=0 phasing is not extra packages or Inst lines");
+  }
+
+  {
+    const std::string text = read_file(dir + "/apt-quiet0-removal.bin");
+    std::vector<std::string> removed;
+    std::vector<std::string> newly;
+    parse_removal_plan(text, removed, newly);
+    expect(removed.size() == 1 && removed[0] == "oldplug",
+           "quiet=0 removal plan names the removed package");
+    expect(newly.size() == 1 && newly[0] == "newplug",
+           "quiet=0 removal plan names the new package");
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.packages.size() == 1 && r.packages[0].name == "newplug",
+           "quiet=0 Inst line survives the percent lines");
+    expect(r.upgraded_count == 0 && r.not_upgraded_count == 2,
+           "quiet=0 removal summary counts");
+    expect(!r.reboot_required, "quiet=0 removal text does not invent a reboot");
+  }
+
+  {
+    const std::string text = read_file(dir + "/apt-quiet0-print-uris.bin");
+    expect(parse_download_need(text) == "Need to get 0 B/478 B of archives.",
+           "quiet=0 print-uris keeps apt's download size");
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.upgraded_count == 1, "quiet=0 print-uris still has the summary");
+    expect(r.status != SimulateResult::Error, "quiet=0 print-uris is not an error");
+    SimulateResult shown;
+    shown.status = SimulateResult::Upgrades;
+    shown.packages.push_back(PackageUpgrade{"lcos-fixture-pkg", "1.0", "2.0"});
+    shown.download_need = parse_download_need(text);
+    const JobOutcome outcome = outcome_check(shown, 0, true);
+    expect(outcome.status.find("Updates are available.") != std::string::npos,
+           "a sized check still says updates are available");
+    expect(outcome.status.find("Need to get 0 B/478 B of archives.") != std::string::npos,
+           "a sized check shows the download size");
+    const std::string proto = format_protocol(shown);
+    expect(proto.find("NEED Need to get 0 B/478 B of archives.\n") != std::string::npos,
+           "NEED protocol line");
+    const SimulateResult back = parse_protocol(proto);
+    expect(back.download_need == "Need to get 0 B/478 B of archives.", "NEED round trip");
+  }
+
+  {
+    const std::string text = read_file(dir + "/apt-quiet0-update.bin");
+    const UpdateFetch fetch = classify_apt_update(text);
+    expect(fetch.kind == UpdateFetchKind::Partial, "quiet=0 update with a Get and an Err is partial");
+    expect(fetch.detail.find("Err:1 ") != std::string::npos, "quiet=0 update keeps the Err line");
+    expect(fetch.detail.find("NO_PUBKEY 871920D1991BC93C") != std::string::npos,
+           "quiet=0 update keeps NO_PUBKEY");
+    expect(fetch.detail.find("W: GPG error:") != std::string::npos, "quiet=0 update keeps the W: line");
+    expect(fetch.detail.find("E: The repository ") != std::string::npos,
+           "quiet=0 update keeps the E: line");
+    const std::string warning = apt_index_warning(text);
+    expect(warning.find("NO_PUBKEY 871920D1991BC93C") != std::string::npos,
+           "quiet=0 partial warning keeps NO_PUBKEY");
+    expect(warning.find("is not signed") != std::string::npos,
+           "quiet=0 partial warning keeps the E: line");
+    expect(friendly_job_error(fetch.detail, JobKind::Check).find("NO_PUBKEY 871920D1991BC93C") !=
+               std::string::npos,
+           "quiet=0 Err/W/E lines stay in the check message");
+  }
+
+  {
+    const std::string text = read_file(dir + "/apt-quiet0-install.bin");
+    const SimulateResult r = parse_apt_simulate(text);
+    expect(r.status == SimulateResult::Error, "quiet=0 install failure is an error");
+    expect(r.error_msg.find("E: Sub-process /usr/bin/dpkg returned an error code (1)") !=
+               std::string::npos,
+           "quiet=0 install keeps apt's E: line");
+    expect(r.upgraded_count == 1, "quiet=0 install keeps the summary");
+    expect(r.packages.empty(), "quiet=0 Setting up is not an Inst line");
+    expect(!r.reboot_required, "quiet=0 install failure does not invent a reboot");
+    expect(parse_download_need(text) == "Need to get 0 B/574 B of archives.",
+           "quiet=0 install output still yields a download size");
+    expect(friendly_job_error(r.error_msg, JobKind::Install).find("returned an error code (1)") !=
+               std::string::npos,
+           "quiet=0 dpkg E: line is not rewritten");
+    expect(friendly_job_error("dpkg: error processing package lcos-simple (--configure):",
+                              JobKind::Install)
+                   .find("dpkg: error processing package lcos-simple") != std::string::npos,
+           "a dpkg header stays dpkg's own line");
+    const std::string crlf =
+        "dpkg: error processing package lcos-simple (--configure):\r\n"
+        " installed lcos-simple package post-installation script subprocess returned error exit "
+        "status 1\r\n"
+        "Errors were encountered while processing:\r\n"
+        " lcos-simple\r\n"
+        "E: Sub-process /usr/bin/dpkg returned an error code (1)\r\n";
+    CaptureBuf cap;
+    capture_append(cap, crlf.data(), crlf.size());
+    const std::string stored = capture_text(cap);
+    expect(stored.find("\r") == std::string::npos, "a CRLF capture stores line breaks as newlines");
+    expect(stored.find("Errors were encountered while processing:\n lcos-simple\n") != std::string::npos,
+           "CRLF does not insert a blank line before the package name");
+    expect(stored.find("E: Sub-process /usr/bin/dpkg returned an error code (1)") != std::string::npos,
+           "CRLF capture keeps the E: line");
+  }
+
+  {
+    const std::string burst =
+        "12% [Working]\r"
+        "47% [1 linux-image-amd64 40 MB/80 MB 50%]\r"
+        "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+    const SimulateResult r = parse_apt_simulate(burst);
+    expect(r.status == SimulateResult::UpToDate, "carriage-return percents still parse the summary");
+    expect(r.packages.empty() && r.not_upgraded_count == 0,
+           "carriage-return percents are not packages");
+  }
+
+  {
+    SimulateResult unseen;
+    unseen.status = SimulateResult::KeptBack;
+    unseen.unclassified.push_back("pkg01");
+    unseen.unclassified.push_back("pkg40");
+    const std::string sentence = describe_remaining(unseen);
+    expect(sentence.find("Some kept-back packages were not classified: pkg01, pkg40.") !=
+               std::string::npos,
+           "unclassified kept-back packages are named as unclassified");
+    expect(sentence.find("need extra packages") == std::string::npos,
+           "unclassified packages are not extra packages");
+    const JobOutcome outcome = outcome_check(unseen, 0, false);
+    expect(outcome.status.find("not classified: pkg01, pkg40.") != std::string::npos,
+           "a check says which kept-back packages were not classified");
+    expect(!outcome.install_enabled, "unclassified kept-back packages are not an install");
+    const std::string proto = format_protocol(unseen);
+    expect(proto.find("UNCLASSIFIED pkg01\n") != std::string::npos, "UNCLASSIFIED protocol line");
+    const SimulateResult back = parse_protocol(proto);
+    expect(back.unclassified.size() == 2 && back.kept_back.empty(), "UNCLASSIFIED round trip");
   }
 
   if (g_fails != 0) {

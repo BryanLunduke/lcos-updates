@@ -386,6 +386,38 @@ case "$mode" in
     echo HELPER_READY >&2
     printf 'STATUS kept-back\nREMOVE foo oldplug\n'
     ;;
+  cancel-then-result)
+    echo HELPER_READY >&2
+    echo 'PHASE simulate' >&2
+    sleep 0.8
+    printf 'STATUS upgrades\nCOUNT 1\nPKG foo 1 2\nKEPT bar\n'
+    ;;
+  configure-named)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      echo DPKG_STARTED >&2
+      echo 'PROGRESS Setting up linux-image-amd64 (6.1.0) ...' >&2
+      wait_sec 0.6
+      echo DPKG_IDLE >&2
+      echo 'PHASE download' >&2
+      echo 'PROGRESS Get:1 http://deb.example/linux-image-amd64.deb' >&2
+      sleep 1.2
+      printf 'STATUS success\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
+    fi
+    ;;
+  percent)
+    echo HELPER_READY >&2
+    echo 'PHASE refresh' >&2
+    echo 'PROGRESS 12% [1 linux-image-amd64 4.2 MB/80 MB 5%]' >&2
+    sleep 0.8
+    printf 'STATUS up-to-date\n'
+    ;;
+  sized)
+    echo HELPER_READY >&2
+    printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\nNEED Need to get 0 B/478 B of archives.\n'
+    ;;
   *)
     echo HELPER_READY >&2
     printf 'STATUS up-to-date\n'
@@ -1209,7 +1241,7 @@ int main()
     set_timeout_ms(8000);
     setenv("LCOS_UPDATES_FAKE_INHIBIT", "1", 1);
     setenv("LCOS_UPDATES_STALL_NOTICE_SEC", "1", 1);
-    setenv("LCOS_UPDATES_STALL_INHIBIT_SEC", "2", 1);
+    setenv("LCOS_UPDATES_STALL_INHIBIT_SEC", "4", 1);
     UpdatesWindow* window = new_window();
     window->test_click_check();
     const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
@@ -1226,14 +1258,24 @@ int main()
     pump_for(40);
     expect(window->background_for_test(), "close during configure keeps the install");
     expect(alive(pid), "the hidden install is still running");
-    const bool noted = pump_until(5000, [&]() {
-      return contains(window->notification_text_for_test(), "Still installing") &&
-             contains(window->notification_text_for_test(), "Shutdown");
+    bool saw_notice = false;
+    bool saw_inhibit = false;
+    const bool noted = pump_until(8000, [&]() {
+      const int n = window->stall_notifications_for_test();
+      const std::string text(window->notification_text_for_test());
+      if (n == 1 && text.find("don't turn off the computer") != std::string::npos &&
+          text.find("Shutdown") == std::string::npos &&
+          window->inhibit_mode_for_test() == "block")
+        saw_notice = true;
+      if (n >= 2 && text.find("Shutdown") != std::string::npos)
+        saw_inhibit = true;
+      return saw_notice && saw_inhibit;
     });
-    expect(noted, "a hidden stall sends one notification");
-    expect(window->stall_notifications_for_test() == 1, "the stall notification is sent once");
+    expect(noted && saw_notice, "a hidden install notifies at 10 minutes without mentioning shutdown");
+    expect(saw_inhibit, "a hidden install notifies again when shutdown is no longer blocked");
+    expect(window->stall_notifications_for_test() == 2, "the stall notices are the 10-minute and the 30-minute");
     pump_for(1500);
-    expect(window->stall_notifications_for_test() == 1, "the stall notification is not repeated");
+    expect(window->stall_notifications_for_test() == 2, "the stall notices are not repeated");
     expect(alive(pid), "the stall notification does not stop the helper");
     {
       std::ofstream out(release);
@@ -1308,6 +1350,82 @@ int main()
            "a removal is not described as extra packages");
     expect(window->check_sensitive_for_test(), "Check is enabled for a removal keep-back");
     expect(!window->install_sensitive_for_test(), "a removal-only result does not offer Install");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("cancel-then-result");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool ready = pump_until(2000, [&]() { return window->progress_visible_for_test(); });
+    expect(ready, "cancel-during-check is past authentication");
+    window->test_click_cancel();
+    const bool cancelled = pump_until(3000, [&]() {
+      return contains(window->status_text_for_test(), "Update check was cancelled");
+    });
+    expect(cancelled, "cancelling a check overrides a later success protocol");
+    expect(!contains(window->status_text_for_test(), "Updates are available"),
+           "a cancelled check is not reported as finished");
+    expect(!window->install_sensitive_for_test(), "a cancelled check does not offer Install");
+    expect(window->check_sensitive_for_test(), "Check is enabled after a cancelled check");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(release.c_str());
+    unlink(pidfile.c_str());
+    set_mode("configure-named");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() { return window->install_sensitive_for_test(); });
+    expect(listed, "named configure listed a package");
+    window->test_click_install();
+    const bool named = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Configuring linux-image-amd64");
+    });
+    expect(named, "configuring names the package apt is setting up");
+    const bool downloading = pump_until(3000, [&]() {
+      return contains(window->commit_note_for_test(), "Downloading") &&
+             !contains(window->commit_note_for_test(), "Configuring");
+    });
+    expect(downloading, "after dpkg goes idle the note says downloading");
+    expect(contains(window->commit_note_for_test(), "This install will finish on its own."),
+           "the idle note still says the install finishes on its own");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("percent");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool shown = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "12%") &&
+             contains(window->status_text_for_test(), "linux-image-amd64") &&
+             window->progress_fraction_for_test() > 0.11 &&
+             window->progress_fraction_for_test() < 0.13;
+    });
+    expect(shown, "a download percent reaches the status and the bar");
+    expect(window->progress_text_for_test() == "12%", "the bar shows the leading percent");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("sized");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool sized = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Updates are available.") &&
+             contains(window->status_text_for_test(), "Need to get 0 B/478 B of archives.");
+    });
+    expect(sized, "a check shows how much will be downloaded");
+    expect(window->install_sensitive_for_test(), "a sized check still offers Install");
     destroy_window(window, pidfile);
   }
 

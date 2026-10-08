@@ -58,6 +58,8 @@ public:
   bool closing_for_test() const { return m_closing; }
   Glib::ustring inhibit_mode_for_test() const { return m_inhibit_mode; }
   int stall_notifications_for_test() const { return m_stall_notifications; }
+  double progress_fraction_for_test() const { return m_progress.get_fraction(); }
+  Glib::ustring progress_text_for_test() const { return m_progress.get_text(); }
   void test_keep_open();
   bool warning_visible_for_test() const { return m_warning.get_visible(); }
   Glib::ustring warning_text_for_test() const { return m_warning.get_text(); }
@@ -201,9 +203,11 @@ private:
   bool m_closing = false;
   bool m_stopping = false;
   bool m_inhibit_relaxed = false;
-  bool m_stall_notified = false;
+  bool m_stall_notice_sent = false;
+  bool m_stall_inhibit_sent = false;
   bool m_delay_inhibit = false;
   int m_stall_notifications = 0;
+  int m_progress_percent = -1;
   std::string m_inhibit_mode;
   gint64 m_phase_mark_us = 0;
   gint64 m_progress_mark_us = 0;

@@ -9,6 +9,7 @@
 #include "timeouts.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <csignal>
 #include <fcntl.h>
 #include <gio/gio.h>
@@ -179,6 +180,43 @@ InhibitHold take_inhibitors(Gtk::Application* app, Gtk::Window& window, const Gl
     }
   }
   return hold;
+}
+
+int leading_percent(const Glib::ustring& line)
+{
+  std::size_t i = 0;
+  while (i < line.size() && line[i] == ' ')
+    ++i;
+  if (i >= line.size() || !g_ascii_isdigit(line[i]))
+    return -1;
+  int value = 0;
+  while (i < line.size() && g_ascii_isdigit(line[i])) {
+    value = value * 10 + (line[i] - '0');
+    if (value > 100)
+      return -1;
+    ++i;
+  }
+  if (i >= line.size() || line[i] != '%')
+    return -1;
+  return value;
+}
+
+Glib::ustring package_being_configured(const Glib::ustring& line)
+{
+  const char* prefixes[] = {"Setting up ", "Unpacking "};
+  for (const char* prefix : prefixes) {
+    const std::size_t n = std::strlen(prefix);
+    if (line.compare(0, n, prefix) != 0)
+      continue;
+    Glib::ustring rest = line.substr(n);
+    const auto end = rest.find_first_of(" (");
+    if (end != Glib::ustring::npos)
+      rest = rest.substr(0, end);
+    while (!rest.empty() && (rest[rest.size() - 1] == '.' || rest[rest.size() - 1] == ' '))
+      rest.erase(rest.size() - 1);
+    return rest;
+  }
+  return {};
 }
 
 std::string authentication_message(const std::string& err, int exit_code)
@@ -431,7 +469,14 @@ bool UpdatesWindow::on_pulse_tick()
 {
   if (m_job == Job::None)
     return false;
-  m_progress.pulse();
+  if (m_progress_percent >= 0) {
+    m_progress.set_show_text(true);
+    m_progress.set_text(std::to_string(m_progress_percent) + "%");
+    m_progress.set_fraction(static_cast<double>(m_progress_percent) / 100.0);
+  } else {
+    m_progress.set_show_text(false);
+    m_progress.pulse();
+  }
   return true;
 }
 
@@ -600,8 +645,10 @@ void UpdatesWindow::finish_job()
   m_phase_mark_us = 0;
   m_progress_mark_us = 0;
   m_inhibit_relaxed = false;
-  m_stall_notified = false;
+  m_stall_notice_sent = false;
+  m_stall_inhibit_sent = false;
   m_delay_inhibit = false;
+  m_progress_percent = -1;
   m_commit_note.hide();
   release_inhibitors();
   update_logout_warning();
@@ -641,9 +688,11 @@ void UpdatesWindow::start_helper(const std::vector<std::string>& helper_args, Jo
   m_phase_mark_us = 0;
   m_progress_mark_us = 0;
   m_inhibit_relaxed = false;
-  m_stall_notified = false;
+  m_stall_notice_sent = false;
+  m_stall_inhibit_sent = false;
   m_delay_inhibit = false;
   m_stall_notifications = 0;
+  m_progress_percent = -1;
   m_commit_note.hide();
   m_job = job;
 
@@ -760,6 +809,14 @@ void UpdatesWindow::append_stderr(const char* data, std::size_t n)
       m_progress_line = line.substr(9);
       if (m_progress_line.size() > 240)
         m_progress_line.resize(240);
+      m_progress_percent = leading_percent(m_progress_line);
+      if (m_progress_percent >= 0 && m_progress.get_visible()) {
+        m_progress.set_show_text(true);
+        m_progress.set_text(std::to_string(m_progress_percent) + "%");
+        m_progress.set_fraction(static_cast<double>(m_progress_percent) / 100.0);
+      } else if (m_progress_percent < 0) {
+        m_progress.set_show_text(false);
+      }
     }
     if (m_stderr_first_error.empty() && line.compare(0, 2, "E:") == 0) {
       if (line.size() > 2048)
@@ -878,6 +935,9 @@ void UpdatesWindow::maybe_note_dpkg()
     return;
   if (m_install_committed)
     m_cancel.set_sensitive(false);
+  /* The configure clock stops when dpkg goes idle. The next stretch is the
+   * download of the following package, timed from now. */
+  m_phase_mark_us = g_get_monotonic_time();
   arm_job_timeout();
   apply_phase_status();
   if (m_progress_line.empty() && m_phase.empty())
@@ -972,6 +1032,7 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
   const bool timed_out = m_stop_was_timeout;
   const bool helper_ready = m_helper_ready;
   const bool check_again = m_check_after_job;
+  const bool user_stopped = m_stopping;
   m_check_after_job = false;
   m_stdout = capture_text(m_out_cap);
   const std::string out = m_stdout;
@@ -997,6 +1058,19 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
       parsed.error_msg = auth;
     else if (!err.empty())
       parsed.error_msg = err;
+  }
+
+  /* Cancel wins over a success protocol that arrived after the pipe closed.
+   * That includes a check that finished classifying kept-back packages. */
+  if (user_stopped && !timed_out && (job == Job::Check || job == Job::Install)) {
+    const std::string want =
+        job == Job::Install ? "Install was cancelled" : "Update check was cancelled";
+    const bool said = parsed.status == SimulateResult::Error &&
+                      parsed.error_msg.find("cancelled") != std::string::npos;
+    if (!said) {
+      parsed.status = SimulateResult::Error;
+      parsed.error_msg = want;
+    }
   }
 
   if (job == Job::Check)
@@ -1242,17 +1316,26 @@ void UpdatesWindow::refresh_commit_note()
   if (!m_install_committed)
     return;
   Glib::ustring note = "This install will finish on its own.";
-  if (m_phase_mark_us > 0) {
-    const int sec = static_cast<int>((g_get_monotonic_time() - m_phase_mark_us) / G_USEC_PER_SEC);
-    if (sec >= 1) {
-      if (sec < 60)
-        note += " Configuring packages for " + std::to_string(sec) + (sec == 1 ? " second." : " seconds.");
-      else {
-        const int minutes = sec / 60;
-        note += " Configuring packages for " + std::to_string(minutes) +
-                (minutes == 1 ? " minute." : " minutes.");
-      }
+  const int sec = m_phase_mark_us > 0
+                      ? static_cast<int>((g_get_monotonic_time() - m_phase_mark_us) / G_USEC_PER_SEC)
+                      : 0;
+  Glib::ustring duration;
+  if (sec >= 1) {
+    if (sec < 60)
+      duration = " for " + std::to_string(sec) + (sec == 1 ? " second" : " seconds");
+    else {
+      const int minutes = sec / 60;
+      duration = " for " + std::to_string(minutes) + (minutes == 1 ? " minute" : " minutes");
     }
+  }
+  if (m_dpkg_started) {
+    const Glib::ustring pkg = package_being_configured(m_progress_line);
+    if (pkg.empty())
+      note += " Configuring packages" + duration + ".";
+    else
+      note += " Configuring " + pkg + duration + ".";
+  } else {
+    note += " Downloading updates" + duration + ".";
   }
   m_commit_note.set_text(note);
   m_commit_note.show();
@@ -1268,9 +1351,13 @@ void UpdatesWindow::apply_phase_status()
       return;
   }
   Glib::ustring text;
-  if (m_dpkg_started)
-    text = "Configuring packages…";
-  else if (!m_progress_line.empty())
+  if (m_dpkg_started) {
+    const Glib::ustring pkg = package_being_configured(m_progress_line);
+    if (pkg.empty())
+      text = "Configuring packages…";
+    else
+      text = "Configuring " + pkg + "…";
+  } else if (!m_progress_line.empty())
     text = m_progress_line;
   else if (m_phase == "refresh")
     text = "Refreshing package lists…";
@@ -1341,9 +1428,6 @@ void UpdatesWindow::relax_logind_inhibitor()
 
 void UpdatesWindow::send_stall_notification(const Glib::ustring& body)
 {
-  if (m_stall_notified || !m_inhibit_relaxed)
-    return;
-  m_stall_notified = true;
   ++m_stall_notifications;
   m_notification = body;
   if (auto app = get_application()) {
@@ -1380,8 +1464,21 @@ bool UpdatesWindow::on_phase_tick()
     }
     m_status.set_text(text);
     refresh_commit_note();
-    if (!get_visible() || m_background)
-      send_stall_notification(text);
+    if (!get_visible() || m_background) {
+      /* 10 minutes with no progress: tell them the install is still running.
+       * The inhibitor is still a block. The 30-minute notice is a second one,
+       * sent when shutdown stops being blocked. */
+      if (!m_stall_notice_sent) {
+        m_stall_notice_sent = true;
+        Glib::ustring notice = "Still installing — no progress for " + std::to_string(minutes) +
+                               " minutes. The install is still running; don't turn off the computer.";
+        send_stall_notification(notice);
+      }
+      if (m_inhibit_relaxed && !m_stall_inhibit_sent) {
+        m_stall_inhibit_sent = true;
+        send_stall_notification(text);
+      }
+    }
     return true;
   }
   apply_phase_status();

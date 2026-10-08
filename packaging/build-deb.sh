@@ -1,10 +1,18 @@
 #!/bin/sh
-# Build lcos-updates_0.9-5_amd64.deb into packaging/debs/ (repo-local).
+# Build lcos-updates_0.9-6_amd64.deb into packaging/debs/ (repo-local).
 # Does NOT seed lcos-live-06 or lcos-live-07.
 set -eu
 
+# meson test includes the GTK window suite. With no display, re-exec once
+# under Xvfb so the package build is headless. xvfb and xauth are
+# Build-Depends only; they are not installed with the package.
+if [ -z "${DISPLAY:-}" ] && [ -z "${LCOS_UPDATES_UNDER_XVFB:-}" ]; then
+  export LCOS_UPDATES_UNDER_XVFB=1
+  exec xvfb-run -a "$0" "$@"
+fi
+
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="0.9-5"
+VERSION="0.9-6"
 PKGNAME="lcos-updates_${VERSION}_amd64"
 BUILD="$ROOT/build"
 DEST="$ROOT/packaging/src/lcos-updates"
