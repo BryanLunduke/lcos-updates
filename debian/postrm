@@ -1,0 +1,24 @@
+#!/bin/sh
+# Remove the helper's runtime state on purge only.
+# save_check_snap() creates /var/lib/lcos-updates at runtime. remove,
+# upgrade, and failed-upgrade leave it alone so the saved check survives
+# upgrades, including the upgrade away from 0.9-7 (that package has no
+# postrm, and this one must not delete the directory when it is the old
+# version).
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /var/lib/lcos-updates
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
