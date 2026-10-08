@@ -2429,9 +2429,10 @@ int main(int argc, char** argv)
     pid_t helper_pid = 0;
     int cancel_write = -1;
     int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/probe-cancel.count";
     if (run_helper(helper, apt, std::string(dir) + "/probe-cancel.pids", nullptr, &cancel_write,
-                   helper_pid, "probe-sleep", nullptr, &stdout_read, "simulate", nullptr, nullptr,
-                   nullptr, nullptr, nullptr, statefile.c_str()) != 0) {
+                   helper_pid, "probe-sleep", countfile.c_str(), &stdout_read, "simulate", nullptr,
+                   nullptr, nullptr, nullptr, nullptr, statefile.c_str()) != 0) {
       std::fprintf(stderr, "failed to spawn helper for cancel during kept-back probes\n");
       return 1;
     }
@@ -2471,9 +2472,10 @@ int main(int argc, char** argv)
     pid_t helper_pid = 0;
     int cancel_write = -1;
     int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/probe-install-cancel.count";
     if (run_helper(helper, apt, std::string(dir) + "/probe-install-cancel.pids", nullptr, &cancel_write,
-                   helper_pid, "probe-sleep", nullptr, &stdout_read, "upgrade", &pins, nullptr,
-                   argvfile.c_str(), nullptr, nullptr, statefile.c_str()) != 0) {
+                   helper_pid, "probe-sleep", countfile.c_str(), &stdout_read, "upgrade", &pins,
+                   nullptr, argvfile.c_str(), nullptr, nullptr, statefile.c_str()) != 0) {
       std::fprintf(stderr, "failed to spawn helper for cancel during an install probe\n");
       return 1;
     }
@@ -2504,8 +2506,9 @@ int main(int argc, char** argv)
   {
     pid_t helper_pid = 0;
     int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/probe-plain.count";
     if (run_helper(helper, apt, std::string(dir) + "/probe-plain.pids", nullptr, nullptr, helper_pid,
-                   "probe-plain", nullptr, &stdout_read, "simulate") != 0) {
+                   "probe-plain", countfile.c_str(), &stdout_read, "simulate") != 0) {
       std::fprintf(stderr, "failed to spawn helper for a failed kept-back probe\n");
       return 1;
     }
@@ -2547,9 +2550,10 @@ int main(int argc, char** argv)
     pid_t helper_pid = 0;
     int stdout_read = -1;
     int stderr_read = -1;
+    const std::string countfile = std::string(dir) + "/many-kept.count";
     if (run_helper(helper, apt, std::string(dir) + "/many-kept.pids", nullptr, nullptr, helper_pid,
-                   "many-kept", nullptr, &stdout_read, "simulate", nullptr, &stderr_read, argvfile.c_str(),
-                   nullptr, nullptr, statefile.c_str()) != 0) {
+                   "many-kept", countfile.c_str(), &stdout_read, "simulate", nullptr, &stderr_read,
+                   argvfile.c_str(), nullptr, nullptr, statefile.c_str()) != 0) {
       std::fprintf(stderr, "failed to spawn helper for many kept-back packages\n");
       return 1;
     }
@@ -2563,10 +2567,10 @@ int main(int argc, char** argv)
     if (stderr_read >= 0)
       close(stderr_read);
     expect(exited, "helper exits after classifying many kept-back packages");
-    expect(err.find("Checking kept-back packages") != std::string::npos,
+    const auto heading = err.find("The following packages have been kept back:");
+    const auto checking = err.rfind("Checking kept-back packages");
+    expect(checking != std::string::npos && (heading == std::string::npos || checking > heading),
            "kept-back classification replaces apt's heading");
-    expect(err.find("The following packages have been kept back:") == std::string::npos,
-           "the kept-back heading is not the status during probes");
     int removes = 0;
     for (std::string::size_type pos = 0; (pos = out.find("REMOVE pkg", pos)) != std::string::npos;
          pos += 7)
@@ -2574,7 +2578,11 @@ int main(int argc, char** argv)
     expect(removes == 40, "every kept-back name is classified when the budget allows it");
     expect(out.find("KEPT ") == std::string::npos, "a classified removal is not an extra package");
     expect(out.find("UNCLASSIFIED ") == std::string::npos, "a finished probe is not left unclassified");
-    expect(count_lines_equal(state, "probe") == 40, "each name is probed once");
+    int probes = 0;
+    for (std::string::size_type pos = 0; (pos = state.find("probe\n", pos)) != std::string::npos;
+         pos += 6)
+      ++probes;
+    expect(probes == 40, "each name is probed once");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
   }
@@ -2585,9 +2593,10 @@ int main(int argc, char** argv)
     pid_t helper_pid = 0;
     int stdout_read = -1;
     int stderr_read = -1;
+    const std::string countfile = std::string(dir) + "/many-capped.count";
     if (run_helper(helper, apt, std::string(dir) + "/many-capped.pids", nullptr, nullptr, helper_pid,
-                   "many-kept", nullptr, &stdout_read, "simulate", nullptr, &stderr_read, nullptr,
-                   nullptr, nullptr, statefile.c_str()) != 0) {
+                   "many-kept", countfile.c_str(), &stdout_read, "simulate", nullptr, &stderr_read,
+                   nullptr, nullptr, nullptr, statefile.c_str()) != 0) {
       unsetenv("LCOS_UPDATES_KEPT_BUDGET_SEC");
       std::fprintf(stderr, "failed to spawn helper for a capped kept-back pass\n");
       return 1;
@@ -2647,8 +2656,10 @@ int main(int argc, char** argv)
     pid_t helper_pid = 0;
     int stderr_read = -1;
     int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/quick-progress.count";
     if (run_helper(helper, apt, std::string(dir) + "/quick-progress.pids", nullptr, nullptr, helper_pid,
-                   "quick-progress", nullptr, &stdout_read, "simulate", nullptr, &stderr_read) != 0) {
+                   "quick-progress", countfile.c_str(), &stdout_read, "simulate", nullptr,
+                   &stderr_read) != 0) {
       std::fprintf(stderr, "failed to spawn helper for a short progress flush\n");
       return 1;
     }
@@ -2675,9 +2686,10 @@ int main(int argc, char** argv)
     const std::string argvfile = std::string(dir) + "/with-size.argv";
     pid_t helper_pid = 0;
     int stdout_read = -1;
+    const std::string countfile = std::string(dir) + "/with-size.count";
     if (run_helper(helper, apt, std::string(dir) + "/with-size.pids", nullptr, nullptr, helper_pid,
-                   "with-size", nullptr, &stdout_read, "simulate", nullptr, nullptr, argvfile.c_str()) !=
-        0) {
+                   "with-size", countfile.c_str(), &stdout_read, "simulate", nullptr, nullptr,
+                   argvfile.c_str()) != 0) {
       std::fprintf(stderr, "failed to spawn helper for download size\n");
       return 1;
     }

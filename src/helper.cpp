@@ -382,7 +382,8 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     }
     return clean;
   };
-  auto publish_progress = [&](const std::string& clean) {
+  /* By value: flush passes progress_pending, and this clears that string. */
+  auto publish_progress = [&](std::string clean) {
     if (!forward_progress || clean.empty())
       return;
     struct timespec now {};
@@ -430,6 +431,9 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
       const std::string::size_type nl = progress_hold.find('\n');
       if (cr == std::string::npos && nl == std::string::npos)
         break;
+      /* npos is the largest size_t, so "cr < nl" is true when only a
+       * carriage return is present. That is the intended cut. */
+      /* npos is the largest size_t, so a lone carriage return still wins. */
       const std::string::size_type cut = cr < nl ? cr : nl;
       emit_progress(clean_progress(progress_hold.substr(0, cut)));
       progress_hold.erase(0, cut + 1);
