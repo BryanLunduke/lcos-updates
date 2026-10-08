@@ -1,3 +1,15 @@
+lcos-updates (0.9-10) unstable; urgency=medium
+
+  * Download progress reads apt's status-fd lines and never shows a
+    placeholder such as Working, Connecting, or Waiting as a package name.
+  * Packages whose version has an epoch show a download size.
+  * Version columns ellipsize, can be resized, and show the full version.
+  * The window no longer opens with the status sentence selected.
+  * Restart says the computer will restart and that open applications will
+    close. A failed restart shows the reason.
+
+ -- Phil <phil@brushpad.local>  Thu, 08 Oct 2026 23:20:00 +0000
+
 lcos-updates (0.9-8) unstable; urgency=medium
 
   * Purge removes /var/lib/lcos-updates, the helper's last-check state.

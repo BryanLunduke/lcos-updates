@@ -1542,6 +1542,8 @@ int main(int argc, char** argv)
     expect(argv_text.find("dist-upgrade") == std::string::npos, "install argv has no dist-upgrade");
     expect(argv_text.find("full-upgrade") == std::string::npos, "install argv has no full-upgrade");
     expect(argv_text.find("\nquiet=0\n") != std::string::npos, "update and install pass quiet=0");
+    expect(argv_text.find("\nAPT::Status-Fd=3\n") != std::string::npos,
+           "apt is given a machine-readable status fd");
     expect(count_lines_equal(argv_text, "quiet=0") == 2,
            "quiet=0 is on update and install, not the simulation");
     expect(argv_text.find("--print-uris") == std::string::npos,
@@ -2768,6 +2770,8 @@ int main(int argc, char** argv)
     expect(argv_text.find("full-upgrade") == std::string::npos, "the size request is not full-upgrade");
     expect(argv_text.find("\ninstall\n") == std::string::npos, "the size request does not install");
     expect(argv_text.find("\nquiet=0\n") != std::string::npos, "the check's apt update passes quiet=0");
+    expect(argv_text.find("\nAPT::Status-Fd=3\n") != std::string::npos,
+           "the check asks apt for machine-readable progress");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
   }
