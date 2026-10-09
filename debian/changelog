@@ -1,3 +1,9 @@
+lcos-updates (0.9.1-1) unstable; urgency=medium
+
+  * Version bump for LCOS 0.9.1 (testing and bug-fix release). No functional changes.
+
+ -- Phil <phil@brushpad.local>  Fri, 09 Oct 2026 15:54:51 +0000
+
 lcos-updates (0.9-10) unstable; urgency=medium
 
   * Download progress reads apt's status-fd lines and never shows a
