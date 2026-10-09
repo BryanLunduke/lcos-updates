@@ -14,7 +14,7 @@
 #include <vector>
 
 namespace lcos_updates {
-constexpr const char* kVersion = "0.9";
+constexpr const char* kVersion = "0.9.1";
 constexpr const char* kProductName = "LCOS Updates";
 constexpr const char* kAppId = "org.lunduke.LcosUpdates";
 /* Real hicolor artwork is not in the tree. The SVG only references a missing
