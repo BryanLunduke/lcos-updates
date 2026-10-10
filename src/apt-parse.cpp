@@ -6,6 +6,7 @@
 
 #include "apt-parse.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <sstream>
@@ -1037,6 +1038,10 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
     out << "NOT_UPGRADED " << result.not_upgraded_count << "\n";
   for (const auto& name : result.kept_back)
     out << "KEPT " << name << "\n";
+  for (const auto& pkg : result.new_packages) {
+    if (!pkg.name.empty() && !pkg.new_version.empty())
+      out << "NEW " << pkg.name << " " << pkg.new_version << "\n";
+  }
   for (const auto& name : result.unclassified)
     out << "UNCLASSIFIED " << name << "\n";
   if (!result.download_need.empty()) {
@@ -1181,6 +1186,12 @@ SimulateResult parse_protocol(const std::string& text)
       const std::string name = line.substr(5);
       if (!name.empty())
         result.kept_back.push_back(name);
+    } else if (line.compare(0, 4, "NEW ") == 0) {
+      std::istringstream ps(line.substr(4));
+      PackageUpgrade pkg;
+      pkg.old_version = "-";
+      if (ps >> pkg.name >> pkg.new_version && !pkg.name.empty() && !pkg.new_version.empty())
+        result.new_packages.push_back(pkg);
     } else if (line.compare(0, 13, "UNCLASSIFIED ") == 0) {
       const std::string name = line.substr(13);
       if (!name.empty())
@@ -1530,20 +1541,39 @@ static bool is_new_header(const std::string& line)
   return line.compare(0, header.size(), header) == 0;
 }
 
-void parse_removal_plan(const std::string& text, std::vector<std::string>& removed,
-                        std::vector<std::string>& newly)
+static bool is_downgrade_header(const std::string& line)
 {
-  removed.clear();
-  newly.clear();
+  const std::string header = "The following packages will be DOWNGRADED:";
+  return line.compare(0, header.size(), header) == 0;
+}
+
+static void note_summary_count(const std::string& line, const char* phrase, int& slot)
+{
+  const std::string::size_type pos = line.find(phrase);
+  if (pos == std::string::npos)
+    return;
+  const int value = integer_before(line, pos);
+  if (value >= 0)
+    slot = value;
+}
+
+InstallPlan parse_install_plan(const std::string& text)
+{
+  InstallPlan plan;
   std::istringstream in(normalize_breaks(text));
   std::string line;
-  enum class Section { None, Removed, New };
+  enum class Section { None, Removed, New, Down };
   Section section = Section::None;
   while (std::getline(in, line)) {
     line = trim_cr(line);
     if (section != Section::None) {
       if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
-        append_tokens(line, section == Section::Removed ? removed : newly);
+        if (section == Section::Removed)
+          append_tokens(line, plan.removed);
+        else if (section == Section::New)
+          append_tokens(line, plan.newly);
+        else
+          append_tokens(line, plan.downgraded);
         continue;
       }
       section = Section::None;
@@ -1552,16 +1582,38 @@ void parse_removal_plan(const std::string& text, std::vector<std::string>& remov
       section = Section::Removed;
       const std::string::size_type colon = line.find(':');
       if (colon != std::string::npos)
-        append_tokens(line.substr(colon + 1), removed);
+        append_tokens(line.substr(colon + 1), plan.removed);
       continue;
     }
     if (is_new_header(line)) {
       section = Section::New;
       const std::string::size_type colon = line.find(':');
       if (colon != std::string::npos)
-        append_tokens(line.substr(colon + 1), newly);
+        append_tokens(line.substr(colon + 1), plan.newly);
+      continue;
     }
+    if (is_downgrade_header(line)) {
+      section = Section::Down;
+      const std::string::size_type colon = line.find(':');
+      if (colon != std::string::npos)
+        append_tokens(line.substr(colon + 1), plan.downgraded);
+      continue;
+    }
+    note_summary_count(line, " to remove", plan.remove_count);
+    note_summary_count(line, " downgraded", plan.downgrade_count);
+    PackageUpgrade pkg;
+    if (parse_inst_line(line, pkg))
+      plan.inst.push_back(pkg);
   }
+  return plan;
+}
+
+void parse_removal_plan(const std::string& text, std::vector<std::string>& removed,
+                        std::vector<std::string>& newly)
+{
+  const InstallPlan plan = parse_install_plan(text);
+  removed = plan.removed;
+  newly = plan.newly;
 }
 
 std::string parse_download_need(const std::string& text)
@@ -1741,6 +1793,16 @@ JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_
     const std::string kept = describe_remaining(result);
     if (!kept.empty())
       status += " " + kept;
+    if (!result.new_packages.empty()) {
+      std::vector<std::string> names;
+      names.reserve(result.new_packages.size());
+      for (const auto& pkg : result.new_packages) {
+        if (!pkg.name.empty())
+          names.push_back(pkg.name);
+      }
+      std::sort(names.begin(), names.end());
+      status += " New packages will also be installed: " + join_names(names) + ".";
+    }
     out.status = with_warning_text(status, result.warning, JobKind::Check);
     return out;
   }

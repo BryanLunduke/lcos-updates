@@ -69,6 +69,15 @@ public:
   bool restart_default_is_cancel_for_test() const;
   int package_rows_for_test() const;
   Glib::ustring package_at_row_for_test(int row) const;
+  int new_package_rows_for_test() const;
+  Glib::ustring new_package_at_row_for_test(int row) const;
+  bool new_packages_visible_for_test() const;
+  void test_confirm_new_packages();
+  void test_cancel_new_packages();
+  bool new_dialog_up_for_test() const { return m_new_dialog != nullptr; }
+  Glib::ustring new_primary_for_test() const { return m_new_primary; }
+  Glib::ustring new_secondary_for_test() const { return m_new_secondary; }
+  bool new_default_is_cancel_for_test() const;
   Glib::ustring size_at_row_for_test(int row) const;
   Glib::ustring security_at_row_for_test(int row) const;
   bool columns_fit_for_test() const;
@@ -141,8 +150,11 @@ private:
   void apply_check_result(const SimulateResult& result, int wait_status);
   void apply_install_result(const SimulateResult& result, int wait_status);
   void show_packages(const std::vector<PackageUpgrade>& packages);
+  void show_new_packages(const std::vector<PackageUpgrade>& packages);
   void show_package_list();
   void hide_package_list();
+  void start_reviewed_install();
+  void confirm_new_packages();
   void on_cancel_clicked();
   void on_quit();
   /* True when the window should hide now. False when a close dialog is up. */
@@ -168,7 +180,8 @@ private:
   void note_helper_activity();
   void notify_and_leave(const Glib::ustring& body);
   void use_cancel_as_default();
-  void present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages);
+  void present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages,
+                       const std::vector<PackageUpgrade>& new_packages);
   bool on_phase_tick();
   void relax_logind_inhibitor();
   void send_stall_notification(const Glib::ustring& body);
@@ -213,8 +226,24 @@ private:
     Gtk::TreeModelColumn<Glib::ustring> security;
   };
 
+  class NewColumns : public Gtk::TreeModel::ColumnRecord {
+  public:
+    NewColumns()
+    {
+      add(package);
+      add(version);
+    }
+    Gtk::TreeModelColumn<Glib::ustring> package;
+    Gtk::TreeModelColumn<Glib::ustring> version;
+  };
+
   ModelColumns m_cols;
   Glib::RefPtr<Gtk::ListStore> m_store;
+  NewColumns m_new_cols;
+  Glib::RefPtr<Gtk::ListStore> m_new_store;
+  Gtk::Label m_new_heading;
+  Gtk::ScrolledWindow m_new_scroller;
+  Gtk::TreeView m_new_view;
 
   Job m_job = Job::None;
   Glib::Pid m_pid = 0;
@@ -268,6 +297,9 @@ private:
   Glib::Pid m_retry_pid = 0;
   Gtk::MessageDialog* m_close_dialog = nullptr;
   Gtk::MessageDialog* m_restart_dialog = nullptr;
+  Gtk::MessageDialog* m_new_dialog = nullptr;
+  Glib::ustring m_new_primary;
+  Glib::ustring m_new_secondary;
   bool m_ask_download = false;
   bool m_download_stop_hides = false;
   Glib::ustring m_close_primary;

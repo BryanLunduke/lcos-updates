@@ -33,6 +33,12 @@ struct SimulateResult {
   std::vector<PackageUpgrade> packages;
   /* Packages apt will not upgrade because they need extra packages. */
   std::vector<std::string> kept_back;
+  /* New packages a safe kept-back upgrade will install. Not upgrades. */
+  std::vector<PackageUpgrade> new_packages;
+  /* Kept-back names adopted because the probe only added packages. */
+  std::vector<std::string> adopted_kept;
+  /* Upgrades taken from those probes (the kept-back package and any others). */
+  std::vector<PackageUpgrade> kept_upgrades;
   /* Classic kept-back packages that would remove another package (Breaks). */
   struct KeptRemoval {
     std::string package;
@@ -187,6 +193,19 @@ SimulateResult parse_protocol(const std::string& text);
  * discard the other lines. */
 enum class JobKind { Check, Install };
 std::string friendly_job_error(const std::string& msg, JobKind kind);
+
+/* One apt-get -s install simulation: removals, new packages, downgrades, Inst lines. */
+struct InstallPlan {
+  std::vector<std::string> removed;
+  std::vector<std::string> newly;
+  std::vector<std::string> downgraded;
+  std::vector<PackageUpgrade> inst;
+  /* From the summary line. -1 when that phrase was absent. */
+  int remove_count = -1;
+  int downgrade_count = -1;
+};
+
+InstallPlan parse_install_plan(const std::string& text);
 
 /* REMOVED and NEW package sections from apt-get -s install. */
 void parse_removal_plan(const std::string& text, std::vector<std::string>& removed,

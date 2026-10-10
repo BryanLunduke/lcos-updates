@@ -524,6 +524,26 @@ int main(int argc, char** argv)
                        removed, newly);
     expect(removed.size() == 1 && removed[0] == "oldplug", "removal plan names the removed package");
     expect(newly.size() == 1 && newly[0] == "extralib", "removal plan names a new dependency");
+    const InstallPlan down = parse_install_plan(
+        "The following packages will be DOWNGRADED:\n"
+        "  libc6\n"
+        "Inst lcos-base [1.0] (2.0 Debian:12 [amd64])\n"
+        "1 upgraded, 0 newly installed, 1 downgraded, 0 to remove and 0 not upgraded.\n");
+    expect(down.downgraded.size() == 1 && down.downgraded[0] == "libc6",
+           "a downgrade section names the package");
+    expect(down.downgrade_count == 1 && down.remove_count == 0, "the summary counts a downgrade");
+    expect(down.inst.size() == 1 && down.inst[0].name == "lcos-base", "Inst lines stay on the plan");
+    const InstallPlan added = parse_install_plan(
+        "The following NEW packages will be installed:\n"
+        "  eject\n"
+        "Inst eject (2.38.2-5 Debian:12 [amd64])\n"
+        "0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.\n");
+    expect(added.newly.size() == 1 && added.newly[0] == "eject", "a new package is named");
+    expect(added.removed.empty() && added.remove_count == 0 && added.downgrade_count == -1,
+           "an add-only plan has no removal and no downgrade");
+    expect(added.inst.size() == 1 && added.inst[0].old_version == "-" &&
+               added.inst[0].new_version == "2.38.2-5",
+           "a new Inst line has no old version");
   }
 
   {
@@ -855,6 +875,29 @@ int main(int argc, char** argv)
     expect(proto.find("UNCLASSIFIED pkg01\n") != std::string::npos, "UNCLASSIFIED protocol line");
     const SimulateResult back = parse_protocol(proto);
     expect(back.unclassified.size() == 2 && back.kept_back.empty(), "UNCLASSIFIED round trip");
+  }
+
+  {
+    SimulateResult shown;
+    shown.status = SimulateResult::Upgrades;
+    shown.packages.push_back(PackageUpgrade{"bash", "1", "2", "", "", false});
+    shown.packages.push_back(PackageUpgrade{"lcos-base", "1.0", "2.0", "", "", false});
+    shown.new_packages.push_back(PackageUpgrade{"gvfs-backends", "-", "1.54.2-1", "", "", false});
+    shown.new_packages.push_back(PackageUpgrade{"eject", "-", "2.38.2-5", "", "", false});
+    const std::string proto = format_protocol(shown);
+    expect(proto.find("NEW eject 2.38.2-5\n") != std::string::npos, "NEW protocol line");
+    expect(proto.find("PKG lcos-base 1.0 2.0\n") != std::string::npos,
+           "the kept-back upgrade stays a PKG line");
+    const SimulateResult parsed = parse_protocol(proto);
+    expect(parsed.new_packages.size() == 2, "NEW packages round trip");
+    expect(parsed.packages.size() == 2, "NEW packages are not upgrade rows");
+    const JobOutcome outcome = outcome_check(shown, 0, false);
+    expect(outcome.install_enabled, "an add-only kept-back upgrade can be installed");
+    expect(outcome.status.find("2 updates.") != std::string::npos, "new packages are not upgrade rows");
+    expect(outcome.status.find("New packages will also be installed: eject, gvfs-backends.") !=
+               std::string::npos,
+           "the check names the new packages before install");
+    expect(outcome.packages == PackageListAction::Show, "the review list stays available");
   }
 
   {
