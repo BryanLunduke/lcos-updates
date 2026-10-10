@@ -228,6 +228,20 @@ case "$mode" in
       printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
     fi
     ;;
+  list-with-new)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      printf 'STATUS success\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 2\n'
+      printf 'PKG bash 1 2\n'
+      printf 'PKG lcos-base 1.0 2.0\n'
+      printf 'NEW eject 2.38.2-5\n'
+      printf 'NEW cifs-utils 2:7.0-2\n'
+      printf 'NEW keyutils 1.6.3-3\n'
+      printf 'NEW gvfs-backends 1.54.2-1\n'
+    fi
+    ;;
   list-or-changed)
     echo HELPER_READY >&2
     if [ "$cmd" = "upgrade" ]; then
@@ -713,6 +727,81 @@ int main()
            "a kept conffile is not reported as up to date");
     const std::string text = slurp(log);
     expect(text.find("libc6=2") != std::string::npos, "install passes the reviewed name=version pin");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(log.c_str());
+    set_mode("list-with-new");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    const bool listed = pump_until(2000, [&]() {
+      return window->install_sensitive_for_test() && window->new_packages_visible_for_test() &&
+             window->new_package_rows_for_test() == 4;
+    });
+    expect(listed, "new packages are listed before install");
+    expect(window->package_rows_for_test() == 2, "upgrades stay in their own list");
+    bool saw_base = false;
+    bool saw_new_in_upgrades = false;
+    for (int row = 0; row < window->package_rows_for_test(); ++row) {
+      const std::string name = window->package_at_row_for_test(row);
+      if (name == "lcos-base" || name == "bash")
+        saw_base = true;
+      if (name == "eject" || name == "gvfs-backends" || name == "cifs-utils" || name == "keyutils")
+        saw_new_in_upgrades = true;
+    }
+    expect(saw_base, "the kept-back upgrade is in the upgrade list");
+    expect(!saw_new_in_upgrades, "new packages are not upgrade rows");
+    bool saw_eject = false;
+    bool saw_gvfs = false;
+    for (int row = 0; row < window->new_package_rows_for_test(); ++row) {
+      const std::string name = window->new_package_at_row_for_test(row);
+      if (name == "eject")
+        saw_eject = true;
+      if (name == "gvfs-backends")
+        saw_gvfs = true;
+    }
+    expect(saw_eject && saw_gvfs, "the new-package list names eject and gvfs-backends");
+    const std::string status = window->status_text_for_test();
+    expect(status.find("New packages will also be installed: ") != std::string::npos,
+           "the status names the new packages before install");
+    expect(status.find("eject") != std::string::npos && status.find("gvfs-backends") != std::string::npos,
+           "the status lists each new package");
+    expect(count_lines(log) == 1, "showing the new packages has not started the install");
+    window->test_click_install();
+    const bool asking_first = pump_until(1000, [&]() {
+      return window->new_dialog_up_for_test() && window->new_default_is_cancel_for_test();
+    });
+    expect(asking_first, "install asks before adding new packages");
+    expect(window->new_default_is_cancel_for_test(), "the new-package question defaults to cancel");
+    expect(window->new_secondary_for_test().find("eject") != std::string::npos &&
+               window->new_secondary_for_test().find("gvfs-backends") != std::string::npos,
+           "the confirmation names the new packages");
+    expect(count_lines(log) == 1, "declining is still possible before the install starts");
+    window->test_cancel_new_packages();
+    pump_for(80);
+    expect(!window->new_dialog_up_for_test(), "cancel closes the new-package question");
+    expect(count_lines(log) == 1, "cancel does not install the new packages");
+    expect(window->install_sensitive_for_test(), "install stays available after cancel");
+    window->test_click_install();
+    const bool asking = pump_until(1000, [&]() { return window->new_dialog_up_for_test(); });
+    expect(asking, "install asks again");
+    window->test_confirm_new_packages();
+    const bool installed = pump_until(2000, [&]() {
+      return contains(window->status_text_for_test(), "Updates installed.");
+    });
+    expect(installed, "confirming installs the combined set");
+    const std::string text = slurp(log);
+    expect(text.find(" upgrade ") != std::string::npos || text.find("\nupgrade ") != std::string::npos ||
+               text.find(" upgrade\n") != std::string::npos || text.find(" upgrade") != std::string::npos,
+           "confirm runs the install");
+    expect(text.find("bash=2") != std::string::npos, "confirm passes the upgrade pin");
+    expect(text.find("lcos-base=2.0") != std::string::npos, "confirm passes the kept-back pin");
+    expect(text.find("eject=2.38.2-5") != std::string::npos, "confirm passes eject");
+    expect(text.find("cifs-utils=2:7.0-2") != std::string::npos, "confirm passes the epoch pin");
+    expect(text.find("keyutils=1.6.3-3") != std::string::npos, "confirm passes keyutils");
+    expect(text.find("gvfs-backends=1.54.2-1") != std::string::npos, "confirm passes gvfs-backends");
     destroy_window(window, pidfile);
   }
 

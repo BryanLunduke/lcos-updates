@@ -381,6 +381,24 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_scroller.add(m_view);
   m_scroller.hide();
 
+  m_new_heading.set_text("New packages");
+  m_new_heading.set_halign(Gtk::ALIGN_START);
+  m_new_heading.set_margin_top(6);
+  m_new_heading.set_no_show_all(true);
+  m_new_heading.hide();
+  m_new_store = Gtk::ListStore::create(m_new_cols);
+  m_new_view.set_model(m_new_store);
+  m_new_view.append_column("Package", m_new_cols.package);
+  m_new_view.append_column("Version", m_new_cols.version);
+  m_new_view.set_headers_visible(true);
+  m_new_view.get_selection()->set_mode(Gtk::SELECTION_NONE);
+  m_new_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
+  m_new_scroller.set_shadow_type(Gtk::SHADOW_IN);
+  m_new_scroller.set_min_content_height(72);
+  m_new_scroller.set_no_show_all(true);
+  m_new_scroller.add(m_new_view);
+  m_new_scroller.hide();
+
   m_buttons.set_layout(Gtk::BUTTONBOX_END);
   m_buttons.set_spacing(8);
   m_install.set_sensitive(false);
@@ -407,6 +425,8 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_content.pack_start(m_warning, Gtk::PACK_SHRINK);
   m_content.pack_start(m_progress, Gtk::PACK_SHRINK);
   m_content.pack_start(m_scroller, Gtk::PACK_EXPAND_WIDGET);
+  m_content.pack_start(m_new_heading, Gtk::PACK_SHRINK);
+  m_content.pack_start(m_new_scroller, Gtk::PACK_SHRINK);
   m_content.pack_start(m_buttons, Gtk::PACK_SHRINK);
 
   m_vbox.pack_start(m_menubar, Gtk::PACK_SHRINK);
@@ -451,6 +471,11 @@ UpdatesWindow::~UpdatesWindow()
   if (m_restart_dialog != nullptr) {
     Gtk::MessageDialog* dialog = m_restart_dialog;
     m_restart_dialog = nullptr;
+    delete dialog;
+  }
+  if (m_new_dialog != nullptr) {
+    Gtk::MessageDialog* dialog = m_new_dialog;
+    m_new_dialog = nullptr;
     delete dialog;
   }
   m_reboot_watch.disconnect();
@@ -599,6 +624,30 @@ void UpdatesWindow::show_packages(const std::vector<PackageUpgrade>& packages)
   show_package_list();
 }
 
+void UpdatesWindow::show_new_packages(const std::vector<PackageUpgrade>& packages)
+{
+  std::vector<PackageUpgrade> rows = packages;
+  std::stable_sort(rows.begin(), rows.end(), [](const PackageUpgrade& a, const PackageUpgrade& b) {
+    return a.name < b.name;
+  });
+  m_new_store->clear();
+  for (const auto& pkg : rows) {
+    if (pkg.name.empty() || pkg.new_version.empty())
+      continue;
+    Gtk::TreeModel::Row row = *(m_new_store->append());
+    row[m_new_cols.package] = pkg.name;
+    row[m_new_cols.version] = pkg.new_version;
+  }
+  if (m_new_store->children().empty()) {
+    m_new_heading.hide();
+    m_new_scroller.hide();
+    return;
+  }
+  m_new_view.show();
+  m_new_heading.show();
+  m_new_scroller.show();
+}
+
 void UpdatesWindow::show_package_list()
 {
   /* Explicit show(): show_all() is a no-op while no_show_all is set on the scroller. */
@@ -626,6 +675,10 @@ void UpdatesWindow::hide_package_list()
 {
   m_store->clear();
   m_scroller.hide();
+  if (m_new_store)
+    m_new_store->clear();
+  m_new_heading.hide();
+  m_new_scroller.hide();
   gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), FALSE, FALSE, 0,
                             GTK_PACK_START);
   /* Collapse to the natural height of menubar + status + buttons. */
@@ -1118,11 +1171,13 @@ void UpdatesWindow::maybe_note_dpkg()
     set_status_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
 }
 
-void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages)
+void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages,
+                                     const std::vector<PackageUpgrade>& new_packages)
 {
-  if (outcome.packages == PackageListAction::Show)
+  if (outcome.packages == PackageListAction::Show) {
     show_packages(packages);
-  else if (outcome.packages == PackageListAction::Hide)
+    show_new_packages(new_packages);
+  } else if (outcome.packages == PackageListAction::Hide)
     hide_package_list();
   set_idle_status(outcome.status);
   m_check.set_sensitive(outcome.check_enabled);
@@ -1155,7 +1210,7 @@ void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
 {
   const bool keep = !m_store->children().empty();
   const JobOutcome outcome = outcome_timeout(job == Job::Install, helper_ready, keep);
-  present_outcome(outcome, {});
+  present_outcome(outcome, {}, {});
 }
 
 bool UpdatesWindow::on_timeout()
@@ -1305,7 +1360,7 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
       shown.error_msg = auth;
   }
   const bool have_rows = !m_store->children().empty();
-  present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages);
+  present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages);
 }
 
 void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_status)
@@ -1319,7 +1374,7 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
       shown.error_msg = auth;
   }
   const bool have_rows = !m_store->children().empty();
-  present_outcome(outcome_install(shown, exit_code, have_rows), shown.packages);
+  present_outcome(outcome_install(shown, exit_code, have_rows), shown.packages, shown.new_packages);
 }
 
 void UpdatesWindow::on_about()
@@ -1568,7 +1623,7 @@ void UpdatesWindow::on_check_clicked()
   update_logout_warning();
 }
 
-void UpdatesWindow::on_install_clicked()
+void UpdatesWindow::start_reviewed_install()
 {
   if (m_closing || m_job != Job::None || m_have_pid)
     return;
@@ -1582,6 +1637,16 @@ void UpdatesWindow::on_install_clicked()
       continue;
     args.push_back(name + "=" + ver);
   }
+  if (m_new_store) {
+    const auto fresh = m_new_store->children();
+    for (const auto& row : fresh) {
+      const std::string name = static_cast<Glib::ustring>((*row)[m_new_cols.package]);
+      const std::string ver = static_cast<Glib::ustring>((*row)[m_new_cols.version]);
+      if (name.empty() || ver.empty())
+        continue;
+      args.push_back(name + "=" + ver);
+    }
+  }
   if (args.size() < 2)
     return;
   set_busy(true, "Waiting for authentication…");
@@ -1589,6 +1654,52 @@ void UpdatesWindow::on_install_clicked()
   if (m_job != Job::None)
     acquire_inhibitors("Installing updates");
   update_logout_warning();
+}
+
+void UpdatesWindow::confirm_new_packages()
+{
+  if (m_new_dialog != nullptr || !m_new_store || m_new_store->children().empty())
+    return;
+  std::string names;
+  const auto fresh = m_new_store->children();
+  for (const auto& row : fresh) {
+    const std::string name = static_cast<Glib::ustring>((*row)[m_new_cols.package]);
+    if (name.empty())
+      continue;
+    if (!names.empty())
+      names += ", ";
+    names += name;
+  }
+  m_new_primary = "Install new packages with these updates?";
+  m_new_secondary = "These new packages will be installed: " + names + ".";
+  auto* dialog = new Gtk::MessageDialog(*this, m_new_primary, false, Gtk::MESSAGE_QUESTION,
+                                        Gtk::BUTTONS_NONE, true);
+  dialog->set_secondary_text(m_new_secondary);
+  dialog->add_button("_Don't install", Gtk::RESPONSE_CANCEL);
+  dialog->add_button("_Install updates", Gtk::RESPONSE_OK);
+  dialog->set_default_response(Gtk::RESPONSE_CANCEL);
+  m_new_dialog = dialog;
+  dialog->signal_response().connect([this](int response) {
+    Gtk::MessageDialog* dying = m_new_dialog;
+    m_new_dialog = nullptr;
+    if (dying != nullptr)
+      dying->hide();
+    Glib::signal_idle().connect_once([dying]() { delete dying; });
+    if (response == Gtk::RESPONSE_OK)
+      start_reviewed_install();
+  });
+  dialog->show_all();
+}
+
+void UpdatesWindow::on_install_clicked()
+{
+  if (m_closing || m_job != Job::None || m_have_pid || m_new_dialog != nullptr)
+    return;
+  if (m_new_store && !m_new_store->children().empty()) {
+    confirm_new_packages();
+    return;
+  }
+  start_reviewed_install();
 }
 
 void UpdatesWindow::acquire_inhibitors(const Glib::ustring& reason)
@@ -1915,6 +2026,48 @@ Glib::ustring UpdatesWindow::package_at_row_for_test(int row) const
   if (row < 0 || row >= static_cast<int>(children.size()))
     return {};
   return (*children[static_cast<std::size_t>(row)])[m_cols.package];
+}
+
+int UpdatesWindow::new_package_rows_for_test() const
+{
+  if (!m_new_store)
+    return 0;
+  return static_cast<int>(m_new_store->children().size());
+}
+
+Glib::ustring UpdatesWindow::new_package_at_row_for_test(int row) const
+{
+  if (!m_new_store)
+    return {};
+  const auto children = m_new_store->children();
+  if (row < 0 || row >= static_cast<int>(children.size()))
+    return {};
+  return (*children[static_cast<std::size_t>(row)])[m_new_cols.package];
+}
+
+bool UpdatesWindow::new_packages_visible_for_test() const
+{
+  return m_new_heading.get_visible() && m_new_scroller.get_visible();
+}
+
+void UpdatesWindow::test_confirm_new_packages()
+{
+  if (m_new_dialog != nullptr)
+    m_new_dialog->response(Gtk::RESPONSE_OK);
+}
+
+void UpdatesWindow::test_cancel_new_packages()
+{
+  if (m_new_dialog != nullptr)
+    m_new_dialog->response(Gtk::RESPONSE_CANCEL);
+}
+
+bool UpdatesWindow::new_default_is_cancel_for_test() const
+{
+  if (m_new_dialog == nullptr)
+    return false;
+  auto* def = dynamic_cast<Gtk::Button*>(m_new_dialog->get_default_widget());
+  return def != nullptr && def->get_label() == "_Don't install";
 }
 
 Glib::ustring UpdatesWindow::size_at_row_for_test(int row) const

@@ -211,6 +211,37 @@ static bool is_kept_probe(int argc, char** argv)
          !argv_has(argc, argv, "-y");
 }
 
+static std::vector<std::string> argv_blocks(const std::string& text)
+{
+  std::vector<std::string> blocks;
+  std::string cur;
+  std::istringstream in(text);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line == "---") {
+      blocks.push_back(cur);
+      cur.clear();
+      continue;
+    }
+    cur += line;
+    cur.push_back('\n');
+  }
+  if (!cur.empty())
+    blocks.push_back(cur);
+  return blocks;
+}
+
+static bool block_has_line(const std::string& block, const char* token)
+{
+  const std::string needle = std::string("\n") + token + "\n";
+  if (block.find(needle) != std::string::npos)
+    return true;
+  const std::string head = std::string(token) + "\n";
+  return block.compare(0, head.size(), head) == 0;
+}
+
 static int count_lines_equal(const std::string& text, const char* token)
 {
   int n = 0;
@@ -1001,6 +1032,104 @@ static int apt_script(const char* script, int argc, char** argv)
     if (argv_has(argc, argv, "-y")) {
       note_state("install\n");
       std::fputs("2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+      return 0;
+    }
+    return 0;
+  }
+  if (std::strcmp(script, "kept-add") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      note_state("probe\n");
+      std::fputs("The following NEW packages will be installed:\n"
+                 "  eject cifs-utils keyutils gvfs-backends\n"
+                 "Inst lcos-base [1.0] (2.0 Debian:12 [amd64])\n"
+                 "Inst eject (2.38.2-5 Debian:12 [amd64])\n"
+                 "Inst cifs-utils (2:7.0-2 Debian:12 [amd64])\n"
+                 "Inst keyutils (1.6.3-3 Debian:12 [amd64])\n"
+                 "Inst gvfs-backends (1.54.2-1 Debian:12 [amd64])\n"
+                 "1 upgraded, 4 newly installed, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "update")) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "-s") && argv_has(argc, argv, "upgrade") &&
+        !argv_has(argc, argv, "--only-upgrade")) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  lcos-base\n"
+                 "Inst bash [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "-y") && argv_has(argc, argv, "install")) {
+      note_state("install\n");
+      std::fputs("2 upgraded, 4 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+      return 0;
+    }
+    return 0;
+  }
+  if (std::strcmp(script, "kept-remove") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      note_state("probe\n");
+      std::fputs("The following packages will be REMOVED:\n"
+                 "  oldplug\n"
+                 "The following NEW packages will be installed:\n"
+                 "  newdep\n"
+                 "Inst linux-image-amd64 [1] (2 Debian:12 [amd64])\n"
+                 "Inst newdep (1 Debian:12 [amd64])\n"
+                 "1 upgraded, 1 newly installed, 1 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "update")) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "-s") && argv_has(argc, argv, "upgrade") &&
+        !argv_has(argc, argv, "--only-upgrade")) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  linux-image-amd64\n"
+                 "Inst bash [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "-y") && argv_has(argc, argv, "install")) {
+      note_state("install\n");
+      std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+      return 0;
+    }
+    return 0;
+  }
+  if (std::strcmp(script, "kept-downgrade") == 0) {
+    if (is_kept_probe(argc, argv)) {
+      note_state("probe\n");
+      std::fputs("The following packages will be DOWNGRADED:\n"
+                 "  libc6\n"
+                 "Inst lcos-base [1.0] (2.0 Debian:12 [amd64])\n"
+                 "Inst libc6 [2] (1 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 1 downgraded, 0 to remove and 0 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "update")) {
+      std::fputs("Hit:1 http://deb.example stable InRelease\n", stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "-s") && argv_has(argc, argv, "upgrade") &&
+        !argv_has(argc, argv, "--only-upgrade")) {
+      std::fputs("The following packages have been kept back:\n"
+                 "  lcos-base\n"
+                 "Inst bash [1] (2 Debian:12 [amd64])\n"
+                 "1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n",
+                 stdout);
+      return 0;
+    }
+    if (argv_has(argc, argv, "-y") && argv_has(argc, argv, "install")) {
+      note_state("install\n");
+      std::fputs("1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
       return 0;
     }
     return 0;
@@ -2953,6 +3082,191 @@ int main(int argc, char** argv)
 
     unsetenv("LCOS_UPDATES_LISTS_DIR");
     unsetenv("LCOS_UPDATES_STATE_DIR");
+  }
+
+  {
+    /* A kept-back upgrade whose probe only adds packages is installed with
+     * those packages. The check lists the new packages before any install. */
+    const std::string argvfile = std::string(dir) + "/kept-add-check.argv";
+    const std::string statefile = std::string(dir) + "/kept-add-check.state";
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/kept-add-check.pids", nullptr, nullptr,
+                   helper_pid, "kept-add", nullptr, &stdout_read, "simulate", nullptr, nullptr,
+                   argvfile.c_str(), nullptr, nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a kept-back package that adds dependencies\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    const std::string argv_text = read_file_all(argvfile);
+    const std::string state = read_file_all(statefile);
+    expect(exited, "helper exits after a kept-back package that only adds packages");
+    expect(out.find("STATUS upgrades\n") != std::string::npos,
+           "an add-only kept-back package is offered with the other upgrades");
+    expect(out.find("PKG bash 1 2\n") != std::string::npos, "the plain upgrade is still listed");
+    expect(out.find("PKG lcos-base 1.0 2.0\n") != std::string::npos,
+           "the kept-back package is listed as an upgrade");
+    expect(out.find("NEW eject 2.38.2-5\n") != std::string::npos, "eject is listed before install");
+    expect(out.find("NEW cifs-utils 2:7.0-2\n") != std::string::npos,
+           "an epoch version on a new package is kept");
+    expect(out.find("NEW keyutils 1.6.3-3\n") != std::string::npos, "keyutils is listed before install");
+    expect(out.find("NEW gvfs-backends 1.54.2-1\n") != std::string::npos,
+           "gvfs-backends is listed before install");
+    expect(out.find("KEPT lcos-base\n") == std::string::npos,
+           "an add-only kept-back package is not left held");
+    expect(out.find("NEW ") != std::string::npos, "new packages are named before any install");
+    expect(count_lines_equal(state, "probe") == 1, "the kept-back package was probed once");
+    bool saw_probe = false;
+    bool saw_install = false;
+    for (const auto& block : argv_blocks(argv_text)) {
+      if (block_has_line(block, "--only-upgrade") && block_has_line(block, "-s") &&
+          block_has_line(block, "lcos-base")) {
+        saw_probe = true;
+        expect(block_has_line(block, "APT::Install-Recommends=false"),
+               "the kept-back probe disables recommends");
+        expect(!block_has_line(block, "-y"), "the kept-back probe does not install");
+      }
+      if (block_has_line(block, "install") && block_has_line(block, "-y") &&
+          !block_has_line(block, "--print-uris"))
+        saw_install = true;
+    }
+    expect(saw_probe, "the check simulated install --only-upgrade for the kept-back package");
+    expect(!saw_install, "the check lists new packages before applying them");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+
+    const std::vector<std::string> pins = {"bash=2", "lcos-base=2.0", "eject=2.38.2-5",
+                                           "cifs-utils=2:7.0-2", "keyutils=1.6.3-3",
+                                           "gvfs-backends=1.54.2-1"};
+    const std::string install_argv = std::string(dir) + "/kept-add-install.argv";
+    const std::string install_state = std::string(dir) + "/kept-add-install.state";
+    std::string installed;
+    bool install_exited = false;
+    pid_t install_pid = 0;
+    int install_out = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/kept-add-install.pids", nullptr, nullptr,
+                   install_pid, "kept-add", nullptr, &install_out, "upgrade", &pins, nullptr,
+                   install_argv.c_str(), nullptr, nullptr, install_state.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper to install an add-only kept-back upgrade\n");
+      return 1;
+    }
+    int install_status = 0;
+    install_exited = wait_pid(install_pid, 10000, install_status);
+    installed = install_out >= 0 ? read_all_fd(install_out) : std::string();
+    if (install_out >= 0)
+      close(install_out);
+    const std::string install_args = read_file_all(install_argv);
+    const std::string install_notes = read_file_all(install_state);
+    expect(install_exited, "helper exits after installing an add-only kept-back upgrade");
+    expect(installed.find("STATUS success\n") != std::string::npos,
+           "the add-only kept-back upgrade is installed");
+    expect(installed.find("SKIPPED") == std::string::npos, "the reviewed set matches the simulation");
+    expect(count_lines_equal(install_notes, "install") == 1, "the combined set is installed");
+    bool found_install = false;
+    for (const auto& block : argv_blocks(install_args)) {
+      if (!block_has_line(block, "install") || !block_has_line(block, "-y") ||
+          block_has_line(block, "--print-uris"))
+        continue;
+      found_install = true;
+      expect(block_has_line(block, "APT::Install-Recommends=false"),
+             "the install keeps recommends off");
+      expect(!block_has_line(block, "--only-upgrade"),
+             "new packages are not skipped by --only-upgrade");
+      expect(block_has_line(block, "bash=2"), "the plain upgrade pin is installed");
+      expect(block_has_line(block, "lcos-base=2.0"), "the kept-back package pin is installed");
+      expect(block_has_line(block, "eject=2.38.2-5"), "eject is installed with the upgrade");
+      expect(block_has_line(block, "cifs-utils=2:7.0-2"), "cifs-utils is installed with the upgrade");
+      expect(block_has_line(block, "keyutils=1.6.3-3"), "keyutils is installed with the upgrade");
+      expect(block_has_line(block, "gvfs-backends=1.54.2-1"),
+             "gvfs-backends is installed with the upgrade");
+      expect(!block_has_line(block, "remove"), "the install command is not remove");
+    }
+    expect(found_install, "apt-get install ran for the combined set");
+    if (!install_exited)
+      terminate_process_tree(install_pid, 200);
+  }
+
+  {
+    const std::string argvfile = std::string(dir) + "/kept-remove.argv";
+    const std::string statefile = std::string(dir) + "/kept-remove.state";
+    const std::vector<std::string> pins = {"bash=2"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/kept-remove.pids", nullptr, nullptr, helper_pid,
+                   "kept-remove", nullptr, &stdout_read, "upgrade", &pins, nullptr, argvfile.c_str(),
+                   nullptr, nullptr, statefile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a kept-back package that would remove one\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    const std::string argv_text = read_file_all(argvfile);
+    const std::string state = read_file_all(statefile);
+    expect(exited, "helper exits after a kept-back package that would remove another");
+    expect(out.find("REMOVE linux-image-amd64 oldplug\n") != std::string::npos,
+           "a removal stays held and names the package that would be removed");
+    expect(out.find("KEPT linux-image-amd64\n") == std::string::npos,
+           "a removal is not described as an extra package");
+    expect(out.find("NEW newdep") == std::string::npos,
+           "new packages from a removal simulation are not installed");
+    expect(out.find("STATUS success\n") != std::string::npos, "the plain upgrade is still installed");
+    expect(count_lines_equal(state, "install") == 1, "the plain upgrade install ran");
+    bool found_install = false;
+    for (const auto& block : argv_blocks(argv_text)) {
+      if (!block_has_line(block, "install") || !block_has_line(block, "-y") ||
+          block_has_line(block, "--print-uris"))
+        continue;
+      found_install = true;
+      expect(block_has_line(block, "--only-upgrade"), "a removal does not widen the install");
+      expect(block_has_line(block, "bash=2"), "only the reviewed upgrade is installed");
+      expect(!block_has_line(block, "linux-image-amd64"), "the held package is not installed");
+      expect(!block_has_line(block, "oldplug"), "nothing is removed");
+      expect(!block_has_line(block, "newdep"), "the removal's new package is not installed");
+      expect(!block_has_line(block, "remove"), "apt is not asked to remove");
+    }
+    expect(found_install, "the plain upgrade still installed");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
+  }
+
+  {
+    const std::string argvfile = std::string(dir) + "/kept-down.argv";
+    const std::vector<std::string> pins = {"bash=2"};
+    pid_t helper_pid = 0;
+    int stdout_read = -1;
+    if (run_helper(helper, apt, std::string(dir) + "/kept-down.pids", nullptr, nullptr, helper_pid,
+                   "kept-downgrade", nullptr, &stdout_read, "upgrade", &pins, nullptr,
+                   argvfile.c_str()) != 0) {
+      std::fprintf(stderr, "failed to spawn helper for a kept-back package that would downgrade\n");
+      return 1;
+    }
+    int status = 0;
+    const bool exited = wait_pid(helper_pid, 10000, status);
+    const std::string out = stdout_read >= 0 ? read_all_fd(stdout_read) : std::string();
+    if (stdout_read >= 0)
+      close(stdout_read);
+    const std::string argv_text = read_file_all(argvfile);
+    expect(exited, "helper exits after a kept-back package that would downgrade");
+    expect(out.find("KEPT lcos-base\n") != std::string::npos, "a downgrade stays held");
+    expect(out.find("NEW ") == std::string::npos, "a downgrade adds no new packages");
+    bool found_install = false;
+    for (const auto& block : argv_blocks(argv_text)) {
+      if (!block_has_line(block, "install") || !block_has_line(block, "-y"))
+        continue;
+      found_install = true;
+      expect(!block_has_line(block, "lcos-base=2.0"), "a downgrade is not installed");
+      expect(!block_has_line(block, "libc6=1"), "the downgraded package is not installed");
+    }
+    expect(found_install, "the plain upgrade still ran when a probe would downgrade");
+    if (!exited)
+      terminate_process_tree(helper_pid, 200);
   }
 
   if (g_fails != 0) {

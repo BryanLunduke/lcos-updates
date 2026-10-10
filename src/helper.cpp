@@ -39,6 +39,9 @@ const char kSimNoteVal[] = "APT::Get::Show-User-Simulation-Note=false";
 const char kConfdef[] = "Dpkg::Options::=--force-confdef";
 const char kConfold[] = "Dpkg::Options::=--force-confold";
 const char kQuietVal[] = "quiet=0";
+/* Hard Depends still appear as new packages. Recommends would add packages
+ * the review never listed. */
+const char kNoRecommends[] = "APT::Install-Recommends=false";
 /* A script or unpack failure left a package half-installed. dpkg --configure -a
  * is not added here: that command is only for an interrupted dpkg that has
  * already exited (see fail_apt). A full disk is this sentence plus kFreeSpace. */
@@ -1307,6 +1310,121 @@ void emit_kept_status(std::size_t index, std::size_t total)
   write_all_fd(STDERR_FILENO, msg.str());
 }
 
+bool package_named(const std::vector<PackageUpgrade>& packages, const std::string& name)
+{
+  for (const auto& pkg : packages) {
+    if (pkg.name == name)
+      return true;
+  }
+  return false;
+}
+
+bool same_new_version(const PackageUpgrade& have, const PackageUpgrade& want)
+{
+  return canonical_deb_version(have.new_version) == canonical_deb_version(want.new_version);
+}
+
+void finish_adopted(SimulateResult& result)
+{
+  if (result.adopted_kept.empty() && result.new_packages.empty() && result.kept_upgrades.empty())
+    return;
+  if (!result.packages.empty() && result.status != SimulateResult::Error)
+    result.status = SimulateResult::Upgrades;
+  if (result.kept_back.empty())
+    result.not_upgraded_count = 0;
+  else if (!result.adopted_kept.empty())
+    result.not_upgraded_count = static_cast<int>(result.kept_back.size());
+}
+
+/* A kept-back probe is safe to install when it upgrades that package, adds
+ * only new packages or further upgrades, and removes or downgrades nothing.
+ * The probed package must appear as an Inst upgrade. An empty or failed
+ * probe stays kept back. */
+bool adopt_kept_plan(SimulateResult& result, const std::string& name, const InstallPlan& plan)
+{
+  const PackageUpgrade* self = nullptr;
+  for (const auto& pkg : plan.inst) {
+    if (pkg.name == name)
+      self = &pkg;
+  }
+  if (self == nullptr || self->old_version.empty() || self->old_version == "-")
+    return false;
+  if (!valid_pin(self->name + "=" + self->new_version))
+    return false;
+  for (const auto& have : result.packages) {
+    if (have.name == self->name && !same_new_version(have, *self))
+      return false;
+  }
+
+  std::vector<PackageUpgrade> ups;
+  std::vector<PackageUpgrade> news;
+  for (const auto& pkg : plan.inst) {
+    if (pkg.name == name)
+      continue;
+    if (!valid_pin(pkg.name + "=" + pkg.new_version))
+      return false;
+    if (pkg.old_version.empty() || pkg.old_version == "-") {
+      if (package_named(result.packages, pkg.name) || package_named(ups, pkg.name))
+        return false;
+      for (const auto& have : result.new_packages) {
+        if (have.name == pkg.name && !same_new_version(have, pkg))
+          return false;
+      }
+      for (const auto& have : news) {
+        if (have.name == pkg.name && !same_new_version(have, pkg))
+          return false;
+      }
+      news.push_back(pkg);
+    } else {
+      for (const auto& have : result.packages) {
+        if (have.name == pkg.name && !same_new_version(have, pkg))
+          return false;
+      }
+      for (const auto& have : result.new_packages) {
+        if (have.name == pkg.name)
+          return false;
+      }
+      for (const auto& have : news) {
+        if (have.name == pkg.name)
+          return false;
+      }
+      ups.push_back(pkg);
+    }
+  }
+  for (const auto& fresh : plan.newly) {
+    bool found = false;
+    for (const auto& pkg : news) {
+      if (pkg.name == fresh)
+        found = true;
+    }
+    if (!found)
+      return false;
+  }
+
+  if (!package_named(result.packages, self->name)) {
+    result.packages.push_back(*self);
+    result.kept_upgrades.push_back(*self);
+  }
+  for (const auto& pkg : ups) {
+    if (!package_named(result.packages, pkg.name)) {
+      result.packages.push_back(pkg);
+      result.kept_upgrades.push_back(pkg);
+    }
+  }
+  for (const auto& pkg : news) {
+    if (!package_named(result.new_packages, pkg.name))
+      result.new_packages.push_back(pkg);
+  }
+  bool seen = false;
+  for (const auto& have : result.adopted_kept) {
+    if (have == name)
+      seen = true;
+  }
+  if (!seen)
+    result.adopted_kept.push_back(name);
+  return true;
+}
+
 /* apt-get -s upgrade does not say whether a kept-back package needs a new
  * dependency or would remove one. A read-only install simulation of that
  * one package does. The pass has a short clock. A name that is not probed,
@@ -1314,10 +1432,13 @@ void emit_kept_status(std::size_t index, std::size_t total)
  * unclassified. It is not described as needing extra packages.
  * skip lists names an earlier pass already classified, so install does not
  * probe them again. honor_cancel is false after the packages are installed:
- * a closed pipe must not hide that result. Returns false when the check or
- * the pre-install pass was cancelled. */
+ * a closed pipe must not hide that result. adopt is true for the check and
+ * the pre-install pass: a probe that only adds packages joins the install
+ * set. After the install has finished, adopt is false so a later probe
+ * cannot hide a package that is still kept back. Returns false when the
+ * check or the pre-install pass was cancelled. */
 bool classify_kept_removals(SimulateResult& result, const std::vector<std::string>* skip,
-                            bool honor_cancel)
+                            bool honor_cancel, bool adopt)
 {
   if (result.kept_back.empty())
     return true;
@@ -1358,8 +1479,8 @@ bool classify_kept_removals(SimulateResult& result, const std::vector<std::strin
       continue;
     }
     emit_kept_status(i + 1, total);
-    const std::vector<const char*> argv = {apt.c_str(), "-s", "-q", "install", "--only-upgrade",
-                                           name.c_str()};
+    const std::vector<const char*> argv = {apt.c_str(), "-s",        "-o", kNoRecommends, "-q",
+                                           "install",   "--only-upgrade", name.c_str()};
     std::string out;
     std::string err;
     int remain = budget - static_cast<int>(elapsed_sec());
@@ -1383,23 +1504,27 @@ bool classify_kept_removals(SimulateResult& result, const std::vector<std::strin
     g_dpkg_committed = saved_commit;
     if (honor_cancel && (rc == -3 || stop_requested()))
       return false;
-    std::vector<std::string> removed;
-    std::vector<std::string> newly;
-    parse_removal_plan(out + "\n" + err, removed, newly);
-    (void)newly;
-    if (!removed.empty()) {
+    const InstallPlan plan = parse_install_plan(out + "\n" + err);
+    if (!plan.removed.empty() || plan.remove_count > 0) {
       SimulateResult::KeptRemoval removal;
       removal.package = name;
-      removal.removes = removed;
+      removal.removes = plan.removed;
       result.kept_removals.push_back(removal);
       continue;
     }
-    if (rc == 0)
-      extra.push_back(name);
-    else
+    if (rc != 0) {
       result.unclassified.push_back(name);
+      continue;
+    }
+    const bool downgrade = !plan.downgraded.empty() || plan.downgrade_count > 0;
+    if (adopt && !downgrade && result.status != SimulateResult::Error &&
+        adopt_kept_plan(result, name, plan))
+      continue;
+    extra.push_back(name);
   }
   result.kept_back.swap(extra);
+  if (adopt)
+    finish_adopted(result);
   return true;
 }
 
@@ -1542,6 +1667,9 @@ struct CheckSnap {
   std::vector<std::string> unclassified;
   std::vector<std::string> phased;
   std::vector<std::string> held;
+  std::vector<std::string> adopted;
+  std::vector<PackageUpgrade> added;
+  std::vector<PackageUpgrade> fresh;
   std::vector<SimulateResult::KeptRemoval> removals;
 };
 
@@ -1588,6 +1716,19 @@ void save_check_snap(const SimulateResult& result)
   for (const auto& name : result.held) {
     if (good_snap_name(name))
       body << "HELD " << name << "\n";
+  }
+  for (const auto& name : result.adopted_kept) {
+    if (good_snap_name(name))
+      body << "ADOPTED " << name << "\n";
+  }
+  for (const auto& pkg : result.kept_upgrades) {
+    if (valid_pin(pkg.name + "=" + pkg.new_version) && !pkg.old_version.empty() &&
+        pkg.old_version != "-")
+      body << "ADD " << pkg.name << " " << pkg.old_version << " " << pkg.new_version << "\n";
+  }
+  for (const auto& pkg : result.new_packages) {
+    if (valid_pin(pkg.name + "=" + pkg.new_version))
+      body << "NEW " << pkg.name << " " << pkg.new_version << "\n";
   }
   for (const auto& removal : result.kept_removals) {
     if (!good_snap_name(removal.package))
@@ -1686,6 +1827,29 @@ bool load_check_snap(CheckSnap& snap)
       if (!good_snap_name(name))
         return false;
       snap.held.push_back(name);
+    } else if (line.compare(0, 8, "ADOPTED ") == 0) {
+      const std::string name = line.substr(8);
+      if (!good_snap_name(name))
+        return false;
+      snap.adopted.push_back(name);
+    } else if (line.compare(0, 4, "ADD ") == 0) {
+      std::istringstream ps(line.substr(4));
+      PackageUpgrade pkg;
+      if (!(ps >> pkg.name >> pkg.old_version >> pkg.new_version))
+        return false;
+      if (!valid_pin(pkg.name + "=" + pkg.new_version) || pkg.old_version.empty() ||
+          pkg.old_version == "-")
+        return false;
+      snap.added.push_back(pkg);
+    } else if (line.compare(0, 4, "NEW ") == 0) {
+      std::istringstream ps(line.substr(4));
+      PackageUpgrade pkg;
+      pkg.old_version = "-";
+      if (!(ps >> pkg.name >> pkg.new_version))
+        return false;
+      if (!valid_pin(pkg.name + "=" + pkg.new_version))
+        return false;
+      snap.fresh.push_back(pkg);
     } else if (line.compare(0, 7, "REMOVE ") == 0) {
       std::istringstream ps(line.substr(7));
       SimulateResult::KeptRemoval removal;
@@ -1723,6 +1887,8 @@ bool classification_matches(const SimulateResult& sim, const CheckSnap& snap)
     pending.push_back(removal.package);
   for (const auto& name : snap.unclassified)
     pending.push_back(name);
+  for (const auto& name : snap.adopted)
+    pending.push_back(name);
   return same_names(sim.kept_back, pending) && same_names(sim.held, snap.held) &&
          same_names(sim.phased, snap.phased);
 }
@@ -1734,6 +1900,14 @@ void apply_classification(SimulateResult& sim, const CheckSnap& snap)
   sim.kept_removals = snap.removals;
   sim.held = snap.held;
   sim.phased = snap.phased;
+  sim.adopted_kept = snap.adopted;
+  sim.kept_upgrades = snap.added;
+  sim.new_packages = snap.fresh;
+  for (const auto& pkg : snap.added) {
+    if (!package_named(sim.packages, pkg.name))
+      sim.packages.push_back(pkg);
+  }
+  finish_adopted(sim);
 }
 
 void add_warning(std::string& warning, const std::string& note)
@@ -1804,7 +1978,7 @@ int do_simulate()
   SimulateResult result = parse_apt_simulate(out + "\n" + err);
   note_holds(result);
   mark_security(result);
-  if (!classify_kept_removals(result, nullptr, true)) {
+  if (!classify_kept_removals(result, nullptr, true, true)) {
     emit_error("Update check was cancelled");
     return 1;
   }
@@ -1893,7 +2067,7 @@ int do_upgrade(const std::vector<std::string>& pins)
       note_holds(sim);
       mark_security(sim);
     }
-    if (!classify_kept_removals(sim, nullptr, true)) {
+    if (!classify_kept_removals(sim, nullptr, true, true)) {
       emit_error("Install was cancelled");
       return 1;
     }
@@ -1906,7 +2080,9 @@ int do_upgrade(const std::vector<std::string>& pins)
     emit_error(msg);
     return 1;
   }
-  if (!same_package_set(sim.packages, pins)) {
+  std::vector<PackageUpgrade> reviewed = sim.packages;
+  reviewed.insert(reviewed.end(), sim.new_packages.begin(), sim.new_packages.end());
+  if (!same_package_set(reviewed, pins)) {
     sim.install_skipped = true;
     std::string note =
         "The package list changed after refreshing indexes. Nothing was installed.";
@@ -1931,8 +2107,13 @@ int do_upgrade(const std::vector<std::string>& pins)
   argv_store.push_back(kConfdef);
   argv_store.push_back("-o");
   argv_store.push_back(kConfold);
+  argv_store.push_back("-o");
+  argv_store.push_back(kNoRecommends);
   argv_store.push_back("install");
-  argv_store.push_back("--only-upgrade");
+  /* New packages are not installed yet, so --only-upgrade would skip them.
+   * The reviewed pins are the whole set, including those new packages. */
+  if (sim.new_packages.empty())
+    argv_store.push_back("--only-upgrade");
   for (const auto& pin : pins)
     argv_store.push_back(pin);
   std::vector<const char*> up_argv;
@@ -1964,7 +2145,7 @@ int do_upgrade(const std::vector<std::string>& pins)
     already.push_back(name);
   /* The install already finished. Do not turn a closed pipe into a cancel,
    * and do not probe a name the pre-install pass already classified. */
-  classify_kept_removals(result, &already, false);
+  classify_kept_removals(result, &already, false, false);
   result.not_upgraded_count = parsed.not_upgraded_count;
   result.upgraded_count = parsed.upgraded_count;
   result.conffiles_kept = parsed.conffiles_kept;
