@@ -1,3 +1,9 @@
+lcos-updates (0.9.3-1) unstable; urgency=medium
+
+  * Version bump for LCOS 0.9.3. No functional changes.
+
+ -- Phil <phil@brushpad.local>  Sun, 11 Oct 2026 13:14:06 +0000
+
 lcos-updates (0.9.2-2) unstable; urgency=medium
 
   * Also install kept-back upgrades that only add new packages and remove nothing.
