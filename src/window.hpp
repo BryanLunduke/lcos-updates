@@ -153,6 +153,14 @@ private:
   void show_new_packages(const std::vector<PackageUpgrade>& packages);
   void show_package_list();
   void hide_package_list();
+  void fit_height();
+  void queue_fit();
+  void run_queued_fit();
+  void apply_status_height();
+  bool settle_fit();
+  Gtk::PolicyType m_status_policy = Gtk::POLICY_EXTERNAL;
+  int m_status_height = -1;
+  bool m_fit_queued = false;
   void start_reviewed_install();
   void confirm_new_packages();
   void on_cancel_clicked();
@@ -191,8 +199,8 @@ private:
 
   Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL, 0};
   Gtk::MenuBar m_menubar;
-  Gtk::Box m_content{Gtk::ORIENTATION_VERTICAL, 10};
-  Gtk::Box m_status_row{Gtk::ORIENTATION_HORIZONTAL, 8};
+  Gtk::Box m_content{Gtk::ORIENTATION_VERTICAL, 6};
+  Gtk::Box m_status_row{Gtk::ORIENTATION_HORIZONTAL, 6};
   Gtk::Spinner m_spinner;
   Gtk::ScrolledWindow m_status_scroll;
   Gtk::Label m_status;
