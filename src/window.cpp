@@ -320,7 +320,10 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 
   /* A long apt error wraps inside the window and scrolls instead of pushing
    * the buttons off the screen. */
-  m_status_scroll.set_policy(Gtk::POLICY_NEVER, Gtk::POLICY_AUTOMATIC);
+  /* EXTERNAL (no scrollbar) until the text is taller than the cap: an
+   * AUTOMATIC vertical scrollbar raises the minimum height to ~46px, which
+   * left a blank band under a one-line status. */
+  m_status_scroll.set_policy(Gtk::POLICY_NEVER, Gtk::POLICY_EXTERNAL);
   m_status_scroll.set_shadow_type(Gtk::SHADOW_NONE);
   m_status_scroll.set_propagate_natural_height(true);
   m_status_scroll.set_max_content_height(160);
@@ -329,6 +332,23 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
     const int width = allocation.get_width() > 80 ? allocation.get_width() : 80;
     if (m_status.get_allocated_width() != width)
       m_status.set_size_request(width, -1);
+    int min_h = 0;
+    int nat_h = 0;
+    m_status.get_preferred_height_for_width(width, min_h, nat_h);
+    const Gtk::PolicyType want = nat_h > 160 ? Gtk::POLICY_AUTOMATIC : Gtk::POLICY_EXTERNAL;
+    Gtk::PolicyType hpol;
+    Gtk::PolicyType vpol;
+    m_status_scroll.get_policy(hpol, vpol);
+    /* GtkScrolledWindow does not do height-for-width, so pin the content
+     * height to the wrapped text at the real width: no blank lines under a
+     * status that wrapped at the narrower natural width. */
+    const int want_h = nat_h > 160 ? 160 : (nat_h > 0 ? nat_h : 1);
+    if (vpol != want || m_status_scroll.get_min_content_height() != want_h) {
+      m_status_policy = want;
+      m_status_height = want_h;
+      /* Trackable slot: dropped automatically if the window goes away first. */
+      Glib::signal_idle().connect_once(sigc::mem_fun(*this, &UpdatesWindow::apply_status_height));
+    }
   });
 
   m_commit_note.set_line_wrap(true);
@@ -376,14 +396,17 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 
   m_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
   m_scroller.set_shadow_type(Gtk::SHADOW_IN);
-  m_scroller.set_min_content_height(180);
+  /* Size the list to its rows (up to a cap set in show_package_list) instead
+   * of opening a near-full-screen window around three rows. */
+  m_scroller.set_min_content_height(120);
+  m_scroller.set_propagate_natural_height(true);
+  m_scroller.set_max_content_height(420);
   m_scroller.set_no_show_all(true);
   m_scroller.add(m_view);
   m_scroller.hide();
 
   m_new_heading.set_text("New packages");
   m_new_heading.set_halign(Gtk::ALIGN_START);
-  m_new_heading.set_margin_top(6);
   m_new_heading.set_no_show_all(true);
   m_new_heading.hide();
   m_new_store = Gtk::ListStore::create(m_new_cols);
@@ -394,7 +417,9 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_new_view.get_selection()->set_mode(Gtk::SELECTION_NONE);
   m_new_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
   m_new_scroller.set_shadow_type(Gtk::SHADOW_IN);
-  m_new_scroller.set_min_content_height(72);
+  /* Show every new package (the old fixed 72px clipped the list to two). */
+  m_new_scroller.set_propagate_natural_height(true);
+  m_new_scroller.set_max_content_height(160);
   m_new_scroller.set_no_show_all(true);
   m_new_scroller.add(m_new_view);
   m_new_scroller.hide();
@@ -435,6 +460,12 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_vbox.pack_start(m_content, Gtk::PACK_SHRINK);
   add(m_vbox);
   show_all_children();
+  /* Refit whenever an optional row comes or goes. */
+  for (Gtk::Widget* w : std::initializer_list<Gtk::Widget*>{&m_progress, &m_warning, &m_commit_note,
+                                                           &m_new_scroller}) {
+    w->signal_show().connect(sigc::mem_fun(*this, &UpdatesWindow::queue_fit));
+    w->signal_hide().connect(sigc::mem_fun(*this, &UpdatesWindow::queue_fit));
+  }
   m_check.grab_default();
   set_default(m_check);
   signal_map().connect([this]() {
@@ -541,6 +572,65 @@ void UpdatesWindow::set_status_text(const Glib::ustring& status)
 {
   m_status.set_text(status);
   m_status.select_region(0, 0);
+  queue_fit();
+}
+
+void UpdatesWindow::queue_fit()
+{
+  if (m_fit_queued)
+    return;
+  m_fit_queued = true;
+  Glib::signal_idle().connect_once(sigc::mem_fun(*this, &UpdatesWindow::run_queued_fit));
+}
+
+void UpdatesWindow::run_queued_fit()
+{
+  m_fit_queued = false;
+  fit_height();
+}
+
+void UpdatesWindow::apply_status_height()
+{
+  if (m_status_height < 0)
+    return;
+  m_status_scroll.set_policy(Gtk::POLICY_NEVER, m_status_policy);
+  m_status_scroll.set_max_content_height(m_status_height);
+  m_status_scroll.set_min_content_height(m_status_height);
+  fit_height();
+}
+
+bool UpdatesWindow::settle_fit()
+{
+  fit_height();
+  return false;
+}
+
+void UpdatesWindow::fit_height()
+{
+  /* The window hugs its content at its current width: drop height left over
+   * from a taller state (progress bar, long error) so no blank band opens
+   * under the buttons, and grow so the package lists are never clipped. */
+  if (!get_realized())
+    return;
+  int width = 0;
+  int height = 0;
+  get_size(width, height);
+  int min_h = 0;
+  int nat_h = 0;
+  get_preferred_height_for_width(width, min_h, nat_h);
+  /* Compare against the allocation: get_size() reports the last requested
+   * size, which can already equal nat_h after the window grew by itself. */
+  if (nat_h <= 0)
+    return;
+  if (height != nat_h) {
+    resize(width, nat_h);
+  } else if (get_allocated_height() != nat_h) {
+    /* The window grew past its request when a row appeared (the request
+     * stayed nat_h), so re-requesting nat_h is a no-op. Nudge the request,
+     * then settle on nat_h once that has been processed. */
+    resize(width, nat_h + 1);
+    Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::settle_fit), 50);
+  }
 }
 
 void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
@@ -656,18 +746,23 @@ void UpdatesWindow::show_package_list()
   /* gtkmm Box no longer wraps this; expand content so the scroller absorbs growth. */
   gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), TRUE, TRUE, 0,
                             GTK_PACK_START);
-  int list_height = 640;
+  /* Cap the list so the window never outgrows the screen, then let the
+   * window take its natural height: a short list no longer opens a tall
+   * window full of empty rows. */
+  int list_cap = 420;
   if (const auto screen = get_screen()) {
     const int sh = screen->get_height();
     if (sh > 200) {
-      list_height = sh - 80;
-      if (list_height > 760)
-        list_height = 760;
-      if (list_height < 520)
-        list_height = 520;
+      list_cap = sh - 340;
+      if (list_cap > 420)
+        list_cap = 420;
+      if (list_cap < 120)
+        list_cap = 120;
     }
   }
-  resize(780, list_height);
+  m_scroller.set_max_content_height(list_cap);
+  resize(780, 1);
+  queue_fit();
   use_install_as_default();
 }
 
@@ -681,17 +776,16 @@ void UpdatesWindow::hide_package_list()
   m_new_scroller.hide();
   gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), FALSE, FALSE, 0,
                             GTK_PACK_START);
-  /* Collapse to the natural height of menubar + status + buttons. */
+  /* Collapse to the natural height of menubar + status + buttons. The fit
+   * runs from idle, after every row for the new state is shown or hidden;
+   * measuring here caught the progress bar mid-check and kept its height. */
   int width = 0;
   int height = 0;
   get_size(width, height);
   if (width < 560)
     width = 560;
-  queue_resize();
-  int min_h = 0;
-  int nat_h = 0;
-  get_preferred_height(min_h, nat_h);
-  resize(width, nat_h > 0 ? nat_h : 1);
+  resize(width, height);
+  queue_fit();
   use_check_as_default();
 }
 

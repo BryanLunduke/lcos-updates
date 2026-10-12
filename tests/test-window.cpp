@@ -1686,7 +1686,11 @@ int main()
       return window->package_rows_for_test() == 3 && window->columns_fit_for_test();
     });
     expect(listed, "name, version, and size columns fit in the window");
-    expect(window->allocated_height_for_test() > 420, "the list uses more than the old 420px window");
+    /* 0.9.3-2: the window sizes to its rows instead of opening ~760px tall
+     * around three packages; it must still show the list and the buttons. */
+    pump_for(200);
+    expect(window->allocated_height_for_test() < 520, "a three-row list does not open a tall empty window");
+    expect(window->buttons_inside_window_for_test(), "the list window keeps the buttons inside");
     const std::string status = window->status_text_for_test();
     expect(status.find("3 updates.") != std::string::npos, "the count matches the rows, not COUNT");
     expect(status.find("9 updates.") == std::string::npos, "a stale COUNT is not the row count");
