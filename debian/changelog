@@ -1,3 +1,9 @@
+lcos-updates (0.9.4-1) unstable; urgency=medium
+
+  * Version bump for LCOS 0.9.4. No functional changes.
+
+ -- Phil <phil@brushpad.local>  Tue, 13 Oct 2026 15:31:29 +0000
+
 lcos-updates (0.9.3-2) unstable; urgency=medium
 
   * Tighten window spacing in all states.
