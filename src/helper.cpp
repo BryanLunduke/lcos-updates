@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * argv is "simulate", or "upgrade" plus the reviewed name=version pins.
+ * argv is "simulate", "repair", or "upgrade" plus the reviewed name=version pins.
  * Hard-coded /usr/bin/apt-get. No shell.
  */
 
@@ -34,6 +34,7 @@
 namespace {
 
 const char kAptGet[] = "/usr/bin/apt-get";
+const char kDpkg[] = "/usr/bin/dpkg";
 const char kSimNoteOpt[] = "-o";
 const char kSimNoteVal[] = "APT::Get::Show-User-Simulation-Note=false";
 const char kConfdef[] = "Dpkg::Options::=--force-confdef";
@@ -46,10 +47,11 @@ const char kNoRecommends[] = "APT::Install-Recommends=false";
  * is not added here: that command is only for an interrupted dpkg that has
  * already exited (see fail_apt). A full disk is this sentence plus kFreeSpace. */
 const char kUpgradeUnfinished[] = "The upgrade stopped with a package left unfinished.";
-const char kFreeSpace[] = "Free disk space, then finish configuring packages.";
+const char kFreeSpace[] = "Free disk space, then use Repair to finish configuring packages.";
+/* Round 10 (U-1): the window offers a Repair button for this state. */
 const char kDpkgRecovery[] =
     "The package installer was interrupted. "
-    "Run dpkg --configure -a to finish configuring packages.";
+    "Use Repair to finish configuring packages.";
 const char kDpkgStillRunning[] =
     "The package installer was interrupted and is still running.";
 const char kSafePath[] = "/usr/sbin:/usr/bin:/sbin:/bin";
@@ -77,6 +79,17 @@ const char* apt_get_path()
       return env;
   }
   return kAptGet;
+}
+
+const char* dpkg_path()
+{
+  /* Same rule as apt_get_path: root never takes the override. */
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_DPKG");
+    if (env != nullptr && env[0] == '/')
+      return env;
+  }
+  return kDpkg;
 }
 
 struct AptClock {
@@ -205,7 +218,8 @@ void restore_env(const char* key, const std::string& value)
  * configuring dpkg latches only for the install invocation, and only while
  * that dpkg is still alive. */
 int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, std::string& out,
-            std::string& err, bool watch_configure, bool forward_progress = true)
+            std::string& err, bool watch_configure, bool forward_progress = true,
+            bool apt_status = true)
 {
   int out_pipe[2] = {-1, -1};
   int err_pipe[2] = {-1, -1};
@@ -254,7 +268,7 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     }
     if (saved_args.empty())
       _exit(127);
-    if (have_status) {
+    if (have_status && apt_status) {
       saved_args.emplace_back("-o");
       saved_args.emplace_back("APT::Status-Fd=3");
     }
@@ -2165,6 +2179,130 @@ int do_upgrade(const std::vector<std::string>& pins)
   return 0;
 }
 
+/* Names of packages a simulated "apt-get -s -f install" would remove. Both
+ * the REMOVED section and "Remv" plan lines count. */
+std::vector<std::string> repair_removals(const std::string& text, const InstallPlan& plan)
+{
+  std::vector<std::string> names = plan.removed;
+  std::istringstream in(text);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.compare(0, 5, "Remv ") != 0)
+      continue;
+    std::istringstream ps(line.substr(5));
+    std::string name;
+    if (ps >> name && std::find(names.begin(), names.end(), name) == names.end())
+      names.push_back(name);
+  }
+  return names;
+}
+
+std::string join_names(const std::vector<std::string>& names)
+{
+  std::string out;
+  for (std::size_t i = 0; i < names.size() && i < 20; ++i) {
+    if (!out.empty())
+      out += ", ";
+    out += pin_for_message(names[i].c_str());
+  }
+  if (names.size() > 20)
+    out += ", …";
+  return out;
+}
+
+/* Round 10 (U-1): finish an interrupted or failed install.
+ * 1. dpkg --configure -a (confdef/confold, stdin /dev/null, noninteractive).
+ * 2. apt-get -s -f install. Any removal or downgrade refuses the repair, in
+ *    the same adds-only spirit as the kept-back probes. Nothing is removed.
+ * 3. apt-get -f install --no-remove, without Recommends. Never dist-upgrade.
+ * Once step 1 starts, the repair is committed: cancel, EOF and SIGTERM do not
+ * stop it, the same as an install whose dpkg has started. */
+int do_repair()
+{
+  if (stop_requested()) {
+    emit_error("Repair was cancelled");
+    return 1;
+  }
+  announce_ready();
+
+  const std::string dpkg = dpkg_path();
+  const AptClock clock = apt_clock(kUpgradeIdleSec, kUpgradeHardCapSec);
+  std::string out;
+  std::string err;
+
+  emit_phase("configure");
+  g_dpkg_committed = 1;
+  g_stop = 0;
+  write_all_fd(STDERR_FILENO, "DPKG_STARTED\n");
+  const std::vector<const char*> cfg_argv = {dpkg.c_str(), "--force-confdef", "--force-confold",
+                                             "--configure", "-a"};
+  int rc = run_apt(cfg_argv, clock.idle_sec, clock.hard_sec, out, err, false, true, false);
+  if (rc != 0) {
+    std::string msg = "Repair could not finish configuring packages.";
+    const std::string detail = first_error_line(out, err);
+    if (rc > 0 && !detail.empty() && detail != "apt-get failed")
+      msg += "\n" + detail;
+    if (rc == -1 || rc == 127)
+      msg += "\nCould not run dpkg.";
+    msg += "\nA package is still left unfinished.";
+    emit_error(msg);
+    return 1;
+  }
+
+  emit_phase("simulate");
+  const std::string apt = apt_get_path();
+  out.clear();
+  err.clear();
+  const std::vector<const char*> sim_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "-o",
+                                             kNoRecommends, "-s", "-q", "-f", "install"};
+  const AptClock sim_clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+  rc = run_apt(sim_argv, sim_clock.idle_sec, sim_clock.hard_sec, out, err, false);
+  if (rc != 0) {
+    std::string msg = "Repair finished configuring packages, but could not fix missing dependencies.\n";
+    msg += first_error_line(out, err);
+    emit_error(msg);
+    return 1;
+  }
+  const std::string sim_text = out + "\n" + err;
+  const InstallPlan plan = parse_install_plan(sim_text);
+  const std::vector<std::string> removals = repair_removals(sim_text, plan);
+  if (!removals.empty() || !plan.downgraded.empty() || plan.remove_count > 0 ||
+      plan.downgrade_count > 0) {
+    std::string msg = "Repair stopped: fixing the dependencies would ";
+    if (!removals.empty() || plan.remove_count > 0)
+      msg += "remove " + (removals.empty() ? std::string("packages") : join_names(removals));
+    else
+      msg += "downgrade " + join_names(plan.downgraded);
+    msg += ". Nothing was removed.\nAsk for help before removing packages.";
+    emit_error(msg);
+    return 1;
+  }
+
+  SimulateResult result;
+  result.status = SimulateResult::Success;
+  if (!plan.inst.empty() || !plan.newly.empty()) {
+    emit_phase("repair");
+    out.clear();
+    err.clear();
+    const std::vector<const char*> fix_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, kSimNoteOpt,
+                                               kQuietVal,  "-y",        "-o",        kConfdef,
+                                               "-o",       kConfold,    "-o",        kNoRecommends,
+                                               "--no-remove", "-f",     "install"};
+    rc = run_apt(fix_argv, clock.idle_sec, clock.hard_sec, out, err, true);
+    if (rc != 0) {
+      std::string msg = "Repair could not fix missing dependencies.\n";
+      msg += first_error_line(out, err);
+      emit_error(msg);
+      return 1;
+    }
+    const SimulateResult parsed = parse_apt_simulate(out + "\n" + err);
+    result.conffiles_kept = parsed.conffiles_kept;
+    result.upgraded_count = parsed.upgraded_count;
+  }
+  emit(result);
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -2179,7 +2317,7 @@ int main(int argc, char** argv)
   sigaction(SIGHUP, &sa, nullptr);
 
   if (argc < 2 || argv[1] == nullptr) {
-    emit_error("refused: helper accepts only simulate or upgrade");
+    emit_error("refused: helper accepts only simulate, upgrade or repair");
     return 2;
   }
 
@@ -2194,10 +2332,17 @@ int main(int argc, char** argv)
   const std::string cmd = argv[1];
   if (cmd == "simulate") {
     if (argc != 2) {
-      emit_error("refused: helper accepts only simulate or upgrade");
+      emit_error("refused: helper accepts only simulate, upgrade or repair");
       return 2;
     }
     return do_simulate();
+  }
+  if (cmd == "repair") {
+    if (argc != 2) {
+      emit_error("refused: repair takes no arguments");
+      return 2;
+    }
+    return do_repair();
   }
   if (cmd == "upgrade") {
     std::vector<std::string> pins;
@@ -2236,6 +2381,6 @@ int main(int argc, char** argv)
     }
     return do_upgrade(pins);
   }
-  emit_error("refused: helper accepts only simulate or upgrade");
+  emit_error("refused: helper accepts only simulate, upgrade or repair");
   return 2;
 }

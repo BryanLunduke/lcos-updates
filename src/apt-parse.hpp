@@ -182,6 +182,12 @@ void apply_held_packages(SimulateResult& result, const std::string& status_text)
 /* Stable helper stdout protocol. */
 std::string format_protocol(const SimulateResult& result);
 SimulateResult parse_protocol(const std::string& text);
+/* Field escaping for that protocol. token also escapes a space. */
+std::string protocol_escape(const std::string& value, bool token);
+std::string protocol_unescape(const std::string& value);
+/* True when an error says dpkg/apt is left interrupted or broken and the
+ * Repair action (dpkg --configure -a, then apt-get -f install) applies. */
+bool error_suggests_repair(const std::string& msg);
 
 /* Check and install failures are worded separately. Apt's Err:, W:, and E:
  * lines are kept, including the URL. A connect timeout or refusal adds the

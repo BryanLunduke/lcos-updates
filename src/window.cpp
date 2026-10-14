@@ -439,10 +439,19 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_buttons.pack_start(m_install, Gtk::PACK_SHRINK);
   m_buttons.pack_start(m_check, Gtk::PACK_SHRINK);
   m_buttons.pack_start(m_restart, Gtk::PACK_SHRINK);
+  /* Round 10 (U-1): shown only when a check or install says dpkg was left
+   * interrupted or with broken dependencies. */
+  m_repair.set_no_show_all(true);
+  m_repair.set_can_default(true);
+  m_repair.set_tooltip_text("Finish the interrupted install and fix missing dependencies. "
+                            "Nothing is removed.");
+  m_repair.hide();
+  m_buttons.pack_start(m_repair, Gtk::PACK_SHRINK);
   m_check.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_check_clicked));
   m_install.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_install_clicked));
   m_cancel.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_cancel_clicked));
   m_restart.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_restart_clicked));
+  m_repair.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_repair_clicked));
 
   m_content.set_border_width(12);
   m_content.pack_start(m_status_row, Gtk::PACK_SHRINK);
@@ -645,6 +654,7 @@ void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
     use_cancel_as_default();
   m_pulse.disconnect();
   if (busy) {
+    m_repair.hide();
     m_restart.hide();
     m_restart.set_sensitive(false);
     m_spinner.show();
@@ -833,7 +843,7 @@ bool UpdatesWindow::on_view_tooltip(int x, int y, bool /*keyboard_tooltip*/,
 
 void UpdatesWindow::order_trailing(Gtk::Button& trailing)
 {
-  Gtk::Button* buttons[] = {&m_cancel, &m_install, &m_check, &m_restart};
+  Gtk::Button* buttons[] = {&m_cancel, &m_install, &m_check, &m_restart, &m_repair};
   int pos = 0;
   for (Gtk::Button* button : buttons) {
     if (button == &trailing)
@@ -911,7 +921,8 @@ void UpdatesWindow::request_stop()
   const Job job = m_job;
   m_check.set_sensitive(false);
   m_install.set_sensitive(false);
-  set_status_text(job == Job::Install ? "Stopping the update…" : "Stopping the update check…");
+  set_status_text(job == Job::Check ? "Stopping the update check…"
+                                    : job == Job::Repair ? "Stopping the repair…" : "Stopping the update…");
   if (m_helper_ready || !m_have_pid)
     return;
   const pid_t child = static_cast<pid_t>(m_pid);
@@ -966,9 +977,9 @@ void UpdatesWindow::finish_job()
 void UpdatesWindow::arm_job_timeout()
 {
   /* Once dpkg has started, the install is not on a kill clock. */
-  if (m_dpkg_started || m_install_committed || (m_job != Job::Check && m_job != Job::Install))
+  if (m_dpkg_started || m_install_committed || m_job == Job::None)
     return;
-  const int fallback = m_job == Job::Install ? kInstallTimeoutMs : kCheckTimeoutMs;
+  const int fallback = installing() ? kInstallTimeoutMs : kCheckTimeoutMs;
   m_timeout.disconnect();
   m_timeout = Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::on_timeout),
                                              gui_timeout_ms(fallback));
@@ -1211,7 +1222,7 @@ bool UpdatesWindow::on_stderr(Glib::IOCondition cond)
 
 void UpdatesWindow::maybe_rearm_job_timeout()
 {
-  if (m_helper_ready || (m_job != Job::Check && m_job != Job::Install))
+  if (m_helper_ready || m_job == Job::None)
     return;
   if (m_markers.find("HELPER_READY\n") == std::string::npos)
     return;
@@ -1219,7 +1230,9 @@ void UpdatesWindow::maybe_rearm_job_timeout()
   arm_phase_timer();
   show_job_progress();
   if (!m_dpkg_started && m_phase.empty() && m_progress_line.empty())
-    set_status_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
+    set_status_text(m_job == Job::Repair    ? "Repairing…"
+                    : m_job == Job::Install ? "Installing updates…"
+                                            : "Checking for updates…");
   apply_phase_status();
   if (m_dpkg_started || m_install_committed)
     return;
@@ -1236,7 +1249,7 @@ void UpdatesWindow::maybe_note_dpkg()
   m_dpkg_started = on;
   if (on) {
     m_progress_percent = -1;
-    if (m_job == Job::Install)
+    if (installing())
       m_install_committed = true;
     m_timeout.disconnect();
     m_retry.disconnect();
@@ -1252,7 +1265,7 @@ void UpdatesWindow::maybe_note_dpkg()
     }
     return;
   }
-  if (m_job != Job::Check && m_job != Job::Install)
+  if (m_job == Job::None)
     return;
   if (m_install_committed)
     m_cancel.set_sensitive(false);
@@ -1262,7 +1275,9 @@ void UpdatesWindow::maybe_note_dpkg()
   arm_job_timeout();
   apply_phase_status();
   if (m_progress_line.empty() && m_phase.empty())
-    set_status_text(m_job == Job::Install ? "Installing updates…" : "Checking for updates…");
+    set_status_text(m_job == Job::Repair    ? "Repairing…"
+                    : m_job == Job::Install ? "Installing updates…"
+                                            : "Checking for updates…");
 }
 
 void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages,
@@ -1303,7 +1318,7 @@ void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector
 void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
 {
   const bool keep = !m_store->children().empty();
-  const JobOutcome outcome = outcome_timeout(job == Job::Install, helper_ready, keep);
+  const JobOutcome outcome = outcome_timeout(job == Job::Install || job == Job::Repair, helper_ready, keep);
   present_outcome(outcome, {}, {});
 }
 
@@ -1407,9 +1422,10 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
 
   /* Cancel wins over a success protocol that arrived after the pipe closed.
    * That includes a check that finished classifying kept-back packages. */
-  if (user_stopped && !timed_out && (job == Job::Check || job == Job::Install)) {
-    const std::string want =
-        job == Job::Install ? "Install was cancelled" : "Update check was cancelled";
+  if (user_stopped && !timed_out && job != Job::None) {
+    const std::string want = job == Job::Install  ? "Install was cancelled"
+                             : job == Job::Repair ? "Repair was cancelled"
+                                                  : "Update check was cancelled";
     const bool said = parsed.status == SimulateResult::Error &&
                       parsed.error_msg.find("cancelled") != std::string::npos;
     if (!said) {
@@ -1422,6 +1438,8 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
     apply_check_result(parsed, wait_status);
   else if (job == Job::Install)
     apply_install_result(parsed, wait_status);
+  else if (job == Job::Repair)
+    apply_repair_result(parsed, wait_status);
   else
     set_idle_status(m_status.get_text());
 
@@ -1455,6 +1473,7 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
   }
   const bool have_rows = !m_store->children().empty();
   present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages);
+  offer_repair_for(shown);
 }
 
 void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_status)
@@ -1469,6 +1488,75 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
   }
   const bool have_rows = !m_store->children().empty();
   present_outcome(outcome_install(shown, exit_code, have_rows), shown.packages, shown.new_packages);
+  offer_repair_for(shown);
+}
+
+void UpdatesWindow::offer_repair_for(const SimulateResult& result)
+{
+  if (result.status != SimulateResult::Error || !error_suggests_repair(result.error_msg)) {
+    m_repair.hide();
+    m_repair.set_sensitive(false);
+    return;
+  }
+  m_repair.show();
+  m_repair.set_sensitive(true);
+  /* Nothing to install until the package system is repaired. */
+  m_install.set_sensitive(false);
+  order_trailing(m_repair);
+  set_default(m_repair);
+  m_repair.grab_default();
+  queue_fit();
+}
+
+void UpdatesWindow::apply_repair_result(const SimulateResult& result, int wait_status)
+{
+  SimulateResult shown = result;
+  const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+  if (shown.status == SimulateResult::Error &&
+      (shown.error_msg.empty() || shown.error_msg == "No STATUS from helper")) {
+    const std::string auth = authentication_message({}, exit_code);
+    shown.error_msg = auth.empty() ? "Repair did not finish." : auth;
+  }
+  hide_package_list();
+  m_install.set_sensitive(false);
+  m_check.set_sensitive(true);
+  if (shown.status == SimulateResult::Success) {
+    Glib::ustring text = "Repair finished. Check for updates to continue.";
+    if (!shown.conffiles_kept.empty())
+      text += " Your changed settings files were kept.";
+    set_idle_status(text);
+    m_repair.hide();
+    m_repair.set_sensitive(false);
+    use_check_as_default();
+    return;
+  }
+  set_idle_status(friendly_job_error(shown.error_msg, JobKind::Install));
+  /* A cancelled or failed repair can be tried again; a refused removal cannot. */
+  const bool again = error_suggests_repair(shown.error_msg) ||
+                     shown.error_msg.find("cancelled") != std::string::npos;
+  if (again) {
+    m_repair.show();
+    m_repair.set_sensitive(true);
+    order_trailing(m_repair);
+    set_default(m_repair);
+    m_repair.grab_default();
+  } else {
+    m_repair.hide();
+    m_repair.set_sensitive(false);
+    use_check_as_default();
+  }
+  queue_fit();
+}
+
+void UpdatesWindow::on_repair_clicked()
+{
+  if (m_closing || m_job != Job::None || m_have_pid || m_new_dialog != nullptr)
+    return;
+  set_busy(true, "Waiting for authentication…");
+  start_helper({"repair"}, Job::Repair, gui_timeout_ms(kAuthTimeoutMs));
+  if (m_job != Job::None)
+    acquire_inhibitors("Repairing software updates");
+  update_logout_warning();
 }
 
 void UpdatesWindow::on_about()
@@ -1825,9 +1913,10 @@ void UpdatesWindow::release_inhibitors()
 
 void UpdatesWindow::update_logout_warning()
 {
-  const bool show = m_job == Job::Install && m_logind_fd < 0 && m_inhibit_cookie == 0;
+  const bool show = installing() && m_logind_fd < 0 && m_inhibit_cookie == 0;
   if (show) {
-    m_warning.set_text("Don't log out or shut down until the install finishes.");
+    m_warning.set_text(m_job == Job::Repair ? "Don't log out or shut down until the repair finishes."
+                                            : "Don't log out or shut down until the install finishes.");
     m_warning.show();
   } else {
     m_warning.hide();
@@ -1851,7 +1940,8 @@ void UpdatesWindow::refresh_commit_note()
 {
   if (!m_install_committed)
     return;
-  Glib::ustring note = "This install will finish on its own.";
+  Glib::ustring note = m_job == Job::Repair ? "This repair will finish on its own."
+                                            : "This install will finish on its own.";
   const int sec = m_phase_mark_us > 0
                       ? static_cast<int>((g_get_monotonic_time() - m_phase_mark_us) / G_USEC_PER_SEC)
                       : 0;
@@ -1899,8 +1989,14 @@ void UpdatesWindow::apply_phase_status()
     text = "Refreshing package lists…";
   else if (m_phase == "download")
     text = "Downloading updates…";
+  else if (m_phase == "configure")
+    text = "Finishing the interrupted install…";
+  else if (m_phase == "repair")
+    text = "Installing missing dependencies…";
   else if (m_phase == "simulate")
-    text = m_job == Job::Install ? "Checking the package list…" : "Checking for updates…";
+    text = m_job == Job::Repair    ? "Checking for missing dependencies…"
+           : m_job == Job::Install ? "Checking the package list…"
+                                   : "Checking for updates…";
   else
     return;
   if (!progress_has_count(text))
@@ -1913,8 +2009,7 @@ void UpdatesWindow::note_helper_activity()
 {
   if (m_helper_ready)
     m_progress_mark_us = g_get_monotonic_time();
-  if (!m_helper_ready || m_dpkg_started || m_install_committed ||
-      (m_job != Job::Check && m_job != Job::Install))
+  if (!m_helper_ready || m_dpkg_started || m_install_committed || m_job == Job::None)
     return;
   if (m_phase.empty() && m_progress_line.empty())
     return;
@@ -1986,7 +2081,7 @@ bool UpdatesWindow::on_phase_tick()
   const int stalled = m_progress_mark_us > 0
                           ? static_cast<int>((g_get_monotonic_time() - m_progress_mark_us) / G_USEC_PER_SEC)
                           : 0;
-  const bool stalled_install = m_job == Job::Install && m_install_committed && stalled >= stall_notice_sec();
+  const bool stalled_install = installing() && m_install_committed && stalled >= stall_notice_sec();
   if (stalled_install) {
     if (stalled >= stall_inhibit_sec())
       relax_logind_inhibitor();

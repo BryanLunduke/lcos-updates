@@ -8,14 +8,18 @@
   <icon_name>system-software-update</icon_name>
 
   <!-- pkexec matches exec.path plus exec.argv1. A path-only action would
-       also match simulate and show the install prompt for a check. -->
+       also match simulate and show the install prompt for a check.
+       Round 10 (U-4): no action uses auth_admin_keep. A kept authorization
+       belongs to the whole login session, so any program the user runs could
+       have started the root helper without a password for about 5 minutes.
+       Every check, install and repair now asks for the password itself. -->
   <action id="org.lunduke.lcos-updates.check">
     <description>Check for software updates</description>
     <message>Authentication is required to check for software updates</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
-      <allow_active>auth_admin_keep</allow_active>
+      <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/lcos-updates-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">simulate</annotate>
@@ -32,6 +36,19 @@
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/lcos-updates-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">upgrade</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="org.lunduke.lcos-updates.repair">
+    <description>Repair an interrupted software update</description>
+    <message>Authentication is required to repair an interrupted software update</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/lcos-updates-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">repair</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

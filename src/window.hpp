@@ -41,6 +41,10 @@ public:
   bool install_sensitive_for_test() const { return m_install.get_sensitive(); }
   void test_click_check() { on_check_clicked(); }
   void test_click_install() { on_install_clicked(); }
+  void test_click_repair() { on_repair_clicked(); }
+  bool repair_visible_for_test() const { return m_repair.get_visible(); }
+  bool repair_sensitive_for_test() const { return m_repair.get_sensitive(); }
+  bool repair_is_default_for_test() const { return get_default_widget() == &m_repair; }
   void test_click_cancel() { on_cancel_clicked(); }
   void test_quit() { on_quit(); }
   void test_confirm_close();
@@ -120,12 +124,15 @@ public:
 protected:
   void on_check_clicked();
   void on_install_clicked();
+  void on_repair_clicked();
   void on_about();
   bool on_delete_event(GdkEventAny* event) override;
   bool on_key_press_event(GdkEventKey* event) override;
 
 private:
-  enum class Job { None, Check, Install };
+  enum class Job { None, Check, Install, Repair };
+  /* Install and Repair both run dpkg as root and cannot be cancelled once dpkg starts. */
+  bool installing() const { return m_job == Job::Install || m_job == Job::Repair; }
 
   void set_busy(bool busy, const Glib::ustring& status);
   void set_idle_status(const Glib::ustring& status);
@@ -149,6 +156,9 @@ private:
   void on_child_exited(Glib::Pid pid, int wait_status);
   void apply_check_result(const SimulateResult& result, int wait_status);
   void apply_install_result(const SimulateResult& result, int wait_status);
+  void apply_repair_result(const SimulateResult& result, int wait_status);
+  /* Shows Repair when an error says the package system is left broken. */
+  void offer_repair_for(const SimulateResult& result);
   void show_packages(const std::vector<PackageUpgrade>& packages);
   void show_new_packages(const std::vector<PackageUpgrade>& packages);
   void show_package_list();
@@ -214,6 +224,7 @@ private:
   Gtk::Button m_check{"_Check for updates", true};
   Gtk::Button m_install{"_Install updates", true};
   Gtk::Button m_restart{"_Restart", true};
+  Gtk::Button m_repair{"_Repair", true};
 
   class ModelColumns : public Gtk::TreeModel::ColumnRecord {
   public:

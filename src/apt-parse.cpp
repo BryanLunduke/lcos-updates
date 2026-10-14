@@ -11,6 +11,26 @@
 #include <cstring>
 #include <sstream>
 
+/* Decimal count in [begin, end). False for a non-digit or a value above
+ * kMaxCount, so a hostile digit run cannot overflow int (round 10, U-3). */
+static constexpr int kMaxCount = 1000000000;
+static bool checked_count(const std::string& text, std::size_t begin, std::size_t end, int& out)
+{
+  if (begin >= end || end > text.size())
+    return false;
+  long long value = 0;
+  for (std::size_t i = begin; i < end; ++i) {
+    const unsigned char ch = static_cast<unsigned char>(text[i]);
+    if (!std::isdigit(ch))
+      return false;
+    value = value * 10 + (ch - '0');
+    if (value > kMaxCount)
+      return false;
+  }
+  out = static_cast<int>(value);
+  return true;
+}
+
 static std::string trim_cr(std::string line)
 {
   if (!line.empty() && line.back() == '\r')
@@ -665,6 +685,11 @@ void apply_download_details(SimulateResult& result, const std::string& text)
         digits = false;
         break;
       }
+      /* 10^15 bytes is far beyond any real package; a longer run is garbage. */
+      if (bytes > 100000000000000ull) {
+        digits = false;
+        break;
+      }
       bytes = bytes * 10ull + static_cast<unsigned long long>(ch - '0');
     }
     if (!digits)
@@ -726,8 +751,8 @@ static int integer_before(const std::string& line, std::string::size_type word)
   if (i == end)
     return -1;
   int value = 0;
-  for (; i < end; ++i)
-    value = value * 10 + (line[i] - '0');
+  if (!checked_count(line, i, end, value))
+    return -1;
   return value;
 }
 
@@ -1016,7 +1041,93 @@ std::string apt_index_warning(const std::string& text)
   return warning;
 }
 
-static void emit_lines(std::ostringstream& out, const char* tag, const std::string& text)
+/* Round 10 (U-2): every field value is escaped, so no value can start a
+ * new protocol line. Backslash, control bytes and DEL become \\, \n, \r,
+ * \t or \xHH. Token fields (package names, versions) also escape a space,
+ * so a name cannot shift the next token. parse_protocol undoes this. */
+std::string protocol_escape(const std::string& value, bool token)
+{
+  static const char hex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(value.size());
+  for (char ch : value) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c == '\\')
+      out += "\\\\";
+    else if (c == '\n')
+      out += "\\n";
+    else if (c == '\r')
+      out += "\\r";
+    else if (c == '\t')
+      out += "\\t";
+    else if (c < 0x20 || c == 0x7f || (token && c == ' ')) {
+      out += "\\x";
+      out.push_back(hex[c >> 4]);
+      out.push_back(hex[c & 15]);
+    } else
+      out.push_back(ch);
+  }
+  return out;
+}
+
+static int hex_value(char ch)
+{
+  if (ch >= '0' && ch <= '9')
+    return ch - '0';
+  if (ch >= 'a' && ch <= 'f')
+    return ch - 'a' + 10;
+  if (ch >= 'A' && ch <= 'F')
+    return ch - 'A' + 10;
+  return -1;
+}
+
+std::string protocol_unescape(const std::string& value)
+{
+  std::string out;
+  out.reserve(value.size());
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    const char ch = value[i];
+    if (ch != '\\' || i + 1 >= value.size()) {
+      out.push_back(ch);
+      continue;
+    }
+    const char next = value[i + 1];
+    if (next == '\\') {
+      out.push_back('\\');
+      ++i;
+    } else if (next == 'n') {
+      out.push_back('\n');
+      ++i;
+    } else if (next == 'r') {
+      out.push_back('\r');
+      ++i;
+    } else if (next == 't') {
+      out.push_back('\t');
+      ++i;
+    } else if (next == 'x' && i + 3 < value.size() && hex_value(value[i + 2]) >= 0 &&
+               hex_value(value[i + 3]) >= 0) {
+      out.push_back(static_cast<char>(hex_value(value[i + 2]) * 16 + hex_value(value[i + 3])));
+      i += 3;
+    } else {
+      out.push_back(ch);
+    }
+  }
+  return out;
+}
+
+static std::string esc(const std::string& value)
+{
+  return protocol_escape(value, false);
+}
+
+static std::string tok(const std::string& value)
+{
+  return protocol_escape(value, true);
+}
+
+/* Multi-line text keeps one tagged line per source line. */
+static void emit_lines(std::ostringstream& out, const char* tag, const std::string& text,
+                       bool fallback = true)
 {
   std::istringstream lines(text);
   std::string line;
@@ -1026,9 +1137,9 @@ static void emit_lines(std::ostringstream& out, const char* tag, const std::stri
     if (line.empty())
       continue;
     any = true;
-    out << tag << " " << line << "\n";
+    out << tag << " " << esc(line) << "\n";
   }
-  if (!any)
+  if (!any && fallback)
     out << tag << " unknown error\n";
 }
 
@@ -1037,67 +1148,53 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
   if (result.not_upgraded_count > 0)
     out << "NOT_UPGRADED " << result.not_upgraded_count << "\n";
   for (const auto& name : result.kept_back)
-    out << "KEPT " << name << "\n";
+    out << "KEPT " << esc(name) << "\n";
   for (const auto& pkg : result.new_packages) {
     if (!pkg.name.empty() && !pkg.new_version.empty())
-      out << "NEW " << pkg.name << " " << pkg.new_version << "\n";
+      out << "NEW " << tok(pkg.name) << " " << tok(pkg.new_version) << "\n";
   }
   for (const auto& name : result.unclassified)
-    out << "UNCLASSIFIED " << name << "\n";
-  if (!result.download_need.empty()) {
-    std::istringstream needs(result.download_need);
-    std::string need;
-    while (std::getline(needs, need)) {
-      need = trim_cr(need);
-      if (!need.empty())
-        out << "NEED " << need << "\n";
-    }
-  }
+    out << "UNCLASSIFIED " << esc(name) << "\n";
+  if (!result.download_need.empty())
+    emit_lines(out, "NEED", result.download_need, false);
   if (!result.disk_use.empty())
-    out << "DISK " << result.disk_use << "\n";
+    out << "DISK " << esc(result.disk_use) << "\n";
   for (const auto& pkg : result.packages) {
     if (pkg.security)
-      out << "SEC " << pkg.name << "\n";
+      out << "SEC " << esc(pkg.name) << "\n";
     if (!pkg.size.empty())
-      out << "SIZE " << pkg.name << " " << pkg.size << "\n";
+      out << "SIZE " << tok(pkg.name) << " " << esc(pkg.size) << "\n";
   }
   for (const auto& name : result.phased)
-    out << "PHASED " << name << "\n";
+    out << "PHASED " << esc(name) << "\n";
   for (const auto& name : result.held)
-    out << "HELD " << name << "\n";
+    out << "HELD " << esc(name) << "\n";
   if (result.reboot_required) {
     if (result.reboot_pkgs.empty())
       out << "REBOOT\n";
     for (const auto& name : result.reboot_pkgs)
-      out << "REBOOT " << name << "\n";
+      out << "REBOOT " << esc(name) << "\n";
   }
   if (result.reboot_already) {
     if (result.reboot_pending_pkgs.empty())
       out << "REBOOT_ALREADY\n";
     for (const auto& name : result.reboot_pending_pkgs)
-      out << "REBOOT_ALREADY " << name << "\n";
+      out << "REBOOT_ALREADY " << esc(name) << "\n";
   }
   for (const auto& removal : result.kept_removals) {
     if (removal.removes.empty())
-      out << "REMOVE " << removal.package << "\n";
+      out << "REMOVE " << tok(removal.package) << "\n";
     for (const auto& victim : removal.removes)
-      out << "REMOVE " << removal.package << " " << victim << "\n";
+      out << "REMOVE " << tok(removal.package) << " " << tok(victim) << "\n";
   }
   if (result.summary_missing)
     out << "SUMMARY_MISSING\n";
   for (const auto& path : result.conffiles_kept)
-    out << "CONFKEPT " << path << "\n";
+    out << "CONFKEPT " << esc(path) << "\n";
   if (result.install_skipped)
     out << "SKIPPED\n";
-  if (result.warning.empty())
-    return;
-  std::istringstream lines(result.warning);
-  std::string line;
-  while (std::getline(lines, line)) {
-    line = trim_cr(line);
-    if (!line.empty())
-      out << "WARN " << line << "\n";
-  }
+  if (!result.warning.empty())
+    emit_lines(out, "WARN", result.warning, false);
 }
 
 std::string format_protocol(const SimulateResult& result)
@@ -1111,7 +1208,7 @@ std::string format_protocol(const SimulateResult& result)
     out << "STATUS upgrades\n";
     out << "COUNT " << result.packages.size() << "\n";
     for (const auto& pkg : result.packages)
-      out << "PKG " << pkg.name << " " << pkg.old_version << " " << pkg.new_version
+      out << "PKG " << tok(pkg.name) << " " << tok(pkg.old_version) << " " << tok(pkg.new_version)
           << "\n";
     break;
   case SimulateResult::Success:
@@ -1135,6 +1232,7 @@ SimulateResult parse_protocol(const std::string& text)
   result.status = SimulateResult::Error;
   result.error_msg = "No STATUS from helper";
   bool saw_status = false;
+  bool duplicate_status = false;
   std::vector<std::string> security_names;
   std::vector<std::pair<std::string, std::string>> sizes;
 
@@ -1144,6 +1242,11 @@ SimulateResult parse_protocol(const std::string& text)
     line = trim_cr(line);
     if (line.compare(0, 7, "STATUS ") == 0) {
       const std::string st = line.substr(7);
+      if (saw_status) {
+        /* One STATUS per result. A second one is never trusted. */
+        duplicate_status = true;
+        continue;
+      }
       saw_status = true;
       if (st == "up-to-date") {
         result.status = SimulateResult::UpToDate;
@@ -1165,39 +1268,42 @@ SimulateResult parse_protocol(const std::string& text)
         result.error_msg = "Unknown STATUS " + st;
       }
     } else if (line.compare(0, 4, "MSG ") == 0) {
-      const std::string msg = line.substr(4);
+      const std::string msg = protocol_unescape(line.substr(4));
       if (result.error_msg.empty())
         result.error_msg = msg;
       else
         result.error_msg += "\n" + msg;
     } else if (line.compare(0, 9, "CONFKEPT ") == 0) {
-      const std::string path = line.substr(9);
+      const std::string path = protocol_unescape(line.substr(9));
       if (!path.empty())
         result.conffiles_kept.push_back(path);
     } else if (line == "SKIPPED") {
       result.install_skipped = true;
     } else if (line.compare(0, 5, "WARN ") == 0) {
-      const std::string msg = line.substr(5);
+      const std::string msg = protocol_unescape(line.substr(5));
       if (result.warning.empty())
         result.warning = msg;
       else
         result.warning += "\n" + msg;
     } else if (line.compare(0, 5, "KEPT ") == 0) {
-      const std::string name = line.substr(5);
+      const std::string name = protocol_unescape(line.substr(5));
       if (!name.empty())
         result.kept_back.push_back(name);
     } else if (line.compare(0, 4, "NEW ") == 0) {
       std::istringstream ps(line.substr(4));
       PackageUpgrade pkg;
       pkg.old_version = "-";
-      if (ps >> pkg.name >> pkg.new_version && !pkg.name.empty() && !pkg.new_version.empty())
+      if (ps >> pkg.name >> pkg.new_version && !pkg.name.empty() && !pkg.new_version.empty()) {
+        pkg.name = protocol_unescape(pkg.name);
+        pkg.new_version = protocol_unescape(pkg.new_version);
         result.new_packages.push_back(pkg);
+      }
     } else if (line.compare(0, 13, "UNCLASSIFIED ") == 0) {
-      const std::string name = line.substr(13);
+      const std::string name = protocol_unescape(line.substr(13));
       if (!name.empty())
         result.unclassified.push_back(name);
     } else if (line.compare(0, 5, "NEED ") == 0) {
-      const std::string need = line.substr(5);
+      const std::string need = protocol_unescape(line.substr(5));
       if (!need.empty()) {
         if (result.download_need.empty())
           result.download_need = need;
@@ -1205,11 +1311,11 @@ SimulateResult parse_protocol(const std::string& text)
           result.download_need += "\n" + need;
       }
     } else if (line.compare(0, 5, "DISK ") == 0) {
-      const std::string disk = line.substr(5);
+      const std::string disk = protocol_unescape(line.substr(5));
       if (!disk.empty())
         result.disk_use = disk;
     } else if (line.compare(0, 4, "SEC ") == 0) {
-      const std::string name = line.substr(4);
+      const std::string name = protocol_unescape(line.substr(4));
       if (!name.empty())
         security_names.push_back(name);
     } else if (line.compare(0, 5, "SIZE ") == 0) {
@@ -1221,28 +1327,28 @@ SimulateResult parse_protocol(const std::string& text)
         while (!size.empty() && size[0] == ' ')
           size.erase(0, 1);
         if (!name.empty() && !size.empty())
-          sizes.emplace_back(name, size);
+          sizes.emplace_back(protocol_unescape(name), protocol_unescape(size));
       }
     } else if (line.compare(0, 7, "PHASED ") == 0) {
-      const std::string name = line.substr(7);
+      const std::string name = protocol_unescape(line.substr(7));
       if (!name.empty())
         result.phased.push_back(name);
     } else if (line.compare(0, 5, "HELD ") == 0) {
-      const std::string name = line.substr(5);
+      const std::string name = protocol_unescape(line.substr(5));
       if (!name.empty())
         result.held.push_back(name);
     } else if (line == "REBOOT_ALREADY") {
       result.reboot_already = true;
     } else if (line.compare(0, 15, "REBOOT_ALREADY ") == 0) {
       result.reboot_already = true;
-      const std::string name = line.substr(15);
+      const std::string name = protocol_unescape(line.substr(15));
       if (!name.empty())
         result.reboot_pending_pkgs.push_back(name);
     } else if (line == "REBOOT") {
       result.reboot_required = true;
     } else if (line.compare(0, 7, "REBOOT ") == 0) {
       result.reboot_required = true;
-      const std::string name = line.substr(7);
+      const std::string name = protocol_unescape(line.substr(7));
       if (!name.empty())
         result.reboot_pkgs.push_back(name);
     } else if (line.compare(0, 7, "REMOVE ") == 0) {
@@ -1251,6 +1357,7 @@ SimulateResult parse_protocol(const std::string& text)
       std::string victim;
       if (!(ps >> package))
         continue;
+      package = protocol_unescape(package);
       SimulateResult::KeptRemoval* slot = nullptr;
       for (auto& have : result.kept_removals) {
         if (have.package == package)
@@ -1263,26 +1370,27 @@ SimulateResult parse_protocol(const std::string& text)
       }
       while (ps >> victim) {
         if (!victim.empty())
-          slot->removes.push_back(victim);
+          slot->removes.push_back(protocol_unescape(victim));
       }
     } else if (line == "SUMMARY_MISSING") {
       result.summary_missing = true;
     } else if (line.compare(0, 13, "NOT_UPGRADED ") == 0) {
-      int value = 0;
       const std::string digits = line.substr(13);
-      if (!digits.empty()) {
-        for (char ch : digits) {
-          if (!std::isdigit(static_cast<unsigned char>(ch)))
-            break;
-          value = value * 10 + (ch - '0');
-        }
+      std::size_t end = 0;
+      while (end < digits.size() && std::isdigit(static_cast<unsigned char>(digits[end])))
+        ++end;
+      int value = 0;
+      if (end > 0 && checked_count(digits, 0, end, value))
         result.not_upgraded_count = value;
-      }
     } else if (line.compare(0, 4, "PKG ") == 0) {
       std::istringstream ps(line.substr(4));
       PackageUpgrade pkg;
-      if (ps >> pkg.name >> pkg.old_version >> pkg.new_version)
+      if (ps >> pkg.name >> pkg.old_version >> pkg.new_version) {
+        pkg.name = protocol_unescape(pkg.name);
+        pkg.old_version = protocol_unescape(pkg.old_version);
+        pkg.new_version = protocol_unescape(pkg.new_version);
         result.packages.push_back(pkg);
+      }
     }
   }
 
@@ -1297,6 +1405,12 @@ SimulateResult parse_protocol(const std::string& text)
     }
   }
 
+  if (duplicate_status) {
+    result = SimulateResult{};
+    result.status = SimulateResult::Error;
+    result.error_msg = "Malformed helper output (more than one STATUS line)";
+    return result;
+  }
   if (!saw_status) {
     result.status = SimulateResult::Error;
     if (result.error_msg.empty())
@@ -1907,4 +2021,20 @@ JobOutcome outcome_timeout(bool installing, bool helper_ready, bool have_rows)
     out.packages = PackageListAction::Keep;
   }
   return out;
+}
+
+bool error_suggests_repair(const std::string& msg)
+{
+  std::string lower = msg;
+  for (char& ch : lower)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  auto has_text = [&](const char* needle) { return lower.find(needle) != std::string::npos; };
+  /* A dpkg that is still running is not repairable yet. */
+  if (has_text("still running"))
+    return false;
+  return has_text("use repair") || has_text("dpkg was interrupted") ||
+         has_text("dpkg --configure -a") || has_text("--fix-broken") ||
+         has_text("unmet dependencies") || has_text("left unfinished") ||
+         has_text("half-installed") || has_text("half-configured") ||
+         has_text("package installer was interrupted");
 }
