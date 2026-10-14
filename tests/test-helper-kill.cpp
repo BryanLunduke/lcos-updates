@@ -1537,7 +1537,7 @@ int main(int argc, char** argv)
     expect(exited, "helper exits after cancel once dpkg is already running");
     expect(!dead(dpkg), "dpkg is still alive after cancel");
     expect(out.find("cancelled") != std::string::npos, "cancel while configuring reports cancel");
-    expect(out.find("dpkg --configure -a") == std::string::npos,
+    expect(out.find("Use Repair") == std::string::npos,
            "a clean skip of dpkg is not the recovery message");
     if (!dead(dpkg))
       kill(dpkg, SIGKILL);
@@ -1579,7 +1579,7 @@ int main(int argc, char** argv)
     expect(!dead(dpkg), "dpkg is still alive after the helper exits");
     expect(out.find("still running") != std::string::npos,
            "an interrupted dpkg that is still alive does not offer configure -a");
-    expect(out.find("dpkg --configure -a") == std::string::npos,
+    expect(out.find("Use Repair") == std::string::npos,
            "configure -a is withheld while that dpkg process is still alive");
     if (!dead(dpkg))
       kill(dpkg, SIGKILL);
@@ -2323,7 +2323,7 @@ int main(int argc, char** argv)
       close(stdout_read);
     expect(exited, "helper exits after the interrupted dpkg is gone");
     expect(dead(dpkg), "the interrupted dpkg has exited");
-    expect(out.find("dpkg --configure -a") != std::string::npos,
+    expect(out.find("Use Repair") != std::string::npos,
            "configure -a is mentioned only after the interrupted dpkg is gone");
     expect(out.find("still running") == std::string::npos,
            "a gone dpkg is not described as still running");
@@ -2471,11 +2471,11 @@ int main(int argc, char** argv)
     expect(exited, "helper exits after a full disk");
     expect(out.find("No space left on device") != std::string::npos, "a full disk shows the cause");
     expect(out.find("foo.deb") != std::string::npos, "a full disk names the archive");
-    expect(out.find("dpkg --configure -a") == std::string::npos,
+    expect(out.find("Use Repair") == std::string::npos,
            "a full disk does not say to run dpkg --configure -a");
     expect(out.find("The upgrade stopped with a package left unfinished.") != std::string::npos,
            "a full disk says the upgrade stopped unfinished");
-    expect(out.find("Free disk space, then finish configuring packages.") != std::string::npos,
+    expect(out.find("Free disk space, then use Repair to finish configuring packages.") != std::string::npos,
            "a full disk says to free space and finish configuring");
   }
 
@@ -2923,7 +2923,7 @@ int main(int argc, char** argv)
            "a postinst failure names the package that failed");
     expect(out.find("The upgrade stopped with a package left unfinished.") != std::string::npos,
            "a postinst failure says the upgrade stopped unfinished");
-    expect(out.find("dpkg --configure -a") == std::string::npos,
+    expect(out.find("Use Repair") == std::string::npos,
            "a script failure is not an interrupted dpkg");
     expect(out.find("Sub-process /usr/bin/dpkg returned an error code") == std::string::npos,
            "the generic dpkg subprocess line is not the message");

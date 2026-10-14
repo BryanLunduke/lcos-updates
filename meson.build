@@ -136,6 +136,21 @@ test(
   timeout: 180,
 )
 
+test_r10 = executable(
+  'test-r10',
+  'tests/test-r10.cpp',
+  include_directories: inc,
+  link_with: apt_parse,
+  install: false,
+)
+
+test(
+  'round10-repair-protocol-counts',
+  test_r10,
+  args: [helper.full_path()],
+  timeout: 120,
+)
+
 test_window = executable(
   'test-window',
   'tests/test-window.cpp',

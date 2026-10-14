@@ -498,6 +498,40 @@ case "$mode" in
     while [ ! -e "$release.8" ]; do wait_sec 0.05; done
     printf 'STATUS up-to-date\n'
     ;;
+  broken)
+    # Round 10: the check fails on an interrupted dpkg; repair fixes it.
+    echo HELPER_READY >&2
+    if [ "$cmd" = "repair" ]; then
+      echo 'PHASE configure' >&2
+      echo DPKG_STARTED >&2
+      echo 'PROGRESS Setting up foo (2.0-1) ...' >&2
+      while [ ! -e "$release.repair" ]; do wait_sec 0.05; done
+      echo 'PHASE repair' >&2
+      printf 'STATUS success\n'
+    else
+      printf 'STATUS error\nMSG The package installer was interrupted. Use Repair to finish configuring packages.\n'
+    fi
+    ;;
+  broken-refuse)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "repair" ]; then
+      echo 'PHASE configure' >&2
+      echo DPKG_STARTED >&2
+      printf 'STATUS error\nMSG Repair stopped: fixing the dependencies would remove lcos-desktop. Nothing was removed.\nMSG Ask for help before removing packages.\n'
+    else
+      printf 'STATUS error\nMSG E: Unmet dependencies. Try %s with no packages (or specify a solution).\n' "'apt --fix-broken install'"
+    fi
+    ;;
+  broken-fail)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "repair" ]; then
+      echo 'PHASE configure' >&2
+      echo DPKG_STARTED >&2
+      printf 'STATUS error\nMSG Repair could not finish configuring packages.\nMSG installed foo package post-installation script subprocess returned error exit status 1\nMSG A package is still left unfinished.\n'
+    else
+      printf 'STATUS error\nMSG The package installer was interrupted. Use Repair to finish configuring packages.\n'
+    fi
+    ;;
   *)
     echo HELPER_READY >&2
     printf 'STATUS up-to-date\n'
@@ -1976,6 +2010,77 @@ int main()
       out << "go\n";
     }
     pump_until(2000, [&]() { return window->check_sensitive_for_test(); });
+    destroy_window(window, pidfile);
+  }
+
+  /* Round 10 (U-1): Repair for an interrupted or broken install. */
+  {
+    unlink(pidfile.c_str());
+    unlink((release + ".repair").c_str());
+    set_mode("broken");
+    set_timeout_ms(5000);
+    UpdatesWindow* window = new_window();
+    expect(!window->repair_visible_for_test(), "U-1: Repair is hidden before any error");
+    window->test_click_check();
+    const bool failed = pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    expect(failed, "U-1: the check on a broken system finishes");
+    expect(window->repair_visible_for_test() && window->repair_sensitive_for_test(),
+           "U-1: an interrupted install shows a sensitive Repair button");
+    expect(window->repair_is_default_for_test(), "U-1: Repair is the default button");
+    expect(!window->install_sensitive_for_test(), "U-1: Install stays off until repaired");
+    expect(!contains(window->status_text_for_test(), "terminal") &&
+               !contains(window->status_text_for_test(), "dpkg --configure"),
+           "U-1: the error does not tell the user to use a terminal");
+    window->test_click_repair();
+    const bool running = pump_until(3000, [&]() {
+      return contains(window->status_text_for_test(), "Configuring foo") ||
+             contains(window->status_text_for_test(), "Configuring packages");
+    });
+    expect(running, "U-1: the repair shows configure progress");
+    expect(!window->repair_visible_for_test(), "U-1: Repair hides while repairing");
+    expect(!window->cancel_sensitive_for_test(), "U-1: a committed repair cannot be cancelled");
+    expect(!window->check_sensitive_for_test(), "U-1: Check is off while repairing");
+    {
+      std::ofstream out(release + ".repair");
+      out << "go\n";
+    }
+    const bool done = pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    expect(done && contains(window->status_text_for_test(), "Repair finished"),
+           "U-1: a successful repair says so and offers Check");
+    expect(!window->repair_visible_for_test(), "U-1: Repair hides after a successful repair");
+    expect(window->check_is_default_for_test(), "U-1: Check is the default after repair");
+    const std::string calls = slurp(log);
+    expect(calls.find(" repair\n") != std::string::npos, "U-1: the button runs the helper's repair verb");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("broken-refuse");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    expect(window->repair_visible_for_test(), "U-1: unmet dependencies show Repair");
+    window->test_click_repair();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    expect(contains(window->status_text_for_test(), "would remove lcos-desktop") &&
+               contains(window->status_text_for_test(), "Nothing was removed"),
+           "U-1: a refused repair names the package it would have removed");
+    expect(!window->repair_visible_for_test(), "U-1: a refused repair does not offer Repair again");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("broken-fail");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    window->test_click_repair();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    expect(contains(window->status_text_for_test(), "post-installation script"),
+           "U-1: a failed repair shows dpkg's reason");
+    expect(window->repair_visible_for_test(), "U-1: a failed repair can be tried again");
     destroy_window(window, pidfile);
   }
 
