@@ -158,6 +158,7 @@ private:
   void apply_install_result(const SimulateResult& result, int wait_status);
   void apply_repair_result(const SimulateResult& result, int wait_status);
   /* Shows Repair when an error says the package system is left broken. */
+  void refresh_rows_after_failure();
   void offer_repair_for(const SimulateResult& result);
   void show_packages(const std::vector<PackageUpgrade>& packages);
   void show_new_packages(const std::vector<PackageUpgrade>& packages);

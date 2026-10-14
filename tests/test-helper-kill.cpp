@@ -1972,7 +1972,7 @@ int main(int argc, char** argv)
     expect(out.find("http://deb.example/InRelease") != std::string::npos,
            "a dead mirror keeps apt's URL");
     expect(out.find("Connection timed out") != std::string::npos, "a dead mirror keeps the timeout words");
-    expect(out.find("No network connection") == std::string::npos,
+    expect(out.find("Can't reach the update server") == std::string::npos,
            "a connection timeout is not reported as no network");
     if (!exited)
       terminate_process_tree(helper_pid, 200);
@@ -1994,7 +1994,7 @@ int main(int argc, char** argv)
       close(stdout_read);
     expect(exited, "helper exits after a resolve failure");
     expect(read_count(countfile) == 1, "a resolve failure does not simulate");
-    expect(out.find("No network connection") != std::string::npos, "a resolve failure is offline");
+    expect(out.find("Can't reach the update server") != std::string::npos, "a resolve failure is offline");
     expect(out.find("deb.example") != std::string::npos, "a resolve failure still shows the hostname");
     if (!exited)
       terminate_process_tree(helper_pid, 200);

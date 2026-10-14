@@ -389,7 +389,7 @@ static void test_repair(const char* helper)
     const std::string calls = slurp(log);
     const SimulateResult p = parse_protocol(r.out);
     expect(r.status == 1 && p.status == SimulateResult::Error &&
-               has(p.error_msg, "Repair could not finish configuring packages") &&
+               has(p.error_msg, "Repair could not finish setting up") &&
                has(p.error_msg, "post-installation script"),
            "U-1: a failing postinst is reported with dpkg's reason");
     expect(!has(calls, "apt-get"), "U-1: apt is not run after configure -a fails");

@@ -1,3 +1,12 @@
+lcos-updates (0.9.4-3) unstable; urgency=medium
+
+  * Fix round 11 review findings: Check and Install detect unfinished or
+    interrupted installs and offer Repair; lock, failed-repair, offline and
+    partial-install wording; sizes include new dependencies; Check keeps
+    its authorization (auth_admin_keep, check action only).
+
+ -- Phil <phil@brushpad.local>  Wed, 14 Oct 2026 18:29:12 +0000
+
 lcos-updates (0.9.4-2) unstable; urgency=medium
 
   * Fix round 10 review findings; add Repair for interrupted installs.

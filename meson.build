@@ -151,6 +151,21 @@ test(
   timeout: 120,
 )
 
+test_r11 = executable(
+  'test-r11',
+  'tests/test-r11.cpp',
+  include_directories: inc,
+  link_with: apt_parse,
+  install: false,
+)
+
+test(
+  'round11-unfinished-lock-repair-offline-sizes',
+  test_r11,
+  args: [helper.full_path()],
+  timeout: 120,
+)
+
 test_window = executable(
   'test-window',
   'tests/test-window.cpp',

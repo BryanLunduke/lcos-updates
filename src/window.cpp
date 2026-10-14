@@ -30,6 +30,29 @@ const int kInstallTimeoutMs = kInstallTimeoutSec * 1000;
 const int kAuthTimeoutMs = kAuthTimeoutSec * 1000;
 const int kPulseIntervalMs = 100;
 
+/* Round 11 (U-1, U-5): dpkg's status database is world-readable, so the
+ * window reads it without a password. */
+const char* dpkg_status_file()
+{
+#ifdef LCOS_UPDATES_TEST
+  const char* env = std::getenv("LCOS_UPDATES_TEST_DPKG_STATUS");
+  if (env != nullptr && env[0] == '/')
+    return env;
+#endif
+  return "/var/lib/dpkg/status";
+}
+
+std::string read_status_file()
+{
+  std::string text;
+  try {
+    text = Glib::file_get_contents(dpkg_status_file());
+  } catch (const Glib::Error&) {
+    text.clear();
+  }
+  return text;
+}
+
 const char* pkexec_path()
 {
 #ifdef LCOS_UPDATES_TEST
@@ -479,9 +502,26 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   set_default(m_check);
   signal_map().connect([this]() {
     m_status.select_region(0, 0);
-    if (m_job == Job::None && m_check.get_sensitive())
+    /* Round 11: an unfinished install found at startup focuses Repair. */
+    if (m_job == Job::None && m_repair.get_visible() && m_repair.get_sensitive())
+      m_repair.grab_focus();
+    else if (m_job == Job::None && m_check.get_sensitive())
       m_check.grab_focus();
   });
+
+  /* Round 11 (U-1): an interrupted or failed install is shown as soon as the
+   * window opens, with Repair, before any password is asked. A Check that
+   * runs now reports the same state from the helper. */
+  {
+    const std::vector<std::string> unfinished = unfinished_packages(read_status_file());
+    if (!unfinished.empty()) {
+      SimulateResult broken;
+      broken.status = SimulateResult::Error;
+      broken.error_msg = unfinished_message(unfinished, false);
+      set_idle_status(broken.error_msg);
+      offer_repair_for(broken);
+    }
+  }
 
   if (check_on_start)
     request_check();
@@ -1317,8 +1357,19 @@ void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector
 
 void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
 {
+  if (job == Job::Repair) {
+    /* Round 11: the password prompt for Repair is a repair, not an install. */
+    present_outcome(outcome_repair_timeout(helper_ready), {}, {});
+    m_repair.show();
+    m_repair.set_sensitive(true);
+    order_trailing(m_repair);
+    set_default(m_repair);
+    m_repair.grab_default();
+    queue_fit();
+    return;
+  }
   const bool keep = !m_store->children().empty();
-  const JobOutcome outcome = outcome_timeout(job == Job::Install || job == Job::Repair, helper_ready, keep);
+  const JobOutcome outcome = outcome_timeout(job == Job::Install, helper_ready, keep);
   present_outcome(outcome, {}, {});
 }
 
@@ -1488,7 +1539,74 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
   }
   const bool have_rows = !m_store->children().empty();
   present_outcome(outcome_install(shown, exit_code, have_rows), shown.packages, shown.new_packages);
+  if (shown.status == SimulateResult::Error && have_rows)
+    refresh_rows_after_failure();
   offer_repair_for(shown);
+}
+
+/* Round 11 (U-5): after a failed install some packages may already be on the
+ * new version. Re-read dpkg's status: rows that are fully installed at the
+ * new version leave the list, the rest show the version installed now, and
+ * the status line says which were installed and which were not. */
+void UpdatesWindow::refresh_rows_after_failure()
+{
+  const std::vector<DpkgPackageState> states = parse_dpkg_status(read_status_file());
+  auto find_state = [&](const std::string& name) -> const DpkgPackageState* {
+    for (const auto& st : states)
+      if (st.name == name)
+        return &st;
+    return nullptr;
+  };
+  std::vector<std::string> installed;
+  std::vector<std::string> pending;
+  auto scan = [&](Glib::RefPtr<Gtk::ListStore> store, auto& name_col, auto& version_col,
+                  Gtk::TreeModelColumn<Glib::ustring>* old_col) {
+    auto children = store->children();
+    for (auto iter = children.begin(); iter != children.end();) {
+      const std::string name = static_cast<Glib::ustring>((*iter)[name_col]);
+      const std::string want = static_cast<Glib::ustring>((*iter)[version_col]);
+      const DpkgPackageState* st = find_state(name);
+      if (st != nullptr && st->state == "installed" && deb_versions_match(st->version, want)) {
+        installed.push_back(name);
+        iter = store->erase(iter);
+        continue;
+      }
+      pending.push_back(name);
+      if (old_col != nullptr && st != nullptr) {
+        Glib::ustring now = st->version;
+        if (st->state != "installed")
+          now += " (not set up)";
+        (*iter)[*old_col] = now;
+        (*iter)[m_cols.version_tip] = now + " → " + Glib::ustring(want);
+      }
+      ++iter;
+    }
+  };
+  scan(m_store, m_cols.package, m_cols.new_version, &m_cols.old_version);
+  if (m_new_store)
+    scan(m_new_store, m_new_cols.package, m_new_cols.version, nullptr);
+  if (installed.empty())
+    return;
+  auto join = [](const std::vector<std::string>& names) {
+    std::string out;
+    for (std::size_t i = 0; i < names.size() && i < 20; ++i)
+      out += (i ? ", " : "") + names[i];
+    if (names.size() > 20)
+      out += ", …";
+    return out;
+  };
+  Glib::ustring text = m_status.get_text();
+  text += "\nInstalled: " + join(installed) + ".";
+  if (!pending.empty())
+    text += "\nNot finished: " + join(pending) + ".";
+  set_idle_status(text);
+  if (m_new_store && m_new_store->children().empty()) {
+    m_new_heading.hide();
+    m_new_scroller.hide();
+  }
+  if (m_store->children().empty())
+    hide_package_list();
+  queue_fit();
 }
 
 void UpdatesWindow::offer_repair_for(const SimulateResult& result)
@@ -1606,8 +1724,11 @@ void UpdatesWindow::show_close_dialog()
 {
   if (m_close_dialog != nullptr)
     return;
-  m_close_primary = "The install will keep running.";
-  m_close_secondary = "It will finish in the background.";
+  /* Round 11: a repair is named as a repair. */
+  const bool repairing = m_job == Job::Repair;
+  m_close_primary = repairing ? "The repair will keep running." : "The install will keep running.";
+  m_close_secondary = repairing ? "It will finish setting up packages in the background."
+                                : "It will finish in the background.";
   auto* dialog = new Gtk::MessageDialog(*this, m_close_primary, false, Gtk::MESSAGE_WARNING,
                                         Gtk::BUTTONS_NONE, true);
   dialog->set_secondary_text(m_close_secondary);

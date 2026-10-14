@@ -2,9 +2,10 @@
 """Polkit wording and subject defaults.
 
 simulate checks, upgrade installs, repair repairs; argv1 keeps them apart.
-allow_any and allow_inactive are no. Round 10 (U-4): no action uses
-auth_admin_keep, so a cached authorization cannot let another program in
-the session start the root helper without a password.
+allow_any and allow_inactive are no. Round 11: only the check action
+(argv1 simulate) may use auth_admin_keep. Install and repair stay
+auth_admin, so a cached authorization never lets another program install,
+remove or configure packages (round 10, U-4).
 """
 
 import sys
@@ -83,20 +84,26 @@ def main() -> int:
             )
             return 1
 
-    for action in (simulate, upgrade, repair):
+    if simulate["allow_active"] != "auth_admin_keep":
+        print(f"check allow_active should be auth_admin_keep, got {simulate['allow_active']}", file=sys.stderr)
+        return 1
+    for action in (upgrade, repair):
         if action["allow_active"] != "auth_admin":
             print(
                 f"{action['id']} allow_active should be auth_admin, got {action['allow_active']}",
                 file=sys.stderr,
             )
             return 1
+    keeps = 0
     with open(path, encoding="utf-8") as handle:
         for raw in handle:
-            if "<allow_" in raw and "auth_admin_keep" in raw:
-                print("no action may use auth_admin_keep (U-4)", file=sys.stderr)
-                return 1
+            if "<allow_" in raw and "_keep" in raw:
+                keeps += 1
+    if keeps != 1:
+        print(f"only the check action may keep an authorization, found {keeps} keeps", file=sys.stderr)
+        return 1
 
-    print("ok: check, install and repair each need a fresh password; subjects are pinned")
+    print("ok: only check keeps its authorization; install and repair need a fresh password; subjects are pinned")
     return 0
 
 

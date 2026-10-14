@@ -1132,7 +1132,7 @@ int main()
     const auto head = status.find("You're up to date.");
     expect(warn != std::string::npos && head != std::string::npos && warn < head,
            "a partial refresh warning is above the headline");
-    expect(status.find("No network connection") == std::string::npos,
+    expect(status.find("Can't reach the update server") == std::string::npos,
            "one skipped mirror is not called no network");
     expect(!window->warning_visible_for_test(), "a check does not show the logout warning");
     destroy_window(window, pidfile);
