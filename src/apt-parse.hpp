@@ -240,5 +240,29 @@ struct JobOutcome {
 JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_rows);
 JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool have_rows);
 JobOutcome outcome_timeout(bool installing, bool helper_ready, bool have_rows);
+/* Round 11: a Repair timeout is worded as a repair, not as an install. */
+JobOutcome outcome_repair_timeout(bool helper_ready);
+
+/* Round 11 (U-1, U-5): one stanza of /var/lib/dpkg/status. state is the
+ * third word of Status: (installed, unpacked, half-configured, ...). */
+struct DpkgPackageState {
+  std::string name;
+  std::string state;
+  std::string version;
+};
+std::vector<DpkgPackageState> parse_dpkg_status(const std::string& status_text);
+/* Names dpkg --audit would report as not fully installed: half-installed,
+ * unpacked, half-configured, triggers-awaited, triggers-pending. Sorted. */
+std::vector<std::string> unfinished_packages(const std::string& status_text);
+/* The Check/Install error for that state. It always says "Use Repair" so the
+ * window offers the Repair button. journal is true when dpkg's update journal
+ * (/var/lib/dpkg/updates) is not empty, i.e. dpkg itself was killed. */
+std::string unfinished_message(const std::vector<std::string>& names, bool journal);
+/* Round 11 (U-2): dpkg or apt could not take its lock (another program is
+ * installing). */
+bool error_says_locked(const std::string& text);
+extern const char kAnotherInstaller[];
+/* Round 11 (U-4): every remote source failed to resolve or connect. */
+extern const char kServerUnreachable[];
 
 #endif

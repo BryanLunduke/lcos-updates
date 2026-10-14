@@ -127,7 +127,7 @@ int main(int argc, char** argv)
     const char* check_timeout =
         "Timed out waiting for the update check. Check your network and try again.";
     const char* install_timeout = "Timed out while installing updates.";
-    const char* offline = "No network connection. Connect to the Internet and try again.";
+    const char* offline = "Can't reach the update server. Check your network connection and try again.";
     const char* proxy =
         "Could not connect to the update server. If this computer uses a proxy, set it in "
         "/etc/apt/apt.conf.d.";
@@ -294,13 +294,13 @@ int main(int argc, char** argv)
            "a dead mirror keeps apt's URL");
     expect(dead_fetch.detail.find("Connection timed out") != std::string::npos,
            "a dead mirror keeps the timeout words");
-    expect(dead_fetch.detail.find("No network connection") == std::string::npos,
+    expect(dead_fetch.detail.find("Can't reach the update server") == std::string::npos,
            "a connection timeout is not the offline sentence");
     const UpdateFetch offline_fetch =
         classify_apt_update("Err:1 http://deb.example stable InRelease\n"
                             "  Temporary failure resolving 'deb.example'\n");
     expect(offline_fetch.kind == UpdateFetchKind::Total &&
-               offline_fetch.detail.find("No network connection") != std::string::npos,
+               offline_fetch.detail.find("Can't reach the update server") != std::string::npos,
            "a resolve failure with nothing fetched adds the offline sentence");
     expect(offline_fetch.detail.find("deb.example") != std::string::npos,
            "a resolve failure still shows the hostname");
@@ -357,7 +357,7 @@ int main(int argc, char** argv)
            "the timeout line is kept");
     expect(got.find("/etc/apt/apt.conf.d") != std::string::npos,
            "the timeout line adds the proxy sentence once");
-    expect(got.find("No network connection") == std::string::npos,
+    expect(got.find("Can't reach the update server") == std::string::npos,
            "that timeout line is not the offline sentence");
     const std::string skipped =
         friendly_job_error("E: Failed to fetch http://deb.example/InRelease  Connection timed out\n"
@@ -366,7 +366,7 @@ int main(int argc, char** argv)
                            JobKind::Check);
     expect(skipped.find("Connection timed out") != std::string::npos,
            "a skipped index does not rewrite the timed-out mirror");
-    expect(skipped.find("No network connection") == std::string::npos,
+    expect(skipped.find("Can't reach the update server") == std::string::npos,
            "a skipped index is not called offline");
     expect(skipped.find("Some index files failed") != std::string::npos,
            "a skipped index keeps apt's own summary");

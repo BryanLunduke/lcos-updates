@@ -883,8 +883,13 @@ std::string first_error_line(const std::string& out, const std::string& err)
       continue;
     }
     if (in_processed) {
-      if (line.compare(0, 2, "E:") == 0 || line.compare(0, 2, "W:") == 0 ||
-          lower.compare(0, 5, "dpkg:") == 0) {
+      /* dpkg lists one name per line, indented. Round 11 (U-3): any other
+       * line ends the list, so "Setting up beta (2.0) ..." from stdout is
+       * not joined in as a package name. */
+      const std::string name_only = trim_ws(line);
+      const bool name_line = (line[0] == ' ' || line[0] == '\t') && !name_only.empty() &&
+                             name_only.find(' ') == std::string::npos;
+      if (!name_line) {
         in_processed = false;
       } else {
         const std::string name = trim_ws(line);
@@ -1105,6 +1110,9 @@ int fail_apt(int rc, const std::string& out, const std::string& err, const char*
   }
   if (rc != 0) {
     std::string msg = first_error_line(out, err);
+    /* Round 11 (U-2): a held lock leads with the plain sentence. */
+    if (error_says_locked(err + "\n" + out))
+      msg = std::string(kAnotherInstaller) + "\n" + msg;
     /* configure -a only after an interrupted dpkg has actually exited.
      * A full disk or a lock is the apt line by itself. */
     if (apt_says_dpkg_interrupted(err + "\n" + out))
@@ -1148,6 +1156,60 @@ const char* dpkg_status_path()
 void note_holds(SimulateResult& result)
 {
   apply_held_packages(result, read_limited(dpkg_status_path(), 8 * 1024 * 1024));
+}
+
+const char* dpkg_updates_dir()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_DPKG_UPDATES_DIR");
+    if (env != nullptr && env[0] == '/')
+      return env;
+  }
+  return "/var/lib/dpkg/updates";
+}
+
+/* dpkg writes numbered journal files here while it changes the status
+ * database and folds them back in when it finishes. Any left over mean
+ * dpkg itself was killed. */
+bool dpkg_journal_pending()
+{
+  DIR* dir = opendir(dpkg_updates_dir());
+  if (dir == nullptr)
+    return false;
+  bool pending = false;
+  while (struct dirent* ent = readdir(dir)) {
+    const char* n = ent->d_name;
+    if (n[0] == '\0' || n[0] == '.')
+      continue;
+    bool digits = true;
+    for (const char* c = n; *c != '\0'; ++c)
+      digits = digits && std::isdigit(static_cast<unsigned char>(*c));
+    if (digits) {
+      pending = true;
+      break;
+    }
+  }
+  closedir(dir);
+  return pending;
+}
+
+std::vector<std::string> current_unfinished()
+{
+  return unfinished_packages(read_limited(dpkg_status_path(), 64 * 1024 * 1024));
+}
+
+/* Round 11 (U-1): apt-get -s upgrade succeeds with half-configured or
+ * unpacked packages ("N not fully installed or removed") and an interrupted
+ * dpkg journal. Check and Install stop here and point at Repair instead of
+ * reporting "kept back" over a broken system. */
+bool report_unfinished()
+{
+  const std::vector<std::string> names = current_unfinished();
+  const bool journal = dpkg_journal_pending();
+  if (names.empty() && !journal)
+    return false;
+  emit_error(unfinished_message(names, journal));
+  return true;
 }
 
 const char* reboot_file_path()
@@ -1549,8 +1611,25 @@ bool note_download_size(SimulateResult& result)
   if (result.packages.empty())
     return true;
   const std::string apt = apt_get_path();
-  const std::vector<const char*> argv = {apt.c_str(),   kSimNoteOpt, kSimNoteVal, kSimNoteOpt, kQuietVal,
-                                         "--print-uris", "-y",        "upgrade"};
+  /* Round 11 (U-6): adopted kept-back packages and their new dependencies
+   * are not in "upgrade". Ask for the same pinned install the Install button
+   * runs, so the sizes and "After this operation" include them. */
+  const bool pinned = !result.adopted_kept.empty() || !result.new_packages.empty();
+  std::vector<std::string> store = {apt, kSimNoteOpt, kSimNoteVal, kSimNoteOpt, kQuietVal,
+                                    "--print-uris", "-y", "-o", kNoRecommends};
+  if (pinned) {
+    store.push_back("install");
+    for (const auto& pkg : result.packages)
+      store.push_back(pkg.name + "=" + pkg.new_version);
+    for (const auto& pkg : result.new_packages)
+      store.push_back(pkg.name + "=" + pkg.new_version);
+  } else {
+    store.push_back("upgrade");
+  }
+  std::vector<const char*> argv;
+  argv.reserve(store.size());
+  for (const auto& arg : store)
+    argv.push_back(arg.c_str());
   std::string out;
   std::string err;
   const AptClock clock = apt_clock(kDownloadSizeIdleSec, kDownloadSizeHardSec);
@@ -1966,6 +2045,8 @@ int do_simulate()
     return 1;
   }
   announce_ready();
+  if (report_unfinished())
+    return 1;
   emit_phase("refresh");
 
   std::string update_warning;
@@ -2014,6 +2095,8 @@ int do_upgrade(const std::vector<std::string>& pins)
     return 1;
   }
   announce_ready();
+  if (report_unfinished())
+    return 1;
 
   /* Reuse the check when the list files still match it. The safety
    * simulation and the name=version pins still run. A different list, or a
@@ -2210,6 +2293,46 @@ std::string join_names(const std::vector<std::string>& names)
   return out;
 }
 
+/* Round 11 (U-3): first_error_line is worded for an install. A repair drops
+ * the install sentences and says once which packages are still unfinished. */
+std::string strip_install_wording(const std::string& msg)
+{
+  std::istringstream in(msg);
+  std::string line;
+  std::string out;
+  while (std::getline(in, line)) {
+    if (line == kUpgradeUnfinished || line == kFreeSpace || line == kDpkgRecovery)
+      continue;
+    if (!out.empty())
+      out += "\n";
+    out += line;
+  }
+  return out;
+}
+
+std::string repair_failure_message(int rc, const std::string& out, const std::string& err)
+{
+  /* Round 11 (U-2): another apt or dpkg holds the lock. Nothing was tried,
+   * so this is not a failed repair and Repair is not offered again yet. */
+  if (error_says_locked(err + "\n" + out))
+    return kAnotherInstaller;
+  if (rc == -2)
+    return "Timed out while repairing packages.";
+  const std::vector<std::string> left = current_unfinished();
+  std::string msg = "Repair could not finish setting up ";
+  msg += left.empty() ? std::string("all packages") : join_names(left);
+  msg += ".";
+  std::string detail = rc > 0 ? strip_install_wording(first_error_line(out, err)) : std::string();
+  if (detail == "apt-get failed")
+    detail.clear();
+  if (!detail.empty())
+    msg += "\n" + detail;
+  if (rc == -1 || rc == 127)
+    msg += "\nCould not run dpkg.";
+  msg += "\nFix the problem shown above, then use Repair again.";
+  return msg;
+}
+
 /* Round 10 (U-1): finish an interrupted or failed install.
  * 1. dpkg --configure -a (confdef/confold, stdin /dev/null, noninteractive).
  * 2. apt-get -s -f install. Any removal or downgrade refuses the repair, in
@@ -2238,14 +2361,7 @@ int do_repair()
                                              "--configure", "-a"};
   int rc = run_apt(cfg_argv, clock.idle_sec, clock.hard_sec, out, err, false, true, false);
   if (rc != 0) {
-    std::string msg = "Repair could not finish configuring packages.";
-    const std::string detail = first_error_line(out, err);
-    if (rc > 0 && !detail.empty() && detail != "apt-get failed")
-      msg += "\n" + detail;
-    if (rc == -1 || rc == 127)
-      msg += "\nCould not run dpkg.";
-    msg += "\nA package is still left unfinished.";
-    emit_error(msg);
+    emit_error(repair_failure_message(rc, out, err));
     return 1;
   }
 
@@ -2258,8 +2374,12 @@ int do_repair()
   const AptClock sim_clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
   rc = run_apt(sim_argv, sim_clock.idle_sec, sim_clock.hard_sec, out, err, false);
   if (rc != 0) {
+    if (error_says_locked(err + "\n" + out)) {
+      emit_error(kAnotherInstaller);
+      return 1;
+    }
     std::string msg = "Repair finished configuring packages, but could not fix missing dependencies.\n";
-    msg += first_error_line(out, err);
+    msg += strip_install_wording(first_error_line(out, err));
     emit_error(msg);
     return 1;
   }
@@ -2290,8 +2410,12 @@ int do_repair()
                                                "--no-remove", "-f",     "install"};
     rc = run_apt(fix_argv, clock.idle_sec, clock.hard_sec, out, err, true);
     if (rc != 0) {
+      if (error_says_locked(err + "\n" + out)) {
+        emit_error(kAnotherInstaller);
+        return 1;
+      }
       std::string msg = "Repair could not fix missing dependencies.\n";
-      msg += first_error_line(out, err);
+      msg += strip_install_wording(first_error_line(out, err));
       emit_error(msg);
       return 1;
     }
@@ -2301,6 +2425,59 @@ int do_repair()
   }
   emit(result);
   return 0;
+}
+
+/* Round 11 (editor request): the check action uses auth_admin_keep, so for
+ * a few minutes after a password a check can start without one. Polkit keeps
+ * that authorization for the session, not for one program. Under pkexec the
+ * helper's parent is the program that ran pkexec; a check is refused unless
+ * that is the Updates app run by the same user. This is a speed bump, not a
+ * boundary: a program running as the user can still drive the real app.
+ * Install and repair keep auth_admin and are not affected. */
+const char* expected_caller()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_CALLER_EXE");
+    if (env != nullptr && env[0] == '/')
+      return env;
+  }
+  return "/usr/bin/lcos-updates";
+}
+
+bool caller_is_updates_app()
+{
+  const char* pk_uid = std::getenv("PKEXEC_UID");
+  /* Not started through pkexec (root shell, tests): nothing cached to abuse. */
+  if (pk_uid == nullptr || pk_uid[0] == '\0')
+    return true;
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long uid = std::strtoul(pk_uid, &end, 10);
+  if (errno != 0 || end == pk_uid || *end != '\0')
+    return false;
+  const pid_t parent = getppid();
+  if (parent <= 1)
+    return false;
+  char link[64];
+  std::snprintf(link, sizeof link, "/proc/%d/exe", static_cast<int>(parent));
+  char exe[4096];
+  const ssize_t n = readlink(link, exe, sizeof exe - 1);
+  if (n <= 0)
+    return false;
+  exe[n] = '\0';
+  /* An upgrade of this package replaces the running binary. */
+  std::string got(exe);
+  const std::string deleted = " (deleted)";
+  if (got.size() > deleted.size() && got.compare(got.size() - deleted.size(), deleted.size(), deleted) == 0)
+    got.resize(got.size() - deleted.size());
+  if (got != expected_caller())
+    return false;
+  char dir[64];
+  std::snprintf(dir, sizeof dir, "/proc/%d", static_cast<int>(parent));
+  struct stat st {};
+  if (stat(dir, &st) != 0)
+    return false;
+  return static_cast<unsigned long>(st.st_uid) == uid;
 }
 
 } // namespace
@@ -2333,6 +2510,10 @@ int main(int argc, char** argv)
   if (cmd == "simulate") {
     if (argc != 2) {
       emit_error("refused: helper accepts only simulate, upgrade or repair");
+      return 2;
+    }
+    if (!caller_is_updates_app()) {
+      emit_error("refused: checks can only be started from Updates");
       return 2;
     }
     return do_simulate();

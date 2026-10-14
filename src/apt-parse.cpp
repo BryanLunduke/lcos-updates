@@ -11,6 +11,11 @@
 #include <cstring>
 #include <sstream>
 
+const char kAnotherInstaller[] =
+    "Another program is installing software. Wait for it to finish and try again.";
+const char kServerUnreachable[] =
+    "Can't reach the update server. The results below may be out of date.";
+
 /* Decimal count in [begin, end). False for a non-digit or a value above
  * kMaxCount, so a hostile digit run cannot overflow int (round 10, U-3). */
 static constexpr int kMaxCount = 1000000000;
@@ -702,6 +707,10 @@ void apply_download_details(SimulateResult& result, const std::string& text)
       if (pkg.name == name && deb_versions_match(pkg.new_version, version))
         pkg.size = format_byte_size(bytes);
     }
+    for (auto& pkg : result.new_packages) {
+      if (pkg.name == name && deb_versions_match(pkg.new_version, version))
+        pkg.size = format_byte_size(bytes);
+    }
   }
 }
 
@@ -905,7 +914,7 @@ static const char kProxyHint[] =
     "Could not connect to the update server. If this computer uses a proxy, set it in "
     "/etc/apt/apt.conf.d.";
 static const char kOfflineHint[] =
-    "No network connection. Connect to the Internet and try again.";
+    "Can't reach the update server. Check your network connection and try again.";
 
 static bool is_hit_or_get(const std::string& line)
 {
@@ -954,6 +963,7 @@ UpdateFetch classify_apt_update(const std::string& text)
 {
   UpdateFetch out;
   bool hit = false;
+  bool remote_hit = false;
   bool fetch_fail = false;
   bool connect = false;
   bool resolve = false;
@@ -966,8 +976,12 @@ UpdateFetch classify_apt_update(const std::string& text)
     line = trim_cr(line);
     if (line.empty())
       continue;
-    if (is_hit_or_get(line))
+    if (is_hit_or_get(line)) {
       hit = true;
+      if (line.find("http://") != std::string::npos || line.find("https://") != std::string::npos ||
+          line.find("ftp://") != std::string::npos || line.find("tor+") != std::string::npos)
+        remote_hit = true;
+    }
     const std::string lower = lower_copy(line);
     const bool index_note = has(lower, "some index files failed to download") ||
                             has(lower, "old ones used instead");
@@ -1003,12 +1017,20 @@ UpdateFetch classify_apt_update(const std::string& text)
     out.kind = UpdateFetchKind::Total;
     if (apt_lines.empty())
       out.detail = "The package lists could not be refreshed.";
+    else if (connect || resolve)
+      /* Round 11 (U-4): the plain sentence first, apt's lines below. */
+      out.detail = append_fetch_hint(std::string(), connect, resolve) + "\n" + apt_lines;
     else
-      out.detail = append_fetch_hint(apt_lines, connect, resolve);
+      out.detail = apt_lines;
     return out;
   }
   out.kind = UpdateFetchKind::Partial;
   out.detail = apt_lines;
+  /* Round 11 (U-4): no network server answered and one could not be resolved
+   * or connected (network down; only local file: repos were read). Lead with one plain sentence;
+   * apt's own lines stay below it. */
+  if ((connect || resolve) && !remote_hit)
+    out.detail = std::string(kServerUnreachable) + (apt_lines.empty() ? "" : "\n" + apt_lines);
   return out;
 }
 
@@ -2037,4 +2059,99 @@ bool error_suggests_repair(const std::string& msg)
          has_text("unmet dependencies") || has_text("left unfinished") ||
          has_text("half-installed") || has_text("half-configured") ||
          has_text("package installer was interrupted");
+}
+
+/* ---------------- Round 11 ---------------- */
+
+
+JobOutcome outcome_repair_timeout(bool helper_ready)
+{
+  JobOutcome out;
+  out.check_enabled = true;
+  out.install_enabled = false;
+  out.packages = PackageListAction::Hide;
+  if (!helper_ready)
+    out.status = "Timed out waiting for the password. The repair did not start. "
+                 "Click Repair to try again.";
+  else
+    out.status = "Timed out while repairing packages.";
+  return out;
+}
+
+std::vector<DpkgPackageState> parse_dpkg_status(const std::string& status_text)
+{
+  std::vector<DpkgPackageState> out;
+  DpkgPackageState cur;
+  auto flush = [&]() {
+    if (!cur.name.empty())
+      out.push_back(cur);
+    cur = DpkgPackageState{};
+  };
+  std::istringstream in(status_text);
+  std::string line;
+  while (std::getline(in, line)) {
+    line = trim_cr(line);
+    if (line.empty()) {
+      flush();
+      continue;
+    }
+    if (starts_with(line, "Package: ")) {
+      cur.name = line.substr(9);
+    } else if (starts_with(line, "Version: ")) {
+      cur.version = line.substr(9);
+    } else if (starts_with(line, "Status: ")) {
+      std::istringstream words(line.substr(8));
+      std::string want;
+      std::string flag;
+      std::string state;
+      words >> want >> flag >> state;
+      cur.state = state;
+    }
+  }
+  flush();
+  return out;
+}
+
+std::vector<std::string> unfinished_packages(const std::string& status_text)
+{
+  std::vector<std::string> names;
+  for (const auto& pkg : parse_dpkg_status(status_text)) {
+    const std::string& st = pkg.state;
+    if (st == "half-installed" || st == "unpacked" || st == "half-configured" ||
+        st == "triggers-awaited" || st == "triggers-pending") {
+      if (std::find(names.begin(), names.end(), pkg.name) == names.end())
+        names.push_back(pkg.name);
+    }
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+std::string unfinished_message(const std::vector<std::string>& names, bool journal)
+{
+  std::string msg = journal ? "An earlier install was interrupted and did not finish."
+                            : "An earlier install did not finish.";
+  if (!names.empty()) {
+    msg += names.size() == 1 ? " This package is not fully set up: "
+                             : " These packages are not fully set up: ";
+    std::string list;
+    for (std::size_t i = 0; i < names.size() && i < 20; ++i) {
+      if (!list.empty())
+        list += ", ";
+      list += protocol_escape(names[i], false);
+    }
+    if (names.size() > 20)
+      list += ", …";
+    msg += list + ".";
+  }
+  msg += "\nUse Repair to finish setting up packages before installing updates.";
+  return msg;
+}
+
+bool error_says_locked(const std::string& text)
+{
+  const std::string lower = lower_copy(text);
+  return has(lower, "could not get lock") || has(lower, "unable to lock") ||
+         has(lower, "lock was locked by") || has(lower, "frontend lock") ||
+         has(lower, "is locked by another process") || has(lower, "unable to acquire the dpkg");
 }
