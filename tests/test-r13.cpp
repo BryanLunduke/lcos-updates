@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include "tmpdir-cleanup.hpp"
 #include "apt-parse.hpp"
 
 #include <cstdio>
@@ -174,8 +175,8 @@ static void test_parser()
   std::vector<std::string> got;
   for (const auto& a : ans)
     got.push_back(a.question + "=" + a.value + "|" + a.text);
-  expect(got == std::vector<std::string>({"ask/pw=(password left blank)|Admin password",
-                                          "ask/pw2=(password set, not shown)|Second password"}),
+  expect(got == std::vector<std::string>({"ask/pw=password left blank|Admin password",
+                                          "ask/pw2=password set, not shown|Second password"}),
          "U-1/U-2/U-3: passwords reported without values; seen color, unchanged name and low lowq are not");
 
   const auto low = debconf_auto_answers(inputs, before, after, kTemplates, debconf_priority(
@@ -198,7 +199,7 @@ static void test_parser()
   done.not_upgraded_count = 0;
   done.debconf_answers = ans;
   const JobOutcome o = outcome_install(done, 0, true);
-  expect(has(o.status, "\u201cAdmin password\u201d (ask): (password left blank)") &&
+  expect(has(o.status, "\u201cAdmin password\u201d (ask): password left blank") &&
              !has(o.status, "ask/pw") && !has(o.status, "s3cret"),
          "U-3: the result shows the question text, not the internal name, and no password");
   expect(has(o.status, "open Terminal from the applications menu") && has(o.status, "sudo dpkg-reconfigure ask."),
@@ -303,6 +304,7 @@ static void test_helper(const char* helper)
     expect(false, "mkdtemp");
     return;
   }
+  lcos_test::cleanup_at_exit(tmpl);
   const std::string dir = tmpl;
   const std::string debconf = dir + "/debconf";
   const std::string state = dir + "/state";
@@ -364,7 +366,7 @@ static void test_helper(const char* helper)
     for (const auto& a : p.debconf_answers)
       got.push_back(a.question + "=" + a.value);
     expect(p.status == SimulateResult::Error &&
-               got == std::vector<std::string>({"quiet/q=yes", "quiet/pw=(password set, not shown)"}) &&
+               got == std::vector<std::string>({"quiet/q=yes", "quiet/pw=password set, not shown"}) &&
                p.debconf_answers[0].text == "Quiet question",
            "U-4: a failed install still reports the answers it chose; unseen quiet/skip is not listed");
     const std::string envs = slurp(dir + "/env");

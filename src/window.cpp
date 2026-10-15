@@ -1655,13 +1655,21 @@ void UpdatesWindow::apply_repair_result(const SimulateResult& result, int wait_s
     Glib::ustring text = "Repair finished. Check for updates to continue.";
     if (!shown.conffiles_kept.empty())
       text += " Your changed settings files were kept.";
+    /* Round 14 (U-4): Repair also answers setup questions. */
+    if (!shown.debconf_answers.empty())
+      text += "\n" + debconf_answer_sentence(shown);
     set_idle_status(text);
     m_repair.hide();
     m_repair.set_sensitive(false);
     use_check_as_default();
     return;
   }
-  set_idle_status(friendly_job_error(shown.error_msg, JobKind::Install));
+  {
+    Glib::ustring text = friendly_job_error(shown.error_msg, JobKind::Install);
+    if (!shown.debconf_answers.empty())
+      text += "\n" + debconf_answer_sentence(shown);
+    set_idle_status(text);
+  }
   /* A cancelled or failed repair can be tried again; a refused removal cannot. */
   const bool again = error_suggests_repair(shown.error_msg) ||
                      shown.error_msg.find("cancelled") != std::string::npos;

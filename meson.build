@@ -196,6 +196,21 @@ test(
   timeout: 120,
 )
 
+test_r14 = executable(
+  'test-r14',
+  'tests/test-r14.cpp',
+  include_directories: inc,
+  link_with: apt_parse,
+  install: false,
+)
+
+test(
+  'round14-cache-reuse-stale-dirs-repair-answers',
+  test_r14,
+  args: [helper.full_path()],
+  timeout: 120,
+)
+
 test_window = executable(
   'test-window',
   'tests/test-window.cpp',

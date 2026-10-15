@@ -1681,26 +1681,75 @@ void remove_probe_dir(const std::string& dir)
   rmdir(dir.c_str());
 }
 
-/* Downloads the pinned packages with apt into a private directory and adds
- * the name of each one whose control area has a templates member. False
- * only on cancel; a failed download just leaves those packages unflagged. */
-bool debs_with_templates(const std::vector<std::string>& pins, std::vector<std::string>& found)
+std::string probe_base()
 {
-  std::string base = "/var/cache/apt";
   if (geteuid() != 0) {
     const char* state = std::getenv("LCOS_UPDATES_STATE_DIR");
-    if (state == nullptr || state[0] != '/')
-      return true;
-    base = state;
+    return state != nullptr && state[0] == '/' ? std::string(state) : std::string();
   }
-  std::string tmpl = base + "/lcos-updates-templates.XXXXXX";
-  std::vector<char> buf(tmpl.begin(), tmpl.end());
-  buf.push_back('\0');
-  if (mkdtemp(buf.data()) == nullptr)
-    return true;
-  const std::string dir = buf.data();
-  mkdir((dir + "/partial").c_str(), 0700);
-  const std::string archives = "Dir::Cache::archives=" + dir + "/";
+  return "/var/cache/apt";
+}
+
+/* Round 14 (U-1): versions up to 0.9.4-6 downloaded into a private
+ * lcos-updates-templates.XXXXXX directory that a killed helper left behind.
+ * The helper no longer makes one; remove any that are left. Only real
+ * directories (not symlinks) owned by this user, in the root-owned cache. */
+void remove_stale_probe_dirs()
+{
+  const std::string base = probe_base();
+  if (base.empty())
+    return;
+  DIR* d = opendir(base.c_str());
+  if (d == nullptr)
+    return;
+  std::vector<std::string> stale;
+  const std::string prefix = "lcos-updates-templates.";
+  while (struct dirent* e = readdir(d)) {
+    const std::string n = e->d_name;
+    if (n.compare(0, prefix.size(), prefix) != 0 || n.size() != prefix.size() + 6 ||
+        n.find('/') != std::string::npos)
+      continue;
+    struct stat st {};
+    if (fstatat(dirfd(d), n.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_uid != geteuid())
+      continue;
+    stale.push_back(base + "/" + n);
+  }
+  closedir(d);
+  for (const auto& dir : stale)
+    remove_probe_dir(dir);
+}
+
+/* apt's archive name for NAME=VERSION: NAME_VERSION_ with ':' as %3a. */
+std::string archive_prefix(const std::string& pin)
+{
+  const std::size_t eq = pin.find('=');
+  std::string ver = pin.substr(eq + 1);
+  std::string quoted;
+  for (char c : ver)
+    quoted += c == ':' ? std::string("%3a") : std::string(1, c);
+  return pin.substr(0, eq) + "_" + quoted + "_";
+}
+
+/* Round 14 (U-2, U-3): downloads the pinned packages with apt into apt's own
+ * archive cache, where Install reuses them and a repeated Check downloads
+ * nothing again. apt verifies each file's checksum before it lands there.
+ * A deb is inspected only when the download (and, for file: sources, the
+ * --print-uris pass) succeeded; a failed or mismatched download is never
+ * opened. Adds each package whose control area has a templates member.
+ * False only on cancel. */
+bool debs_with_templates(const std::vector<std::string>& pins, std::vector<std::string>& found)
+{
+  std::string archives_dir = "/var/cache/apt/archives";
+  if (geteuid() != 0) {
+    const std::string base = probe_base();
+    if (base.empty())
+      return true;
+    archives_dir = base + "/archives";
+    mkdir(archives_dir.c_str(), 0755);
+    mkdir((archives_dir + "/partial").c_str(), 0700);
+  }
+  const std::string archives = "Dir::Cache::archives=" + archives_dir + "/";
   std::vector<const char*> argv = {apt_get_path(), "-q", "-y", "-o", archives.c_str(), "--download-only",
                                    "--no-install-recommends", "install"};
   for (const auto& pin : pins)
@@ -1710,35 +1759,42 @@ bool debs_with_templates(const std::vector<std::string>& pins, std::vector<std::
   const sig_atomic_t saved_commit = g_dpkg_committed;
   g_dpkg_committed = 0;
   int rc = run_apt(argv, kDownloadSizeIdleSec, kDownloadSizeHardSec, out, err, false, false, false);
-  if (rc != -3 && !stop_requested()) {
+  const bool downloaded = rc == 0;
+  bool uris_ok = false;
+  if (downloaded && !stop_requested()) {
     /* The same request with --print-uris names file: sources, which apt
-     * reads in place instead of downloading. */
+     * reads in place instead of copying. */
     std::vector<const char*> uargv = argv;
     uargv.insert(uargv.begin() + 1, "--print-uris");
     out.clear();
     err.clear();
     rc = run_apt(uargv, kDownloadSizeIdleSec, kDownloadSizeHardSec, out, err, false, false, false);
+    uris_ok = rc == 0;
   }
   g_dpkg_committed = saved_commit;
-  if (rc == -3 || stop_requested()) {
-    remove_probe_dir(dir);
+  if (rc == -3 || stop_requested())
     return false;
-  }
+  /* U-3: a failed download (hash mismatch included) inspects nothing. */
+  if (!downloaded)
+    return true;
   for (const auto& pin : pins) {
     const std::string name = pin.substr(0, pin.find('='));
-    DIR* d = opendir(dir.c_str());
-    if (d == nullptr)
-      break;
+    const std::string want_prefix = archive_prefix(pin);
     std::string deb;
-    while (struct dirent* e = readdir(d)) {
-      const std::string n = e->d_name;
-      if (n.compare(0, name.size() + 1, name + "_") == 0 && n.size() > 4 &&
-          n.compare(n.size() - 4, 4, ".deb") == 0)
-        deb = dir + "/" + n;
+    if (DIR* d = opendir(archives_dir.c_str())) {
+      while (struct dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.compare(0, want_prefix.size(), want_prefix) == 0 && n.size() > 4 &&
+            n.compare(n.size() - 4, 4, ".deb") == 0 && n.find('/') == std::string::npos) {
+          struct stat st {};
+          if (fstatat(dirfd(d), n.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode))
+            deb = archives_dir + "/" + n;
+        }
+      }
+      closedir(d);
     }
-    closedir(d);
     /* A file: source is used in place; apt does not copy it. */
-    if (deb.empty()) {
+    if (deb.empty() && uris_ok) {
       std::istringstream lines(out);
       std::string line;
       const std::string want = "'file:";
@@ -1751,7 +1807,7 @@ bool debs_with_templates(const std::vector<std::string>& pins, std::vector<std::
         const std::string path = line.substr(want.size(), end - want.size());
         const std::size_t slash = path.rfind('/');
         const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
-        if (base.compare(0, name.size() + 1, name + "_") == 0 && path.find('%') == std::string::npos &&
+        if (base.compare(0, want_prefix.size(), want_prefix) == 0 && path.find('%') == std::string::npos &&
             path.find("/../") == std::string::npos)
           deb = path;
       }
@@ -1762,10 +1818,11 @@ bool debs_with_templates(const std::vector<std::string>& pins, std::vector<std::
     std::string info_err;
     const std::vector<const char*> iargv = {dpkg_deb_path(), "--info", deb.c_str(), "templates"};
     const int irc = run_apt(iargv, kDownloadSizeIdleSec, kDownloadSizeHardSec, info, info_err, false, false, false);
+    if (irc == -3 || stop_requested())
+      return false;
     if (irc == 0 && info.find("Template:") != std::string::npos)
       found.push_back(name);
   }
-  remove_probe_dir(dir);
   return true;
 }
 
@@ -2599,13 +2656,33 @@ int do_repair()
   std::string out;
   std::string err;
 
+  /* Round 14 (U-4): dpkg --configure -a and the dependency fix answer setup
+   * questions non-interactively too; report them like an install does. */
+  const std::vector<DebconfQuestion> debconf_before =
+      debconf_snapshot(read_debconf("config.dat"), read_debconf("passwords.dat"));
+  auto note_answers = [&debconf_before]() {
+    const std::string config_after = read_debconf("config.dat");
+    const std::vector<DebconfQuestion> debconf_after =
+        debconf_snapshot(config_after, read_debconf("passwords.dat"));
+    const std::vector<DebconfInput> asked = debconf_newly_seen(debconf_before, debconf_after);
+    g_error_answers.clear();
+    if (!asked.empty())
+      g_error_answers = debconf_auto_answers(asked, debconf_before, debconf_after,
+                                             read_debconf("templates.dat"), debconf_priority(config_after));
+  };
+
   emit_phase("configure");
   g_dpkg_committed = 1;
   g_stop = 0;
   write_all_fd(STDERR_FILENO, "DPKG_STARTED\n");
   const std::vector<const char*> cfg_argv = {dpkg.c_str(), "--force-confdef", "--force-confold",
                                              "--configure", "-a"};
+  g_debconf_mark_seen = true;
   int rc = run_apt(cfg_argv, clock.idle_sec, clock.hard_sec, out, err, false, true, false);
+  g_debconf_mark_seen = false;
+  out = strip_debconf_trace(out);
+  err = strip_debconf_trace(err);
+  note_answers();
   if (rc != 0) {
     emit_error(repair_failure_message(rc, out, err));
     return 1;
@@ -2654,7 +2731,12 @@ int do_repair()
                                                kQuietVal,  "-y",        "-o",        kConfdef,
                                                "-o",       kConfold,    "-o",        kNoRecommends,
                                                "--no-remove", "-f",     "install"};
+    g_debconf_mark_seen = true;
     rc = run_apt(fix_argv, clock.idle_sec, clock.hard_sec, out, err, true);
+    g_debconf_mark_seen = false;
+    out = strip_debconf_trace(out);
+    err = strip_debconf_trace(err);
+    note_answers();
     if (rc != 0) {
       if (error_says_locked(err + "\n" + out)) {
         emit_error(kAnotherInstaller);
@@ -2669,6 +2751,8 @@ int do_repair()
     result.conffiles_kept = parsed.conffiles_kept;
     result.upgraded_count = parsed.upgraded_count;
   }
+  result.debconf_answers = g_error_answers;
+  g_error_answers.clear();
   emit(result);
   return 0;
 }
@@ -2751,6 +2835,8 @@ int main(int argc, char** argv)
       fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     g_cancel_fd = STDIN_FILENO;
   }
+
+  remove_stale_probe_dirs();
 
   const std::string cmd = argv[1];
   if (cmd == "simulate") {
