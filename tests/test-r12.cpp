@@ -362,6 +362,18 @@ static void test_helper(const char* helper)
     write_file(debconf + "/config.dat", "");
   }
   {
+    /* Round 13b: the install runs with DEBCONF_NONINTERACTIVE_SEEN=true, so
+     * debconf marks the questions it would have shown; epsilon/asked was
+     * already seen before the install. */
+    write_file(debconf + "/config.dat",
+               "Name: epsilon/asked\nTemplate: epsilon/asked\nValue: true\nOwners: epsilon\nFlags: seen\n");
+    std::string after = kConfigAfter;
+    for (const char* q : {"epsilon/color\n", "epsilon/name\n", "epsilon/secret\n"}) {
+      const std::size_t at = after.find(std::string("Name: ") + q);
+      const std::size_t end = after.find("\n\n", at);
+      after.insert(end + 1, "Flags: seen\n");
+    }
+    write_file(dir + "/config-after", after);
     std::string log;
     const HelperRun r = run({"upgrade", "delta=2.0", "epsilon=1.0"}, log, true);
     const SimulateResult p = parse_protocol(r.out);

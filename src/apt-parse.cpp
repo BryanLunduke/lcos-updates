@@ -2467,6 +2467,35 @@ std::vector<DebconfInput> debconf_inputs(const std::string& apt_output)
   return out;
 }
 
+std::vector<DebconfInput> debconf_newly_seen(const std::vector<DebconfQuestion>& before,
+                                             const std::vector<DebconfQuestion>& after)
+{
+  std::vector<DebconfInput> out;
+  for (const auto& q : after) {
+    if (!q.seen)
+      continue;
+    bool was_seen = false;
+    for (const auto& b : before)
+      if (b.name == q.name && b.seen)
+        was_seen = true;
+    if (was_seen)
+      continue;
+    bool dup = false;
+    for (const auto& o : out)
+      if (o.question == q.name)
+        dup = true;
+    if (dup)
+      continue;
+    DebconfInput in;
+    in.question = q.name;
+    in.package = q.owner.empty() ? q.name.substr(0, q.name.find('/')) : q.owner;
+    /* Debconf already filtered by priority; pass every threshold. */
+    in.priority = "critical";
+    out.push_back(in);
+  }
+  return out;
+}
+
 std::string debconf_priority(const std::string& config_dat)
 {
   for (const auto& st : parse_stanzas(config_dat))
@@ -2495,6 +2524,9 @@ std::vector<DebconfQuestion> debconf_snapshot(const std::string& config_dat, con
       q.has_value = has && !v.empty();
       if (!password)
         q.value = v;
+      const std::vector<std::string> owners = split_list(st.get("Owners"));
+      if (!owners.empty())
+        q.owner = owners.front();
       for (const auto& flag : split_list(st.get("Flags")))
         if (flag == "seen")
           q.seen = true;
@@ -2550,8 +2582,6 @@ std::vector<SimulateResult::DebconfAnswer> debconf_auto_answers(const std::vecto
       now = find(after, in.question, false);
     if (was != nullptr && was->seen)
       continue; /* the user answered it before; debconf kept that answer */
-    if (now != nullptr && now->seen)
-      continue;
     /* U-2: an unseen answer that was already there and did not change was
      * reported (or set) by an earlier install; do not list it again. */
     if (was != nullptr && now != nullptr && was->has_value == now->has_value && was->value == now->value)

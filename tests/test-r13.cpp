@@ -246,9 +246,16 @@ fi
 [ $dl = 1 ] && exit 0
 if [ $inst = 1 ]; then
   if [ $sim = 0 ]; then
-    echo "debconf (developer): frontend running, package name is quiet" >&2
-    echo "debconf (developer): <-- INPUT high quiet/q" >&2
-    printf 'Name: quiet/q\nTemplate: quiet/q\nValue: yes\nOwners: quiet\n' > "$LCOS_STUB_COUNTFILE"
+    env > "$LCOS_STUB_ENVFILE"
+    # Like apt, copy what dpkg's children print into term.log. Real debconf
+    # prints its protocol trace, answers included, only with DEBCONF_DEBUG.
+    if [ -n "$DEBCONF_DEBUG" ]; then
+      echo "debconf (developer): <-- SET quiet/pw TOPSECRET4411" | tee -a "$LCOS_STUB_STATEFILE" >&2
+      echo "debconf (developer): --> 0 TOPSECRET4411" | tee -a "$LCOS_STUB_STATEFILE" >&2
+    fi
+    if [ "$DEBCONF_NONINTERACTIVE_SEEN" = true ]; then flags='Flags: seen\n'; else flags=''; fi
+    printf "Name: quiet/q\nTemplate: quiet/q\nValue: yes\nOwners: quiet\n${flags}\nName: quiet/skip\nTemplate: quiet/skip\nValue: no\nOwners: quiet\n" > "$LCOS_STUB_COUNTFILE"
+    printf "Name: quiet/pw\nTemplate: quiet/pw\nValue: TOPSECRET4411\nOwners: quiet\n${flags}" > "$(dirname "$LCOS_STUB_COUNTFILE")/passwords.dat"
     echo "dpkg: error processing package plainnew (--configure):"
     echo "Errors were encountered while processing:"
     echo " plainnew"
@@ -305,7 +312,11 @@ static void test_helper(const char* helper)
   write_file(dir + "/apt-cache", kStubCache, 0755);
   write_file(dir + "/dpkg-deb", kStubDpkgDeb, 0755);
   write_file(dir + "/status", "Package: host\nStatus: install ok installed\nVersion: 1.0\n\n");
-  write_file(debconf + "/templates.dat", "Name: quiet/q\nType: string\nDescription: Quiet question\nOwners: quiet\n");
+  write_file(debconf + "/templates.dat", "Name: quiet/q\nType: string\nDescription: Quiet question\nOwners: quiet\n\n"
+                                         "Name: quiet/skip\nType: string\nDescription: Skipped question\nOwners: quiet\n\n"
+                                         "Name: quiet/pw\nType: password\nDescription: Quiet password\nOwners: quiet\n");
+  write_file(dir + "/term.log", "");
+  write_file(dir + "/env", "");
   write_file(debconf + "/config.dat", "");
   write_file(dir + "/argv", "");
   std::vector<std::pair<std::string, std::string>> env = {
@@ -319,7 +330,9 @@ static void test_helper(const char* helper)
       {"LCOS_UPDATES_DEBCONF_DIR", debconf},
       {"LCOS_STUB_PIDFILE", dir},
       {"LCOS_STUB_COUNTFILE", debconf + "/config.dat"},
-      {"LCOS_STUB_ARGVFILE", dir + "/argv"}};
+      {"LCOS_STUB_ARGVFILE", dir + "/argv"},
+      {"LCOS_STUB_ENVFILE", dir + "/env"},
+      {"LCOS_STUB_STATEFILE", dir + "/term.log"}};
   {
     const HelperRun r = run_helper(helper, {"simulate"}, env);
     const SimulateResult p = parse_protocol(r.out);
@@ -347,10 +360,20 @@ static void test_helper(const char* helper)
   {
     const HelperRun r = run_helper(helper, {"upgrade", "host=2.0", "plainnew=1.0", "quiet=1.0"}, env);
     const SimulateResult p = parse_protocol(r.out);
-    expect(p.status == SimulateResult::Error && p.debconf_answers.size() == 1 &&
-               p.debconf_answers[0].question == "quiet/q" && p.debconf_answers[0].value == "yes" &&
+    std::vector<std::string> got;
+    for (const auto& a : p.debconf_answers)
+      got.push_back(a.question + "=" + a.value);
+    expect(p.status == SimulateResult::Error &&
+               got == std::vector<std::string>({"quiet/q=yes", "quiet/pw=(password set, not shown)"}) &&
                p.debconf_answers[0].text == "Quiet question",
-           "U-4: a failed install still reports the answers it chose");
+           "U-4: a failed install still reports the answers it chose; unseen quiet/skip is not listed");
+    const std::string envs = slurp(dir + "/env");
+    expect(!has(envs, "DEBCONF_DEBUG") && has(envs, "DEBCONF_NONINTERACTIVE_SEEN=true"),
+           "r13b: the install runs without DEBCONF_DEBUG and with DEBCONF_NONINTERACTIVE_SEEN=true");
+    expect(!has(slurp(dir + "/term.log"), "TOPSECRET4411"),
+           "r13b: no password value reaches apt's term.log");
+    expect(!has(r.out, "TOPSECRET4411") && !has(r.err, "TOPSECRET4411"),
+           "r13b: no password value reaches the helper's stdout or stderr");
     expect(!has(r.out, "debconf (developer)") && !has(r.err, "debconf (developer)"),
            "trace lines never reach the window");
   }
