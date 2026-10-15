@@ -1546,6 +1546,14 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
   present_outcome(outcome_install(shown, exit_code, have_rows), shown.packages, shown.new_packages);
   if (shown.status == SimulateResult::Error && have_rows)
     refresh_rows_after_failure();
+  /* Round 13 (U-4): a partly failed install still lists the setup answers
+   * it chose for the packages that did get configured. */
+  if (shown.status == SimulateResult::Error && !shown.debconf_answers.empty()) {
+    Glib::ustring text = m_status.get_text();
+    text += "\n" + debconf_answer_sentence(shown);
+    set_idle_status(text);
+    queue_fit();
+  }
   offer_repair_for(shown);
 }
 

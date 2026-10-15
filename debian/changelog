@@ -1,3 +1,22 @@
+lcos-updates (0.9.4-5) unstable; urgency=medium
+
+  * Fix round 13 review findings for debconf reporting:
+    - Password questions (passwords.dat) are reported as "left blank" or
+      "set, not shown"; the value never leaves the helper.
+    - Only answers that are new or changed by this install are listed, so
+      a later upgrade does not repeat them.
+    - Only questions a normal install would ask at the configured debconf
+      priority (default high) are listed, by their question text. The
+      install runs with DEBCONF_DEBUG=developer to see the priorities; that
+      trace is stripped from all output.
+    - A partly failed install still lists the answers it chose.
+    - The review notice says earlier answers are kept and new questions get
+      the suggested answer, and points to the Terminal app.
+    - Check inspects new packages' debs for a templates member, so a new
+      package that uses debconf without depending on it is flagged.
+
+ -- Phil <phil@brushpad.local>  Thu, 15 Oct 2026 03:30:00 +0000
+
 lcos-updates (0.9.4-4) unstable; urgency=medium
 
   * Fix round 12 review findings: the review dialog names packages that

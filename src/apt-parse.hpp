@@ -79,6 +79,8 @@ struct SimulateResult {
     std::string package;
     std::string question;
     std::string value;
+    /* Round 13 (U-3): the question's text from its template ("Pick a colour"). */
+    std::string text;
   };
   /* Questions the install answered without asking (not marked seen). */
   std::vector<DebconfAnswer> debconf_answers;
@@ -290,5 +292,43 @@ std::vector<SimulateResult::DebconfAnswer> unseen_debconf_answers(const std::str
 std::string debconf_review_notice(const std::vector<std::string>& pkgs);
 /* After-install sentence listing auto-answered questions and how to change them. */
 std::string debconf_answer_sentence(const SimulateResult& result);
+
+/* Round 13. What debconf held for one question before or after an install.
+ * Password values are never kept: only whether one was set. */
+struct DebconfQuestion {
+  std::string name;
+  std::string value;
+  bool has_value = false;
+  bool seen = false;
+  bool password = false;
+};
+/* config.dat plus passwords.dat. passwords.dat entries keep has_value only. */
+std::vector<DebconfQuestion> debconf_snapshot(const std::string& config_dat, const std::string& passwords_dat);
+/* One "<-- INPUT priority question" line from DEBCONF_DEBUG=developer, with
+ * the package named by the latest "package name is" line. */
+struct DebconfInput {
+  std::string package;
+  std::string priority;
+  std::string question;
+};
+std::vector<DebconfInput> debconf_inputs(const std::string& apt_output);
+/* Drops every "debconf (developer):" line. That trace can carry values,
+ * including a password a maintainer script reads back, so it never leaves
+ * the helper, in the log or in an error message. */
+std::string strip_debconf_trace(const std::string& text);
+bool is_debconf_trace_line(const std::string& line);
+/* debconf/priority from config.dat; "high" when unset or unknown. */
+std::string debconf_priority(const std::string& config_dat);
+/* Questions a normal (interactive) install at the configured priority would
+ * have asked, that were not answered before (no "seen" flag before), and
+ * that are new or changed since the snapshot taken before the install, so a
+ * later upgrade does not list the same answers again. Text comes from
+ * templates.dat. Passwords give "(password left blank)" or "(password set,
+ * not shown)", never the value. */
+std::vector<SimulateResult::DebconfAnswer> debconf_auto_answers(const std::vector<DebconfInput>& inputs,
+                                                                const std::vector<DebconfQuestion>& before,
+                                                                const std::vector<DebconfQuestion>& after,
+                                                                const std::string& templates_dat,
+                                                                const std::string& priority);
 
 #endif
