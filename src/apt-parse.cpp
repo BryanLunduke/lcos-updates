@@ -1221,7 +1221,11 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
   for (const auto& name : result.debconf_pkgs)
     out << "ASKS " << tok(name) << "\n";
   for (const auto& ans : result.debconf_answers)
+  {
     out << "ANSWER " << tok(ans.package) << " " << tok(ans.question) << " " << esc(ans.value) << "\n";
+    if (!ans.text.empty())
+      out << "QTEXT " << tok(ans.question) << " " << esc(ans.text) << "\n";
+  }
   if (result.install_skipped)
     out << "SKIPPED\n";
   if (!result.warning.empty())
@@ -1328,6 +1332,13 @@ SimulateResult parse_protocol(const std::string& text)
         if (!ans.question.empty())
           result.debconf_answers.push_back(ans);
       }
+    } else if (line.compare(0, 6, "QTEXT ") == 0) {
+      /* Round 13 (U-3): question text for the ANSWER just before it. */
+      const std::string rest = line.substr(6);
+      const std::size_t a = rest.find(' ');
+      if (a != std::string::npos && !result.debconf_answers.empty() &&
+          result.debconf_answers.back().question == protocol_unescape(rest.substr(0, a)))
+        result.debconf_answers.back().text = protocol_unescape(rest.substr(a + 1));
     } else if (line == "SKIPPED") {
       result.install_skipped = true;
     } else if (line.compare(0, 5, "WARN ") == 0) {
@@ -2368,15 +2379,209 @@ std::vector<SimulateResult::DebconfAnswer> unseen_debconf_answers(const std::str
   return out;
 }
 
+
+namespace {
+
+std::string debconf_change_hint(const std::vector<std::string>& pkgs)
+{
+  std::string names;
+  for (const auto& p : pkgs)
+    names += (names.empty() ? "" : " ") + p;
+  return "To change an answer later, open Terminal from the applications menu and run: "
+         "sudo dpkg-reconfigure " + names + ".";
+}
+
+int priority_rank(const std::string& p)
+{
+  if (p == "low")
+    return 0;
+  if (p == "medium")
+    return 1;
+  if (p == "high")
+    return 2;
+  if (p == "critical")
+    return 3;
+  return -1;
+}
+
+}  // namespace
+
+bool is_debconf_trace_line(const std::string& line)
+{
+  return line.find("debconf (developer):") != std::string::npos;
+}
+
+std::string strip_debconf_trace(const std::string& text)
+{
+  if (text.find("debconf (developer):") == std::string::npos)
+    return text;
+  std::string out;
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    std::size_t nl = text.find('\n', pos);
+    const std::size_t end = nl == std::string::npos ? text.size() : nl + 1;
+    const std::string line = text.substr(pos, end - pos);
+    if (!is_debconf_trace_line(line))
+      out += line;
+    pos = end;
+  }
+  return out;
+}
+
+std::vector<DebconfInput> debconf_inputs(const std::string& apt_output)
+{
+  std::vector<DebconfInput> out;
+  std::string package;
+  std::size_t pos = 0;
+  const std::string tag = "debconf (developer): ";
+  while (pos < apt_output.size()) {
+    std::size_t nl = apt_output.find_first_of("\r\n", pos);
+    if (nl == std::string::npos)
+      nl = apt_output.size();
+    const std::string line = apt_output.substr(pos, nl - pos);
+    pos = nl + 1;
+    const std::size_t t = line.find(tag);
+    if (t == std::string::npos)
+      continue;
+    const std::string msg = line.substr(t + tag.size());
+    const std::string pkg_tag = "package name is ";
+    const std::size_t pn = msg.find(pkg_tag);
+    if (msg.compare(0, 9, "frontend ") == 0 && pn != std::string::npos) {
+      std::istringstream ps(msg.substr(pn + pkg_tag.size()));
+      package.clear();
+      ps >> package;
+      continue;
+    }
+    if (msg.compare(0, 10, "<-- INPUT ") != 0)
+      continue;
+    std::istringstream is(msg.substr(10));
+    DebconfInput in;
+    is >> in.priority >> in.question;
+    if (in.question.empty() || priority_rank(in.priority) < 0)
+      continue;
+    in.package = package;
+    if (in.package.empty())
+      in.package = in.question.substr(0, in.question.find('/'));
+    out.push_back(in);
+  }
+  return out;
+}
+
+std::string debconf_priority(const std::string& config_dat)
+{
+  for (const auto& st : parse_stanzas(config_dat))
+    if (st.get("Name") == "debconf/priority") {
+      const std::string v = st.get("Value");
+      return priority_rank(v) >= 0 ? v : std::string("high");
+    }
+  return "high";
+}
+
+std::vector<DebconfQuestion> debconf_snapshot(const std::string& config_dat, const std::string& passwords_dat)
+{
+  std::vector<DebconfQuestion> out;
+  auto add = [&](const std::string& text, bool password) {
+    for (const auto& st : parse_stanzas(text)) {
+      DebconfQuestion q;
+      q.name = st.get("Name");
+      if (q.name.empty())
+        continue;
+      q.password = password;
+      bool has = false;
+      for (const auto& f : st.fields)
+        if (f.first == "Value")
+          has = true;
+      const std::string v = st.get("Value");
+      q.has_value = has && !v.empty();
+      if (!password)
+        q.value = v;
+      for (const auto& flag : split_list(st.get("Flags")))
+        if (flag == "seen")
+          q.seen = true;
+      out.push_back(std::move(q));
+    }
+  };
+  add(config_dat, false);
+  add(passwords_dat, true);
+  return out;
+}
+
+std::vector<SimulateResult::DebconfAnswer> debconf_auto_answers(const std::vector<DebconfInput>& inputs,
+                                                                const std::vector<DebconfQuestion>& before,
+                                                                const std::vector<DebconfQuestion>& after,
+                                                                const std::string& templates_dat,
+                                                                const std::string& priority)
+{
+  const int threshold = priority_rank(priority) < 0 ? 2 : priority_rank(priority);
+  auto find = [](const std::vector<DebconfQuestion>& qs, const std::string& name,
+                 bool password) -> const DebconfQuestion* {
+    for (const auto& q : qs)
+      if (q.name == name && q.password == password)
+        return &q;
+    return nullptr;
+  };
+  std::vector<Stanza> templates = parse_stanzas(templates_dat);
+  auto template_of = [&](const std::string& name) -> const Stanza* {
+    for (const auto& t : templates)
+      if (t.get("Name") == name)
+        return &t;
+    return nullptr;
+  };
+  std::vector<SimulateResult::DebconfAnswer> out;
+  std::vector<std::string> done;
+  for (const auto& in : inputs) {
+    if (priority_rank(in.priority) < threshold)
+      continue; /* U-3: a normal install would not have asked this either */
+    if (std::find(done.begin(), done.end(), in.question) != done.end())
+      continue;
+    const Stanza* tmpl = template_of(in.question);
+    const std::string type = tmpl != nullptr ? tmpl->get("Type") : std::string();
+    if (type != "string" && type != "boolean" && type != "select" && type != "multiselect" &&
+        type != "password")
+      continue;
+    const bool password = type == "password";
+    /* Debconf keeps passwords in passwords.dat; an older or custom setup
+     * may keep them in config.dat. Either way only has_value is used. */
+    const DebconfQuestion* was = find(before, in.question, password);
+    if (was == nullptr && password)
+      was = find(before, in.question, false);
+    const DebconfQuestion* now = find(after, in.question, password);
+    if (now == nullptr && password)
+      now = find(after, in.question, false);
+    if (was != nullptr && was->seen)
+      continue; /* the user answered it before; debconf kept that answer */
+    if (now != nullptr && now->seen)
+      continue;
+    /* U-2: an unseen answer that was already there and did not change was
+     * reported (or set) by an earlier install; do not list it again. */
+    if (was != nullptr && now != nullptr && was->has_value == now->has_value && was->value == now->value)
+      continue;
+    if (was != nullptr && now == nullptr)
+      continue;
+    done.push_back(in.question);
+    SimulateResult::DebconfAnswer ans;
+    ans.package = in.package;
+    ans.question = in.question;
+    ans.text = tmpl->get("Description");
+    if (password)
+      ans.value = now != nullptr && now->has_value ? "(password set, not shown)" : "(password left blank)";
+    else
+      ans.value = now != nullptr ? now->value : std::string();
+    out.push_back(ans);
+  }
+  return out;
+}
+
 std::string debconf_review_notice(const std::vector<std::string>& pkgs)
 {
   if (pkgs.empty())
     return {};
-  const bool one = pkgs.size() == 1;
-  return join_names(pkgs) + (one ? " has setup questions. " : " have setup questions. ") +
-         "Updates installs without stopping to ask, so the package defaults will be used. "
-         "You can change the answers afterwards with: sudo dpkg-reconfigure " +
-         (one ? pkgs[0] : std::string("<package>")) + ".";
+  /* Round 13 (U-5): earlier answers are kept; only new questions get the
+   * package's default. The hint names the Terminal app, not just a command. */
+  return join_names(pkgs) + " may ask setup questions. " +
+         "Updates installs without stopping to ask: answers you gave before are kept, and new "
+         "questions get the package's suggested answer. When the install finishes, Updates lists "
+         "the answers it chose. " + debconf_change_hint(pkgs);
 }
 
 std::string debconf_answer_sentence(const SimulateResult& result)
@@ -2387,16 +2592,12 @@ std::string debconf_answer_sentence(const SimulateResult& result)
   std::vector<std::string> owners;
   for (const auto& ans : result.debconf_answers) {
     if (!list.empty())
-      list += ", ";
-    list += ans.question + " = " + (ans.value.empty() ? std::string("(blank)") : ans.value);
+      list += "; ";
+    const std::string text = ans.text.empty() ? ans.question : ans.text;
+    list += "\u201c" + text + "\u201d (" + ans.package + "): " +
+            (ans.value.empty() ? std::string("left blank") : ans.value);
     owners.push_back(ans.package);
   }
   sort_unique(owners);
-  std::string cmd;
-  for (const auto& o : owners) {
-    if (!cmd.empty())
-      cmd += ", ";
-    cmd += "sudo dpkg-reconfigure " + o;
-  }
-  return "Setup questions were answered automatically: " + list + ". To change them, run: " + cmd + ".";
+  return "Setup questions were answered automatically: " + list + ". " + debconf_change_hint(owners);
 }

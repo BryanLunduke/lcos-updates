@@ -137,6 +137,11 @@ case "$LCOS_STUB_SCRIPT" in
   adopt)
     if [ $inst = 1 ] && [ $sim = 0 ] && [ $uris = 0 ] && [ -n "$LCOS_STUB_PIDFILE" ]; then
       cp "$LCOS_STUB_PIDFILE" "$LCOS_STUB_COUNTFILE"
+      echo "debconf (developer): frontend running, package name is epsilon" >&2
+      echo "debconf (developer): <-- INPUT high epsilon/color" >&2
+      echo "debconf (developer): <-- INPUT high epsilon/name" >&2
+      echo "debconf (developer): <-- INPUT critical epsilon/secret" >&2
+      echo "debconf (developer): --> 0 hunter2" >&2
     fi
     if [ $inst = 1 ]; then
       echo "The following NEW packages will be installed:"
@@ -251,7 +256,7 @@ static void test_parser()
   r.debconf_pkgs = {"epsilon"};
   r.debconf_answers = ans;
   /* A value with a newline and a space must survive the protocol. */
-  r.debconf_answers.push_back({"epsilon", "epsilon/evil", "a b\nSTATUS error"});
+  r.debconf_answers.push_back({"epsilon", "epsilon/evil", "a b\nSTATUS error", ""});
   r.new_packages.push_back(PackageUpgrade{});
   r.new_packages.back().name = "epsilon";
   r.new_packages.back().old_version = "-";
@@ -269,7 +274,8 @@ static void test_parser()
          "U-1: ANSWER round-trips blank and escaped values");
 
   const std::string notice = debconf_review_notice({"epsilon"});
-  expect(has(notice, "epsilon has setup questions") && has(notice, "defaults will be used") &&
+  /* Round 13 (U-5) reworded the notice; see test-r13. */
+  expect(has(notice, "epsilon may ask setup questions") && has(notice, "suggested answer") &&
              has(notice, "sudo dpkg-reconfigure epsilon"),
          "U-1: review notice names the package, the defaults and the fix");
   expect(debconf_review_notice({}).empty(), "U-1: no notice without debconf packages");
@@ -280,9 +286,11 @@ static void test_parser()
   done.not_upgraded_count = 0;
   done.debconf_answers = ans;
   const JobOutcome o = outcome_install(done, 0, true);
-  expect(has(o.status, "Setup questions were answered automatically: epsilon/color = green, "
-                       "epsilon/name = (blank), epsilon/secret = (password not shown).") &&
-             has(o.status, "To change them, run: sudo dpkg-reconfigure epsilon."),
+  /* Round 13 (U-3) shows question text when known, the ID otherwise. */
+  expect(has(o.status, "Setup questions were answered automatically: \u201cepsilon/color\u201d (epsilon): green; "
+                       "\u201cepsilon/name\u201d (epsilon): left blank; "
+                       "\u201cepsilon/secret\u201d (epsilon): (password not shown).") &&
+             has(o.status, "sudo dpkg-reconfigure epsilon."),
          "U-1: install result lists the answers and how to change them");
   done.debconf_answers.clear();
   expect(!has(outcome_install(done, 0, true).status, "Setup questions"),
@@ -362,7 +370,7 @@ static void test_helper(const char* helper)
     for (const auto& a : p.debconf_answers)
       qs.push_back(a.package + ":" + a.question + "=" + a.value);
     expect(qs == std::vector<std::string>({"epsilon:epsilon/color=green", "epsilon:epsilon/name=",
-                                           "epsilon:epsilon/secret=(password not shown)"}),
+                                           "epsilon:epsilon/secret=(password set, not shown)"}),
            "U-1: install reports the auto-answered questions with their values");
     expect(!has(r.out, "hunter2"), "U-1: the password value never leaves the helper");
     const std::string calls = slurp(log);

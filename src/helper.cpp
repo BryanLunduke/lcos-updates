@@ -171,11 +171,19 @@ void emit(const SimulateResult& result)
   write_all_stdout(format_protocol(result));
 }
 
+/* Round 13 (U-4): answers the install chose before it failed. emit_error
+ * carries them, so a partial failure still reports them. */
+std::vector<SimulateResult::DebconfAnswer> g_error_answers;
+/* Round 13 (U-3): the install child gets DEBCONF_DEBUG=developer so the
+ * helper can see which questions were asked and at what priority. */
+bool g_debconf_trace = false;
+
 void emit_error(const std::string& msg)
 {
   SimulateResult r;
   r.status = SimulateResult::Error;
   r.error_msg = msg;
+  r.debconf_answers = g_error_answers;
   emit(r);
 }
 
@@ -314,6 +322,8 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (setenv("PATH", kSafePath, 1) != 0 || setenv("LANG", "C.UTF-8", 1) != 0 ||
         setenv("LC_ALL", "C.UTF-8", 1) != 0 || setenv("DEBIAN_FRONTEND", "noninteractive", 1) != 0)
       _exit(127);
+    if (g_debconf_trace)
+      setenv("DEBCONF_DEBUG", "developer", 1);
     if (geteuid() == 0) {
       setenv("HOME", "/root", 1);
     } else {
@@ -441,6 +451,8 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
   /* Apt's clear-line is spaces or a bare carriage return. Inst and Conf lines
    * are the simulator's plan, not a status. Neither replaces a real percent. */
   auto drop_progress = [](const std::string& clean) {
+    if (is_debconf_trace_line(clean))
+      return true;
     if (!progress_line_visible(clean))
       return true;
     return clean.compare(0, 5, "Inst ") == 0 || clean.compare(0, 5, "Conf ") == 0;
@@ -1636,11 +1648,129 @@ std::string read_debconf(const char* file)
   return read_limited((dir + "/" + file).c_str(), 32 * 1024 * 1024);
 }
 
+constexpr std::size_t kTemplateProbeMax = 40;
+
+const char* dpkg_deb_path()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_DPKG_DEB");
+    if (env != nullptr && env[0] == '/')
+      return env;
+  }
+  return "/usr/bin/dpkg-deb";
+}
+
+void remove_probe_dir(const std::string& dir)
+{
+  /* Only this helper's own mkdtemp directory: files and one partial/ level. */
+  for (const std::string& sub : {dir + "/partial", dir}) {
+    if (DIR* d = opendir(sub.c_str())) {
+      while (struct dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n == "." || n == "..")
+          continue;
+        unlink((sub + "/" + n).c_str());
+      }
+      closedir(d);
+    }
+  }
+  rmdir((dir + "/partial").c_str());
+  rmdir(dir.c_str());
+}
+
+/* Downloads the pinned packages with apt into a private directory and adds
+ * the name of each one whose control area has a templates member. False
+ * only on cancel; a failed download just leaves those packages unflagged. */
+bool debs_with_templates(const std::vector<std::string>& pins, std::vector<std::string>& found)
+{
+  std::string base = "/var/cache/apt";
+  if (geteuid() != 0) {
+    const char* state = std::getenv("LCOS_UPDATES_STATE_DIR");
+    if (state == nullptr || state[0] != '/')
+      return true;
+    base = state;
+  }
+  std::string tmpl = base + "/lcos-updates-templates.XXXXXX";
+  std::vector<char> buf(tmpl.begin(), tmpl.end());
+  buf.push_back('\0');
+  if (mkdtemp(buf.data()) == nullptr)
+    return true;
+  const std::string dir = buf.data();
+  mkdir((dir + "/partial").c_str(), 0700);
+  const std::string archives = "Dir::Cache::archives=" + dir + "/";
+  std::vector<const char*> argv = {apt_get_path(), "-q", "-y", "-o", archives.c_str(), "--download-only",
+                                   "--no-install-recommends", "install"};
+  for (const auto& pin : pins)
+    argv.push_back(pin.c_str());
+  std::string out;
+  std::string err;
+  const sig_atomic_t saved_commit = g_dpkg_committed;
+  g_dpkg_committed = 0;
+  int rc = run_apt(argv, kDownloadSizeIdleSec, kDownloadSizeHardSec, out, err, false, false, false);
+  if (rc != -3 && !stop_requested()) {
+    /* The same request with --print-uris names file: sources, which apt
+     * reads in place instead of downloading. */
+    std::vector<const char*> uargv = argv;
+    uargv.insert(uargv.begin() + 1, "--print-uris");
+    out.clear();
+    err.clear();
+    rc = run_apt(uargv, kDownloadSizeIdleSec, kDownloadSizeHardSec, out, err, false, false, false);
+  }
+  g_dpkg_committed = saved_commit;
+  if (rc == -3 || stop_requested()) {
+    remove_probe_dir(dir);
+    return false;
+  }
+  for (const auto& pin : pins) {
+    const std::string name = pin.substr(0, pin.find('='));
+    DIR* d = opendir(dir.c_str());
+    if (d == nullptr)
+      break;
+    std::string deb;
+    while (struct dirent* e = readdir(d)) {
+      const std::string n = e->d_name;
+      if (n.compare(0, name.size() + 1, name + "_") == 0 && n.size() > 4 &&
+          n.compare(n.size() - 4, 4, ".deb") == 0)
+        deb = dir + "/" + n;
+    }
+    closedir(d);
+    /* A file: source is used in place; apt does not copy it. */
+    if (deb.empty()) {
+      std::istringstream lines(out);
+      std::string line;
+      const std::string want = "'file:";
+      while (std::getline(lines, line)) {
+        if (line.compare(0, want.size(), want) != 0)
+          continue;
+        const std::size_t end = line.find('\'', 1);
+        if (end == std::string::npos)
+          continue;
+        const std::string path = line.substr(want.size(), end - want.size());
+        const std::size_t slash = path.rfind('/');
+        const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+        if (base.compare(0, name.size() + 1, name + "_") == 0 && path.find('%') == std::string::npos &&
+            path.find("/../") == std::string::npos)
+          deb = path;
+      }
+    }
+    if (deb.empty())
+      continue;
+    std::string info;
+    std::string info_err;
+    const std::vector<const char*> iargv = {dpkg_deb_path(), "--info", deb.c_str(), "templates"};
+    const int irc = run_apt(iargv, kDownloadSizeIdleSec, kDownloadSizeHardSec, info, info_err, false, false, false);
+    if (irc == 0 && info.find("Template:") != std::string::npos)
+      found.push_back(name);
+  }
+  remove_probe_dir(dir);
+  return true;
+}
+
 /* Packages in the reviewed set that may ask debconf questions: the candidate
  * depends on debconf (dh_installdebconf adds that when a package ships
  * templates), or the installed version already owns questions. The install
  * stays non-interactive; this only lets the window say so beforehand. */
-bool note_debconf(SimulateResult& result)
+bool note_debconf(SimulateResult& result, bool inspect_debs)
 {
   result.debconf_pkgs.clear();
   std::vector<std::string> names;
@@ -1667,6 +1797,20 @@ bool note_debconf(SimulateResult& result)
   }
   for (const auto& owner : debconf_question_owners(read_debconf("config.dat")))
     found.push_back(owner);
+  /* Round 13 (U-6): a new package can ship templates without depending on
+   * debconf. Check only: download those debs to a private directory and look
+   * for a templates member. */
+  if (inspect_debs) {
+    std::vector<std::string> unknown;
+    for (const auto& pkg : result.new_packages)
+      if (std::find(found.begin(), found.end(), pkg.name) == found.end() &&
+          valid_pin(pkg.name + "=" + pkg.new_version))
+        unknown.push_back(pkg.name + "=" + pkg.new_version);
+    if (!unknown.empty() && unknown.size() <= kTemplateProbeMax) {
+      if (!debs_with_templates(unknown, found))
+        return false;
+    }
+  }
   for (const auto& name : names)
     if (std::find(found.begin(), found.end(), name) != found.end() &&
         std::find(result.debconf_pkgs.begin(), result.debconf_pkgs.end(), name) ==
@@ -2147,7 +2291,7 @@ int do_simulate()
     emit_error("Update check was cancelled");
     return 1;
   }
-  if (!note_download_size(result) || !note_debconf(result)) {
+  if (!note_download_size(result) || !note_debconf(result, true)) {
     emit_error("Update check was cancelled");
     return 1;
   }
@@ -2261,7 +2405,7 @@ int do_upgrade(const std::vector<std::string>& pins)
     return 0;
   }
 
-  if (!note_debconf(sim)) {
+  if (!note_debconf(sim, false)) {
     emit_error("Install was cancelled");
     return 1;
   }
@@ -2297,11 +2441,30 @@ int do_upgrade(const std::vector<std::string>& pins)
   err.clear();
   emit_phase("download");
   const RebootSnap reboot_before = snapshot_reboot();
+  /* Round 13: what debconf held before, to report only new or changed
+   * answers afterwards (U-2), including password questions (U-1). */
+  const std::vector<DebconfQuestion> debconf_before =
+      debconf_snapshot(read_debconf("config.dat"), read_debconf("passwords.dat"));
   const AptClock up_clock = apt_clock(kUpgradeIdleSec, kUpgradeHardCapSec);
+  g_debconf_trace = true;
   rc = run_apt(up_argv, up_clock.idle_sec, up_clock.hard_sec, out, err, true);
+  g_debconf_trace = false;
+  const std::vector<DebconfInput> debconf_asked = debconf_inputs(out + "\n" + err);
+  out = strip_debconf_trace(out);
+  err = strip_debconf_trace(err);
+  std::vector<SimulateResult::DebconfAnswer> answers;
+  if (!debconf_asked.empty()) {
+    const std::string config_after = read_debconf("config.dat");
+    answers = debconf_auto_answers(debconf_asked, debconf_before,
+                                   debconf_snapshot(config_after, read_debconf("passwords.dat")),
+                                   read_debconf("templates.dat"), debconf_priority(config_after));
+  }
+  /* U-4: a failed install still says what it answered. */
+  g_error_answers = answers;
   if (fail_apt(rc, out, err, "Install was cancelled", "Timed out while installing updates",
                update_warning) != 0)
     return 1;
+  g_error_answers.clear();
 
   const SimulateResult parsed = parse_apt_simulate(out + "\n" + err);
   SimulateResult result;
@@ -2335,9 +2498,7 @@ int do_upgrade(const std::vector<std::string>& pins)
   note_reboot_delta(result, reboot_before);
   /* Round 12 (U-1): report what the non-interactive frontend answered. */
   result.debconf_pkgs = sim.debconf_pkgs;
-  if (!sim.debconf_pkgs.empty())
-    result.debconf_answers =
-        unseen_debconf_answers(read_debconf("config.dat"), read_debconf("templates.dat"), sim.debconf_pkgs);
+  result.debconf_answers = answers;
   emit(result);
   return 0;
 }

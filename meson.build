@@ -181,6 +181,21 @@ test(
   timeout: 120,
 )
 
+test_r13 = executable(
+  'test-r13',
+  'tests/test-r13.cpp',
+  include_directories: inc,
+  link_with: apt_parse,
+  install: false,
+)
+
+test(
+  'round13-debconf-passwords-priority-partial',
+  test_r13,
+  args: [helper.full_path()],
+  timeout: 120,
+)
+
 test_window = executable(
   'test-window',
   'tests/test-window.cpp',
