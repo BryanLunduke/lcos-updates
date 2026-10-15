@@ -10,6 +10,7 @@
  * and apt-cache; root ignores every override used here.
  */
 
+#include "tmpdir-cleanup.hpp"
 #include "apt-parse.hpp"
 
 #include <algorithm>
@@ -304,6 +305,7 @@ static void test_helper(const char* helper)
     expect(false, "mkdtemp");
     return;
   }
+  lcos_test::cleanup_at_exit(tmpl);
   const std::string dir = tmpl;
   const std::string apt = dir + "/apt-get";
   const std::string cache = dir + "/apt-cache";
@@ -382,7 +384,7 @@ static void test_helper(const char* helper)
     for (const auto& a : p.debconf_answers)
       qs.push_back(a.package + ":" + a.question + "=" + a.value);
     expect(qs == std::vector<std::string>({"epsilon:epsilon/color=green", "epsilon:epsilon/name=",
-                                           "epsilon:epsilon/secret=(password set, not shown)"}),
+                                           "epsilon:epsilon/secret=password set, not shown"}),
            "U-1: install reports the auto-answered questions with their values");
     expect(!has(r.out, "hunter2"), "U-1: the password value never leaves the helper");
     const std::string calls = slurp(log);

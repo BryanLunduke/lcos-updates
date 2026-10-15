@@ -8,6 +8,7 @@
  * binary.
  */
 
+#include "tmpdir-cleanup.hpp"
 #include "window.hpp"
 
 #include <gtk/gtk.h>
@@ -564,6 +565,7 @@ int main()
     std::perror("mkdtemp");
     return 1;
   }
+  lcos_test::cleanup_at_exit(tmpl);
   const std::string dir = tmpl;
   const std::string script = dir + "/pkexec";
   const std::string log = dir + "/pkexec.log";

@@ -1,3 +1,20 @@
+lcos-updates (0.9.4-7) unstable; urgency=medium
+
+  * Round 14 U-1: the helper no longer makes a private download folder;
+    stale lcos-updates-templates.* folders left by a killed 0.9.4-5/-6
+    helper are removed at start (real directories owned by root only).
+  * U-2: Check downloads new packages into apt's archive cache, so Install
+    and later Checks reuse them instead of downloading again.
+  * U-3: a deb is never inspected when its download or checksum failed,
+    file: sources included.
+  * U-4: Repair reports the setup questions dpkg --configure -a and the
+    dependency fix answered automatically, also when Repair fails.
+  * U-5: password answers read "password set, not shown" with one set of
+    brackets.
+  * U-6: tests remove their /tmp/lcos-* folders on exit.
+
+ -- Phil <phil@brushpad.local>  Wed, 14 Oct 2026 23:10:00 -0500
+
 lcos-updates (0.9.4-6) unstable; urgency=high
 
   * Security: stop running installs with DEBCONF_DEBUG=developer. Its

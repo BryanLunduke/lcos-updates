@@ -2594,7 +2594,7 @@ std::vector<SimulateResult::DebconfAnswer> debconf_auto_answers(const std::vecto
     ans.question = in.question;
     ans.text = tmpl->get("Description");
     if (password)
-      ans.value = now != nullptr && now->has_value ? "(password set, not shown)" : "(password left blank)";
+      ans.value = now != nullptr && now->has_value ? "password set, not shown" : "password left blank";
     else
       ans.value = now != nullptr ? now->value : std::string();
     out.push_back(ans);

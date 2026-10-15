@@ -13,6 +13,7 @@
  * and dpkg; root ignores every override used here.
  */
 
+#include "tmpdir-cleanup.hpp"
 #include "apt-parse.hpp"
 
 #include <cstdio>
@@ -282,6 +283,7 @@ static void test_helper(const char* helper)
     expect(false, "mkdtemp");
     return;
   }
+  lcos_test::cleanup_at_exit(tmpl);
   const std::string dir = tmpl;
   const std::string apt = dir + "/apt-get";
   const std::string dpkg = dir + "/dpkg";

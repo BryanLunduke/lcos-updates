@@ -8,6 +8,7 @@
  * apt-get and dpkg shell scripts; root ignores both overrides.
  */
 
+#include "tmpdir-cleanup.hpp"
 #include "apt-parse.hpp"
 
 #include <cstdio>
@@ -321,6 +322,7 @@ static void test_repair(const char* helper)
     expect(false, "mkdtemp");
     return;
   }
+  lcos_test::cleanup_at_exit(tmpl);
   const std::string dir = tmpl;
   const std::string apt = dir + "/apt-get";
   const std::string dpkg = dir + "/dpkg";

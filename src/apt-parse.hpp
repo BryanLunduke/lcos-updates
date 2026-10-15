@@ -331,8 +331,8 @@ std::string debconf_priority(const std::string& config_dat);
  * have asked, that were not answered before (no "seen" flag before), and
  * that are new or changed since the snapshot taken before the install, so a
  * later upgrade does not list the same answers again. Text comes from
- * templates.dat. Passwords give "(password left blank)" or "(password set,
- * not shown)", never the value. */
+ * templates.dat. Passwords give "password left blank" or "password set,
+ * not shown", never the value. */
 std::vector<SimulateResult::DebconfAnswer> debconf_auto_answers(const std::vector<DebconfInput>& inputs,
                                                                 const std::vector<DebconfQuestion>& before,
                                                                 const std::vector<DebconfQuestion>& after,

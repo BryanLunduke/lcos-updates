@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include "tmpdir-cleanup.hpp"
 #include "proc-group.hpp"
 
 #include <cerrno>
@@ -1455,6 +1456,7 @@ int main(int argc, char** argv)
     std::perror("mkdtemp");
     return 1;
   }
+  lcos_test::cleanup_at_exit(dir_template);
   char self_path[4096];
   const ssize_t self_len = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
   if (self_len <= 0) {
