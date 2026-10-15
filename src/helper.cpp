@@ -35,6 +35,8 @@ namespace {
 
 const char kAptGet[] = "/usr/bin/apt-get";
 const char kDpkg[] = "/usr/bin/dpkg";
+const char kAptCache[] = "/usr/bin/apt-cache";
+const char kDebconfDir[] = "/var/cache/debconf";
 const char kSimNoteOpt[] = "-o";
 const char kSimNoteVal[] = "APT::Get::Show-User-Simulation-Note=false";
 const char kConfdef[] = "Dpkg::Options::=--force-confdef";
@@ -1606,6 +1608,74 @@ bool classify_kept_removals(SimulateResult& result, const std::vector<std::strin
 
 /* apt-get -s upgrade does not print a size. --print-uris upgrade does, and
  * it returns before apt downloads or unpacks. Returns false on cancel. */
+/* Round 12 (U-1). Root always uses the system paths. Non-root runs use
+ * them only through the test overrides; without one, detection is skipped. */
+const char* apt_cache_path()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_APT_CACHE");
+    return env != nullptr && env[0] == '/' ? env : nullptr;
+  }
+  return kAptCache;
+}
+
+std::string debconf_dir()
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_DEBCONF_DIR");
+    return env != nullptr && env[0] == '/' ? std::string(env) : std::string();
+  }
+  return kDebconfDir;
+}
+
+std::string read_debconf(const char* file)
+{
+  const std::string dir = debconf_dir();
+  if (dir.empty())
+    return {};
+  return read_limited((dir + "/" + file).c_str(), 32 * 1024 * 1024);
+}
+
+/* Packages in the reviewed set that may ask debconf questions: the candidate
+ * depends on debconf (dh_installdebconf adds that when a package ships
+ * templates), or the installed version already owns questions. The install
+ * stays non-interactive; this only lets the window say so beforehand. */
+bool note_debconf(SimulateResult& result)
+{
+  result.debconf_pkgs.clear();
+  std::vector<std::string> names;
+  std::vector<std::string> pins;
+  for (const auto* list : {&result.packages, &result.new_packages})
+    for (const auto& pkg : *list)
+      if (valid_pin(pkg.name + "=" + pkg.new_version)) {
+        names.push_back(pkg.name);
+        pins.push_back(pkg.name + "=" + pkg.new_version);
+      }
+  if (names.empty())
+    return true;
+  std::vector<std::string> found;
+  if (const char* cache = apt_cache_path()) {
+    std::vector<const char*> argv = {cache, "show", "--no-all-versions"};
+    for (const auto& pin : pins)
+      argv.push_back(pin.c_str());
+    std::string out;
+    std::string err;
+    const int rc = run_apt(argv, kDownloadSizeIdleSec, kDownloadSizeHardSec, out, err, false, false, false);
+    if (rc == -3 || stop_requested())
+      return false;
+    found = packages_depending_on_debconf(out);
+  }
+  for (const auto& owner : debconf_question_owners(read_debconf("config.dat")))
+    found.push_back(owner);
+  for (const auto& name : names)
+    if (std::find(found.begin(), found.end(), name) != found.end() &&
+        std::find(result.debconf_pkgs.begin(), result.debconf_pkgs.end(), name) ==
+            result.debconf_pkgs.end())
+      result.debconf_pkgs.push_back(name);
+  std::sort(result.debconf_pkgs.begin(), result.debconf_pkgs.end());
+  return true;
+}
+
 bool note_download_size(SimulateResult& result)
 {
   if (result.packages.empty())
@@ -2077,7 +2147,7 @@ int do_simulate()
     emit_error("Update check was cancelled");
     return 1;
   }
-  if (!note_download_size(result)) {
+  if (!note_download_size(result) || !note_debconf(result)) {
     emit_error("Update check was cancelled");
     return 1;
   }
@@ -2191,6 +2261,11 @@ int do_upgrade(const std::vector<std::string>& pins)
     return 0;
   }
 
+  if (!note_debconf(sim)) {
+    emit_error("Install was cancelled");
+    return 1;
+  }
+
   /* Keep existing conffiles; never block on TTY conffile prompts.
    * Install only the reviewed name=version pins. Not dist-upgrade. */
   std::vector<std::string> argv_store;
@@ -2258,6 +2333,11 @@ int do_upgrade(const std::vector<std::string>& pins)
   else
     result.status = SimulateResult::Success;
   note_reboot_delta(result, reboot_before);
+  /* Round 12 (U-1): report what the non-interactive frontend answered. */
+  result.debconf_pkgs = sim.debconf_pkgs;
+  if (!sim.debconf_pkgs.empty())
+    result.debconf_answers =
+        unseen_debconf_answers(read_debconf("config.dat"), read_debconf("templates.dat"), sim.debconf_pkgs);
   emit(result);
   return 0;
 }

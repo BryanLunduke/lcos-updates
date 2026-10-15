@@ -1187,6 +1187,11 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
     if (!pkg.size.empty())
       out << "SIZE " << tok(pkg.name) << " " << esc(pkg.size) << "\n";
   }
+  /* Round 12 (U-2): new dependencies carry a size too. */
+  for (const auto& pkg : result.new_packages) {
+    if (!pkg.size.empty())
+      out << "SIZE " << tok(pkg.name) << " " << esc(pkg.size) << "\n";
+  }
   for (const auto& name : result.phased)
     out << "PHASED " << esc(name) << "\n";
   for (const auto& name : result.held)
@@ -1213,6 +1218,10 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
     out << "SUMMARY_MISSING\n";
   for (const auto& path : result.conffiles_kept)
     out << "CONFKEPT " << esc(path) << "\n";
+  for (const auto& name : result.debconf_pkgs)
+    out << "ASKS " << tok(name) << "\n";
+  for (const auto& ans : result.debconf_answers)
+    out << "ANSWER " << tok(ans.package) << " " << tok(ans.question) << " " << esc(ans.value) << "\n";
   if (result.install_skipped)
     out << "SKIPPED\n";
   if (!result.warning.empty())
@@ -1299,6 +1308,26 @@ SimulateResult parse_protocol(const std::string& text)
       const std::string path = protocol_unescape(line.substr(9));
       if (!path.empty())
         result.conffiles_kept.push_back(path);
+    } else if (line.compare(0, 5, "ASKS ") == 0) {
+      const std::string name = protocol_unescape(line.substr(5));
+      if (!name.empty() && name.find(' ') == std::string::npos)
+        result.debconf_pkgs.push_back(name);
+    } else if (line.compare(0, 7, "ANSWER ") == 0) {
+      const std::string rest = line.substr(7);
+      const std::size_t a = rest.find(' ');
+      const std::size_t b = a == std::string::npos ? a : rest.find(' ', a + 1);
+      if (a != std::string::npos && a > 0) {
+        SimulateResult::DebconfAnswer ans;
+        ans.package = protocol_unescape(rest.substr(0, a));
+        if (b == std::string::npos) {
+          ans.question = protocol_unescape(rest.substr(a + 1));
+        } else {
+          ans.question = protocol_unescape(rest.substr(a + 1, b - a - 1));
+          ans.value = protocol_unescape(rest.substr(b + 1));
+        }
+        if (!ans.question.empty())
+          result.debconf_answers.push_back(ans);
+      }
     } else if (line == "SKIPPED") {
       result.install_skipped = true;
     } else if (line.compare(0, 5, "WARN ") == 0) {
@@ -1421,6 +1450,12 @@ SimulateResult parse_protocol(const std::string& text)
       if (name == pkg.name)
         pkg.security = true;
     }
+    for (const auto& size : sizes) {
+      if (size.first == pkg.name)
+        pkg.size = size.second;
+    }
+  }
+  for (auto& pkg : result.new_packages) {
     for (const auto& size : sizes) {
       if (size.first == pkg.name)
         pkg.size = size.second;
@@ -2017,6 +2052,7 @@ JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool hav
       append_sentence(status, "You're up to date.");
   }
   append_sentence(status, conf);
+  append_sentence(status, debconf_answer_sentence(result));
   append_sentence(status, reboot);
   append_sentence(status, pending);
   out.packages = PackageListAction::Hide;
@@ -2154,4 +2190,213 @@ bool error_says_locked(const std::string& text)
   return has(lower, "could not get lock") || has(lower, "unable to lock") ||
          has(lower, "lock was locked by") || has(lower, "frontend lock") ||
          has(lower, "is locked by another process") || has(lower, "unable to acquire the dpkg");
+}
+
+/* ---- Round 12 (U-1): debconf questions ---- */
+
+namespace {
+
+struct Stanza {
+  std::vector<std::pair<std::string, std::string>> fields;
+  std::string get(const char* key) const
+  {
+    for (const auto& f : fields)
+      if (f.first == key)
+        return f.second;
+    return {};
+  }
+};
+
+std::vector<Stanza> parse_stanzas(const std::string& text)
+{
+  std::vector<Stanza> out;
+  std::istringstream in(text);
+  std::string line;
+  Stanza cur;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line.empty()) {
+      if (!cur.fields.empty())
+        out.push_back(std::move(cur));
+      cur = Stanza{};
+      continue;
+    }
+    if (line[0] == ' ' || line[0] == '\t')
+      continue; /* continuation: not needed here */
+    const std::size_t colon = line.find(':');
+    if (colon == std::string::npos || colon == 0)
+      continue;
+    std::string value = line.substr(colon + 1);
+    std::size_t s = value.find_first_not_of(" \t");
+    value = s == std::string::npos ? std::string() : value.substr(s);
+    cur.fields.emplace_back(line.substr(0, colon), value);
+  }
+  if (!cur.fields.empty())
+    out.push_back(std::move(cur));
+  return out;
+}
+
+std::vector<std::string> split_list(const std::string& text)
+{
+  std::vector<std::string> out;
+  std::string item;
+  for (char ch : text + ",") {
+    if (ch == ',') {
+      std::size_t a = item.find_first_not_of(" \t");
+      std::size_t b = item.find_last_not_of(" \t");
+      if (a != std::string::npos)
+        out.push_back(item.substr(a, b - a + 1));
+      item.clear();
+    } else {
+      item += ch;
+    }
+  }
+  return out;
+}
+
+bool pkg_char(char ch)
+{
+  return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '+' || ch == '-';
+}
+
+/* True when a relationship field names debconf or debconf-2.0 as a package. */
+bool names_debconf(const std::string& field)
+{
+  std::size_t i = 0;
+  while (i < field.size()) {
+    if (!pkg_char(field[i])) {
+      ++i;
+      continue;
+    }
+    std::size_t j = i;
+    while (j < field.size() && pkg_char(field[j]))
+      ++j;
+    const std::string word = field.substr(i, j - i);
+    /* Skip version numbers inside (>= ...). */
+    bool in_version = false;
+    for (std::size_t k = i; k > 0; --k) {
+      const char ch = field[k - 1];
+      if (ch == '(') { in_version = true; break; }
+      if (ch == ')' || ch == ',' || ch == '|') break;
+    }
+    if (!in_version && (word == "debconf" || word == "debconf-2.0"))
+      return true;
+    i = j;
+  }
+  return false;
+}
+
+void sort_unique(std::vector<std::string>& names)
+{
+  std::sort(names.begin(), names.end());
+  names.erase(std::unique(names.begin(), names.end()), names.end());
+}
+
+}  // namespace
+
+std::vector<std::string> packages_depending_on_debconf(const std::string& apt_cache_show)
+{
+  std::vector<std::string> out;
+  for (const auto& st : parse_stanzas(apt_cache_show)) {
+    const std::string name = st.get("Package");
+    if (name.empty())
+      continue;
+    if (names_debconf(st.get("Depends")) || names_debconf(st.get("Pre-Depends")))
+      out.push_back(name);
+  }
+  sort_unique(out);
+  return out;
+}
+
+std::vector<std::string> debconf_question_owners(const std::string& config_dat)
+{
+  std::vector<std::string> out;
+  for (const auto& st : parse_stanzas(config_dat))
+    for (const auto& owner : split_list(st.get("Owners")))
+      out.push_back(owner);
+  sort_unique(out);
+  return out;
+}
+
+std::vector<SimulateResult::DebconfAnswer> unseen_debconf_answers(const std::string& config_dat,
+                                                                  const std::string& templates_dat,
+                                                                  const std::vector<std::string>& pkgs)
+{
+  std::vector<std::pair<std::string, std::string>> types;
+  for (const auto& st : parse_stanzas(templates_dat))
+    types.emplace_back(st.get("Name"), st.get("Type"));
+  auto type_of = [&](const std::string& tmpl) -> std::string {
+    for (const auto& t : types)
+      if (t.first == tmpl)
+        return t.second;
+    return {};
+  };
+  std::vector<SimulateResult::DebconfAnswer> out;
+  for (const auto& st : parse_stanzas(config_dat)) {
+    const std::string name = st.get("Name");
+    if (name.empty())
+      continue;
+    bool seen = false;
+    for (const auto& flag : split_list(st.get("Flags")))
+      if (flag == "seen")
+        seen = true;
+    if (seen)
+      continue;
+    std::string tmpl = st.get("Template");
+    if (tmpl.empty())
+      tmpl = name;
+    const std::string type = type_of(tmpl);
+    if (type != "string" && type != "boolean" && type != "select" && type != "multiselect" &&
+        type != "password")
+      continue;
+    std::string owner;
+    for (const auto& o : split_list(st.get("Owners")))
+      if (owner.empty() && std::find(pkgs.begin(), pkgs.end(), o) != pkgs.end())
+        owner = o;
+    if (owner.empty())
+      continue;
+    SimulateResult::DebconfAnswer ans;
+    ans.package = owner;
+    ans.question = name;
+    ans.value = type == "password" ? std::string("(password not shown)") : st.get("Value");
+    out.push_back(ans);
+  }
+  std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+    return a.package != b.package ? a.package < b.package : a.question < b.question;
+  });
+  return out;
+}
+
+std::string debconf_review_notice(const std::vector<std::string>& pkgs)
+{
+  if (pkgs.empty())
+    return {};
+  const bool one = pkgs.size() == 1;
+  return join_names(pkgs) + (one ? " has setup questions. " : " have setup questions. ") +
+         "Updates installs without stopping to ask, so the package defaults will be used. "
+         "You can change the answers afterwards with: sudo dpkg-reconfigure " +
+         (one ? pkgs[0] : std::string("<package>")) + ".";
+}
+
+std::string debconf_answer_sentence(const SimulateResult& result)
+{
+  if (result.debconf_answers.empty())
+    return {};
+  std::string list;
+  std::vector<std::string> owners;
+  for (const auto& ans : result.debconf_answers) {
+    if (!list.empty())
+      list += ", ";
+    list += ans.question + " = " + (ans.value.empty() ? std::string("(blank)") : ans.value);
+    owners.push_back(ans.package);
+  }
+  sort_unique(owners);
+  std::string cmd;
+  for (const auto& o : owners) {
+    if (!cmd.empty())
+      cmd += ", ";
+    cmd += "sudo dpkg-reconfigure " + o;
+  }
+  return "Setup questions were answered automatically: " + list + ". To change them, run: " + cmd + ".";
 }

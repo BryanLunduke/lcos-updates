@@ -72,6 +72,16 @@ struct SimulateResult {
   /* From the apt summary line. -1 when that line was not present. */
   int upgraded_count = -1;
   int not_upgraded_count = -1;
+  /* Round 12 (U-1): reviewed packages that use debconf and may ask setup
+   * questions. The install runs non-interactively, so defaults are used. */
+  std::vector<std::string> debconf_pkgs;
+  struct DebconfAnswer {
+    std::string package;
+    std::string question;
+    std::string value;
+  };
+  /* Questions the install answered without asking (not marked seen). */
+  std::vector<DebconfAnswer> debconf_answers;
 };
 
 /* Apt output retained by the helper and the window. The buffer stays within
@@ -264,5 +274,21 @@ bool error_says_locked(const std::string& text);
 extern const char kAnotherInstaller[];
 /* Round 11 (U-4): every remote source failed to resolve or connect. */
 extern const char kServerUnreachable[];
+
+/* Round 12 (U-1). Names of packages in apt-cache show output whose Depends
+ * or Pre-Depends name debconf or debconf-2.0. Sorted, unique. */
+std::vector<std::string> packages_depending_on_debconf(const std::string& apt_cache_show);
+/* Owners of any question in debconf's config.dat. Sorted, unique. */
+std::vector<std::string> debconf_question_owners(const std::string& config_dat);
+/* Questions owned by one of pkgs that were not shown to anyone (no "seen"
+ * flag), with their stored value. Only asking types (string, boolean,
+ * select, multiselect, password); password values are never returned. */
+std::vector<SimulateResult::DebconfAnswer> unseen_debconf_answers(const std::string& config_dat,
+                                                                  const std::string& templates_dat,
+                                                                  const std::vector<std::string>& pkgs);
+/* Review-dialog notice for packages that may ask setup questions. Empty when none. */
+std::string debconf_review_notice(const std::vector<std::string>& pkgs);
+/* After-install sentence listing auto-answered questions and how to change them. */
+std::string debconf_answer_sentence(const SimulateResult& result);
 
 #endif
