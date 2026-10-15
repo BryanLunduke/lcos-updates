@@ -174,9 +174,12 @@ void emit(const SimulateResult& result)
 /* Round 13 (U-4): answers the install chose before it failed. emit_error
  * carries them, so a partial failure still reports them. */
 std::vector<SimulateResult::DebconfAnswer> g_error_answers;
-/* Round 13 (U-3): the install child gets DEBCONF_DEBUG=developer so the
- * helper can see which questions were asked and at what priority. */
-bool g_debconf_trace = false;
+/* Round 13b: the install child gets DEBCONF_NONINTERACTIVE_SEEN=true so
+ * debconf marks every question it would have shown (priority and seen
+ * checks applied by debconf itself). DEBCONF_DEBUG is never set: its
+ * protocol trace carries answer values, passwords included, and apt copies
+ * all dpkg output into /var/log/apt/term.log before the helper sees it. */
+bool g_debconf_mark_seen = false;
 
 void emit_error(const std::string& msg)
 {
@@ -322,8 +325,8 @@ int run_apt(const std::vector<const char*>& args, int idle_sec, int hard_sec, st
     if (setenv("PATH", kSafePath, 1) != 0 || setenv("LANG", "C.UTF-8", 1) != 0 ||
         setenv("LC_ALL", "C.UTF-8", 1) != 0 || setenv("DEBIAN_FRONTEND", "noninteractive", 1) != 0)
       _exit(127);
-    if (g_debconf_trace)
-      setenv("DEBCONF_DEBUG", "developer", 1);
+    if (g_debconf_mark_seen)
+      setenv("DEBCONF_NONINTERACTIVE_SEEN", "true", 1);
     if (geteuid() == 0) {
       setenv("HOME", "/root", 1);
     } else {
@@ -2446,19 +2449,21 @@ int do_upgrade(const std::vector<std::string>& pins)
   const std::vector<DebconfQuestion> debconf_before =
       debconf_snapshot(read_debconf("config.dat"), read_debconf("passwords.dat"));
   const AptClock up_clock = apt_clock(kUpgradeIdleSec, kUpgradeHardCapSec);
-  g_debconf_trace = true;
+  g_debconf_mark_seen = true;
   rc = run_apt(up_argv, up_clock.idle_sec, up_clock.hard_sec, out, err, true);
-  g_debconf_trace = false;
-  const std::vector<DebconfInput> debconf_asked = debconf_inputs(out + "\n" + err);
+  g_debconf_mark_seen = false;
+  /* Defence in depth: a trace line can only appear if something else turned
+   * debugging on; it is still never forwarded. */
   out = strip_debconf_trace(out);
   err = strip_debconf_trace(err);
   std::vector<SimulateResult::DebconfAnswer> answers;
-  if (!debconf_asked.empty()) {
-    const std::string config_after = read_debconf("config.dat");
-    answers = debconf_auto_answers(debconf_asked, debconf_before,
-                                   debconf_snapshot(config_after, read_debconf("passwords.dat")),
+  const std::string config_after = read_debconf("config.dat");
+  const std::vector<DebconfQuestion> debconf_after =
+      debconf_snapshot(config_after, read_debconf("passwords.dat"));
+  const std::vector<DebconfInput> debconf_asked = debconf_newly_seen(debconf_before, debconf_after);
+  if (!debconf_asked.empty())
+    answers = debconf_auto_answers(debconf_asked, debconf_before, debconf_after,
                                    read_debconf("templates.dat"), debconf_priority(config_after));
-  }
   /* U-4: a failed install still says what it answered. */
   g_error_answers = answers;
   if (fail_apt(rc, out, err, "Install was cancelled", "Timed out while installing updates",

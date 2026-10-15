@@ -301,6 +301,7 @@ struct DebconfQuestion {
   bool has_value = false;
   bool seen = false;
   bool password = false;
+  std::string owner; /* first Owners entry */
 };
 /* config.dat plus passwords.dat. passwords.dat entries keep has_value only. */
 std::vector<DebconfQuestion> debconf_snapshot(const std::string& config_dat, const std::string& passwords_dat);
@@ -312,6 +313,13 @@ struct DebconfInput {
   std::string question;
 };
 std::vector<DebconfInput> debconf_inputs(const std::string& apt_output);
+/* Round 13b: the install runs with DEBCONF_NONINTERACTIVE_SEEN=true and no
+ * DEBCONF_DEBUG. Debconf itself applies the priority and seen checks and marks
+ * each question it would have shown, so a question that turned seen during
+ * the install is one a normal install would have asked. Nothing here reads a
+ * protocol trace, so no answer value is ever written to apt's term.log. */
+std::vector<DebconfInput> debconf_newly_seen(const std::vector<DebconfQuestion>& before,
+                                             const std::vector<DebconfQuestion>& after);
 /* Drops every "debconf (developer):" line. That trace can carry values,
  * including a password a maintainer script reads back, so it never leaves
  * the helper, in the log or in an error message. */

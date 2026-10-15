@@ -1,3 +1,17 @@
+lcos-updates (0.9.4-6) unstable; urgency=high
+
+  * Security: stop running installs with DEBCONF_DEBUG=developer. Its
+    protocol trace (SET and reply lines) carried answer values, including
+    preseeded and script-set passwords, and apt copied it into
+    /var/log/apt/term.log before the helper could strip it.
+  * Questions a normal install would ask are now found by running debconf
+    with DEBCONF_NONINTERACTIVE_SEEN=true and listing questions that turned
+    seen during the install; debconf applies the priority itself.
+  * Regression tests check that no secret reaches term.log, helper output,
+    or the install environment.
+
+ -- Phil <phil@brushpad.local>  Wed, 14 Oct 2026 23:00:00 -0500
+
 lcos-updates (0.9.4-5) unstable; urgency=medium
 
   * Fix round 13 review findings for debconf reporting:
