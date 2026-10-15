@@ -1,3 +1,13 @@
+lcos-updates (0.9.4-4) unstable; urgency=medium
+
+  * Fix round 12 review findings: the review dialog names packages that
+    have debconf setup questions (the install stays non-interactive), and
+    the result lists the questions answered automatically, with their
+    values and a dpkg-reconfigure hint. New packages show a Size column
+    and the helper emits SIZE for them.
+
+ -- Phil <phil@brushpad.local>  Thu, 15 Oct 2026 02:10:00 +0000
+
 lcos-updates (0.9.4-3) unstable; urgency=medium
 
   * Fix round 11 review findings: Check and Install detect unfinished or

@@ -436,6 +436,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_new_view.set_model(m_new_store);
   m_new_view.append_column("Package", m_new_cols.package);
   m_new_view.append_column("Version", m_new_cols.version);
+  m_new_view.append_column("Size", m_new_cols.size);
   m_new_view.set_headers_visible(true);
   m_new_view.get_selection()->set_mode(Gtk::SELECTION_NONE);
   m_new_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
@@ -777,6 +778,7 @@ void UpdatesWindow::show_new_packages(const std::vector<PackageUpgrade>& package
     Gtk::TreeModel::Row row = *(m_new_store->append());
     row[m_new_cols.package] = pkg.name;
     row[m_new_cols.version] = pkg.new_version;
+    row[m_new_cols.size] = pkg.size;
   }
   if (m_new_store->children().empty()) {
     m_new_heading.hide();
@@ -822,6 +824,7 @@ void UpdatesWindow::hide_package_list()
   m_scroller.hide();
   if (m_new_store)
     m_new_store->clear();
+  m_debconf_pkgs.clear();
   m_new_heading.hide();
   m_new_scroller.hide();
   gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), FALSE, FALSE, 0,
@@ -1524,6 +1527,8 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
   }
   const bool have_rows = !m_store->children().empty();
   present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages);
+  if (shown.status != SimulateResult::Error)
+    m_debconf_pkgs = shown.debconf_pkgs;
   offer_repair_for(shown);
 }
 
@@ -1961,7 +1966,8 @@ void UpdatesWindow::start_reviewed_install()
 
 void UpdatesWindow::confirm_new_packages()
 {
-  if (m_new_dialog != nullptr || !m_new_store || m_new_store->children().empty())
+  const bool have_new = m_new_store && !m_new_store->children().empty();
+  if (m_new_dialog != nullptr || (!have_new && m_debconf_pkgs.empty()))
     return;
   std::string names;
   const auto fresh = m_new_store->children();
@@ -1973,8 +1979,12 @@ void UpdatesWindow::confirm_new_packages()
       names += ", ";
     names += name;
   }
-  m_new_primary = "Install new packages with these updates?";
-  m_new_secondary = "These new packages will be installed: " + names + ".";
+  m_new_primary = have_new ? "Install new packages with these updates?" : "Install these updates?";
+  m_new_secondary = have_new ? "These new packages will be installed: " + names + "." : std::string();
+  /* Round 12 (U-1): say beforehand that setup questions get default answers. */
+  const std::string notice = debconf_review_notice(m_debconf_pkgs);
+  if (!notice.empty())
+    m_new_secondary += (m_new_secondary.empty() ? "" : "\n\n") + notice;
   auto* dialog = new Gtk::MessageDialog(*this, m_new_primary, false, Gtk::MESSAGE_QUESTION,
                                         Gtk::BUTTONS_NONE, true);
   dialog->set_secondary_text(m_new_secondary);
@@ -1998,7 +2008,7 @@ void UpdatesWindow::on_install_clicked()
 {
   if (m_closing || m_job != Job::None || m_have_pid || m_new_dialog != nullptr)
     return;
-  if (m_new_store && !m_new_store->children().empty()) {
+  if ((m_new_store && !m_new_store->children().empty()) || !m_debconf_pkgs.empty()) {
     confirm_new_packages();
     return;
   }

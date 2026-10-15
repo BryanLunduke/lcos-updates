@@ -166,6 +166,21 @@ test(
   timeout: 120,
 )
 
+test_r12 = executable(
+  'test-r12',
+  'tests/test-r12.cpp',
+  include_directories: inc,
+  link_with: apt_parse,
+  install: false,
+)
+
+test(
+  'round12-debconf-notice-and-new-sizes',
+  test_r12,
+  args: [helper.full_path()],
+  timeout: 120,
+)
+
 test_window = executable(
   'test-window',
   'tests/test-window.cpp',

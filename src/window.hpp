@@ -252,10 +252,14 @@ private:
     {
       add(package);
       add(version);
+      add(size);
     }
     Gtk::TreeModelColumn<Glib::ustring> package;
     Gtk::TreeModelColumn<Glib::ustring> version;
+    Gtk::TreeModelColumn<Glib::ustring> size;
   };
+  /* Round 12 (U-1): reviewed packages that may ask setup questions. */
+  std::vector<std::string> m_debconf_pkgs;
 
   ModelColumns m_cols;
   Glib::RefPtr<Gtk::ListStore> m_store;
