@@ -1,3 +1,16 @@
+lcos-updates (0.9.5-2) unstable; urgency=medium
+
+  * 095-02 QA U-1: when /var/run/reboot-required exists, Updates shows the
+    restart notice and the Restart button on launch, after Check (also when
+    up to date or when the check fails), and after Install, Repair and
+    Remove Unused Packages. The notice names the packages listed in
+    reboot-required.pkgs (duplicates dropped, at most six named) or says a
+    system update such as a kernel or firmware update needs a restart. No
+    marker, no notice. The post-install restart wording and layout are
+    unchanged. The marker path can be changed only in the test build.
+
+ -- LCOS <lcos@lunduke.com>  Sat, 17 Oct 2026 06:33:45 -0500
+
 lcos-updates (0.9.5-1) unstable; urgency=medium
 
   * Version moves to the LCOS 0.9.5 track.

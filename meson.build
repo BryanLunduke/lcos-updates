@@ -265,7 +265,7 @@ test(
     '-c',
     '''import pathlib,sys
 bins=[pathlib.Path(p) for p in sys.argv[1:]]
-gui_bad=(b"LCOS_UPDATES_TEST_PKEXEC", b"LCOS_UPDATES_TEST_LOGINCTL", b"LCOS_UPDATES_GUI_TIMEOUT_MS", b"LCOS_UPDATES_STALL_NOTICE_SEC", b"LCOS_UPDATES_STALL_INHIBIT_SEC", b"LCOS_UPDATES_FAKE_INHIBIT", b"systemctl", b"/workspace")
+gui_bad=(b"LCOS_UPDATES_TEST_", b"LCOS_UPDATES_TEST_PKEXEC", b"LCOS_UPDATES_TEST_LOGINCTL", b"LCOS_UPDATES_GUI_TIMEOUT_MS", b"LCOS_UPDATES_STALL_NOTICE_SEC", b"LCOS_UPDATES_STALL_INHIBIT_SEC", b"LCOS_UPDATES_FAKE_INHIBIT", b"systemctl", b"/workspace")
 helper_bad=(b"LCOS_UPDATES_TEST_", b"systemctl", b"/workspace")
 for path, bad in ((bins[0], gui_bad), (bins[1], helper_bad)):
     data=path.read_bytes()

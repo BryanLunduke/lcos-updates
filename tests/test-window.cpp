@@ -597,6 +597,11 @@ int main()
   setenv("LCOS_PKEXEC_LOG", log.c_str(), 1);
   setenv("LCOS_PKEXEC_PIDFILE", pidfile.c_str(), 1);
   setenv("LCOS_PKEXEC_RELEASE", release.c_str(), 1);
+  /* 0.9.5-2: the box's own /var/run/reboot-required must not leak into the
+   * other tests. Only the marker section below creates this file. */
+  const std::string reboot_marker = dir + "/reboot-required";
+  const std::string reboot_pkgs = reboot_marker + ".pkgs";
+  setenv("LCOS_UPDATES_TEST_REBOOT_FILE", reboot_marker.c_str(), 1);
   set_timeout_ms(5000);
 
   {
@@ -2128,6 +2133,173 @@ int main()
     expect(window->restart_visible_for_test(), "U-1 r15: Restart is still offered after the cleanup");
     const std::string pk = slurp(log);
     expect(contains(pk, " cleanup libold1 oldtool\n"), "U-2 r15: the helper gets exactly the listed names");
+    destroy_window(window, pidfile);
+  }
+
+  /* 0.9.5-2 (095-02 QA U-1): /var/run/reboot-required shows the restart
+   * notice on launch, after Check and after Install, not only after an
+   * Install that wrote it. */
+  {
+    const std::vector<std::string> pkgs = parse_reboot_marker_pkgs(
+        "linux-image-7.2.6-lunduke\n  linux-image-7.2.6-lunduke \n\nfirmware-misc-nonfree\r\nlinux-image-7.2.6-lunduke\n");
+    expect(pkgs.size() == 2 && pkgs[0] == "linux-image-7.2.6-lunduke" && pkgs[1] == "firmware-misc-nonfree",
+           "095-2: reboot-required.pkgs is trimmed and deduplicated in order");
+    expect(parse_reboot_marker_pkgs("bad\x1b[31mname\nok\n") == std::vector<std::string>{"ok"},
+           "095-2: names with control characters are skipped");
+    RebootMarker none;
+    expect(reboot_marker_sentence(none).empty(), "095-2: no marker, no notice");
+    RebootMarker bare;
+    bare.present = true;
+    expect(reboot_marker_sentence(bare) ==
+               "Restart this computer to finish a system update (such as a kernel or firmware update).",
+           "095-2: a marker without .pkgs names a system update");
+    RebootMarker many;
+    many.present = true;
+    for (int i = 1; i <= 8; ++i)
+      many.pkgs.push_back("pkg" + std::to_string(i));
+    expect(reboot_marker_sentence(many) ==
+               "Restart this computer to finish installing updates (needed by pkg1, pkg2, pkg3, pkg4, pkg5, pkg6 and 2 more).",
+           "095-2: a long .pkgs list is capped");
+    JobOutcome already;
+    already.status = "Updates installed. A restart is still needed for an earlier update (x).";
+    already.offer_restart = true;
+    const std::string before = already.status;
+    expect(!apply_reboot_marker(already, bare, false) && already.status == before,
+           "095-2: an outcome that already offers Restart is left as it is");
+    JobOutcome err;
+    err.status = "Could not reach the server.";
+    expect(apply_reboot_marker(err, bare, true) && err.offer_restart &&
+               err.status.rfind("Restart this computer", 0) == 0 &&
+               contains(err.status, "\nCould not reach the server."),
+           "095-2: lead puts the notice above an error");
+    JobOutcome plain;
+    plain.status = "You're up to date.";
+    expect(!apply_reboot_marker(plain, none, false) && !plain.offer_restart && plain.status == "You're up to date.",
+           "095-2: no marker leaves the outcome alone");
+  }
+
+  auto write_file = [](const std::string& path, const std::string& text) {
+    std::ofstream out(path);
+    out << text;
+  };
+  const char* kNeeded = "Restart this computer to finish installing updates (needed by linux-image-7.2.6-lunduke).";
+
+  /* Marker present, with a .pkgs list that repeats the kernel. */
+  {
+    write_file(reboot_marker, "*** System restart required ***\n");
+    write_file(reboot_pkgs, "linux-image-7.2.6-lunduke\nlinux-image-7.2.6-lunduke\n");
+    unlink(pidfile.c_str());
+    set_mode("ready-exit");
+    UpdatesWindow* window = new_window();
+    expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),
+           "095-2: launch with the marker shows Restart");
+    expect(window->status_text_for_test() == kNeeded, "095-2: launch names the package once");
+    expect(window->check_is_default_for_test() && !window->restart_is_default_for_test(),
+           "095-2: on launch Enter still means Check, not Restart");
+    window->test_click_restart();
+    expect(window->restart_default_is_cancel_for_test(), "095-2: the marker's Restart still asks first");
+    window->test_cancel_restart();
+    pump_for(50);
+    expect(window->restart_visible_for_test(), "095-2: Don't restart keeps the notice");
+
+    window->test_click_check();
+    expect(!window->restart_visible_for_test(), "095-2: Restart is hidden while Check runs");
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    expect(contains(window->status_text_for_test(), "You're up to date.") &&
+               contains(window->status_text_for_test(), kNeeded),
+           "095-2: an up-to-date Check keeps the restart notice");
+    expect(count_in(window->status_text_for_test(), "Restart this computer") == 1,
+           "095-2: the notice appears once after Check");
+    expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),
+           "095-2: Restart is offered after an up-to-date Check");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("many-lines");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    const std::string status = window->status_text_for_test();
+    expect(status.rfind(kNeeded, 0) == 0 && contains(status, "Failed to fetch"),
+           "095-2: a failed Check puts the restart notice above the error");
+    expect(window->restart_visible_for_test(), "095-2: Restart is offered after a failed Check");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("list-or-install");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
+    expect(window->restart_visible_for_test() && contains(window->status_text_for_test(), kNeeded),
+           "095-2: a Check that lists updates keeps the restart notice");
+    expect(window->install_is_default_for_test(), "095-2: with updates listed Enter still means Install");
+    window->test_click_install();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test() && !window->install_sensitive_for_test(); });
+    expect(contains(window->status_text_for_test(), "Updates installed.") &&
+               contains(window->status_text_for_test(), kNeeded),
+           "095-2: an Install the helper did not flag still shows the marker's notice");
+    expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),
+           "095-2: Restart is offered after Install");
+    destroy_window(window, pidfile);
+  }
+
+  {
+    unlink(pidfile.c_str());
+    set_mode("list-then-reboot-already");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
+    window->test_click_install();
+    pump_until(3000, [&]() { return window->restart_visible_for_test(); });
+    const std::string status = window->status_text_for_test();
+    expect(contains(status, "A restart is still needed for an earlier update (linux-image-amd64).") &&
+               count_in(status, "Restart this computer") == 0,
+           "095-2: the helper's post-install wording is unchanged and not doubled");
+    expect(window->restart_is_default_for_test(), "095-2: after Install Restart is still the default");
+    destroy_window(window, pidfile);
+  }
+
+  /* Marker without .pkgs. */
+  {
+    unlink(reboot_pkgs.c_str());
+    unlink(pidfile.c_str());
+    set_mode("ready-exit");
+    UpdatesWindow* window = new_window();
+    expect(window->restart_visible_for_test() &&
+               contains(window->status_text_for_test(), "finish a system update (such as a kernel or firmware update)"),
+           "095-2: a marker without .pkgs still offers Restart on launch");
+    destroy_window(window, pidfile);
+  }
+
+  /* No marker: no notice anywhere. */
+  {
+    unlink(reboot_marker.c_str());
+    unlink(pidfile.c_str());
+    set_mode("ready-exit");
+    UpdatesWindow* window = new_window();
+    expect(!window->restart_visible_for_test() && window->status_text_for_test() == "Check for updates.",
+           "095-2: no marker, no notice on launch");
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+    expect(!window->restart_visible_for_test() && window->status_text_for_test() == "You're up to date.",
+           "095-2: no marker, no notice after Check");
+    destroy_window(window, pidfile);
+  }
+  {
+    unlink(pidfile.c_str());
+    set_mode("list-or-install");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
+    window->test_click_install();
+    pump_until(3000, [&]() { return window->check_sensitive_for_test() && !window->install_sensitive_for_test(); });
+    expect(!window->restart_visible_for_test() &&
+               !contains(window->status_text_for_test(), "Restart this computer"),
+           "095-2: no marker, no notice after Install");
     destroy_window(window, pidfile);
   }
 

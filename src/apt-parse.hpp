@@ -262,6 +262,21 @@ JobOutcome outcome_cleanup(const SimulateResult& result, int exit_code);
  * wrote /var/run/reboot-required: kernels, firmware and CPU microcode. */
 bool needs_reboot_package(const std::string& name);
 std::vector<std::string> reboot_trigger_packages(const std::vector<std::string>& names);
+/* 0.9.5-2: the system's restart marker (/var/run/reboot-required and its
+ * .pkgs list), read whenever the window opens or a job ends. */
+struct RebootMarker {
+  bool present = false;
+  std::vector<std::string> pkgs;
+};
+/* Package names from reboot-required.pkgs: trimmed, blank lines skipped,
+ * duplicates dropped, first-seen order kept. */
+std::vector<std::string> parse_reboot_marker_pkgs(const std::string& text);
+/* The notice for a marker; empty when no marker exists. */
+std::string reboot_marker_sentence(const RebootMarker& marker);
+/* Offers Restart for a marker unless the outcome already offers it. lead puts
+ * the notice first (above a long error) instead of after the status. Returns
+ * true when the marker added the notice. */
+bool apply_reboot_marker(JobOutcome& out, const RebootMarker& marker, bool lead);
 /* Round 15 (U-2): package names from "Remv" lines of apt-get -s autoremove. */
 std::vector<std::string> parse_autoremove(const std::string& text);
 JobOutcome outcome_timeout(bool installing, bool helper_ready, bool have_rows);

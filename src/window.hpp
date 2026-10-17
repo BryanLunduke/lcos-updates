@@ -211,8 +211,16 @@ private:
   void note_helper_activity();
   void notify_and_leave(const Glib::ustring& body);
   void use_cancel_as_default();
+  /* reboot_lead puts the restart-marker notice above the status (a long
+   * Check error would otherwise scroll it out of view). */
   void present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages,
-                       const std::vector<PackageUpgrade>& new_packages);
+                       const std::vector<PackageUpgrade>& new_packages, bool reboot_lead = false);
+  /* 0.9.5-2: shows Restart. make_default is the post-install behaviour; a
+   * restart that only comes from the system's marker does not take Enter. */
+  void show_restart(bool make_default);
+  /* 0.9.5-2: when /var/run/reboot-required exists and Restart is not shown
+   * yet, add the notice to the current status and show Restart. */
+  void offer_restart_for_marker(bool lead);
   bool on_phase_tick();
   void relax_logind_inhibitor();
   void send_stall_notification(const Glib::ustring& body);
