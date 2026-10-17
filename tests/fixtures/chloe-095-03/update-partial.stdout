@@ -1,0 +1,6 @@
+Hit:1 https://lcos.lunduke.com/apt excalibur InRelease
+Hit:2 https://brave-browser-apt-release.s3.brave.com stable InRelease
+Err:8 http://ftp.fau.de/devuan/merged excalibur-backports InRelease
+  Unable to connect to ftp.fau.de:http:
+Err:7 http://ftp.fau.de/devuan/merged excalibur-updates InRelease
+  Unable to connect to ftp.fau.de:http:

@@ -2177,19 +2177,6 @@ std::string reboot_marker_sentence(const RebootMarker& marker)
   return "Restart this computer to finish installing updates (needed by " + names + ").";
 }
 
-bool apply_reboot_marker(JobOutcome& out, const RebootMarker& marker, bool lead)
-{
-  if (!marker.present || out.offer_restart)
-    return false;
-  out.offer_restart = true;
-  const std::string sentence = reboot_marker_sentence(marker);
-  if (lead && !out.status.empty())
-    out.status = sentence + "\n" + out.status;
-  else
-    append_sentence(out.status, sentence);
-  return true;
-}
-
 bool needs_reboot_package(const std::string& raw)
 {
   std::string name = raw;

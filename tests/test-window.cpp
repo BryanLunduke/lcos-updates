@@ -586,9 +586,13 @@ case "$mode" in
 esac
 )PK";
 
-int main()
+int main(int main_argc, char** main_argv)
 {
   setvbuf(stdout, nullptr, _IOLBF, 0);
+  /* 0.9.5-4: the real helper and the fixtures dir, for the replay of a real
+   * Check failure. */
+  const std::string helper_path = main_argc > 1 ? main_argv[1] : "";
+  const std::string fixtures = main_argc > 2 ? main_argv[2] : "";
   const char* display = std::getenv("DISPLAY");
   if (display == nullptr || display[0] == '\0') {
     std::fprintf(stderr, "DISPLAY is not set; the window test cannot run\n");
@@ -2194,22 +2198,6 @@ int main()
     expect(reboot_marker_sentence(many) ==
                "Restart this computer to finish installing updates (needed by pkg1, pkg2, pkg3, pkg4, pkg5, pkg6 and 2 more).",
            "095-2: a long .pkgs list is capped");
-    JobOutcome already;
-    already.status = "Updates installed. A restart is still needed for an earlier update (x).";
-    already.offer_restart = true;
-    const std::string before = already.status;
-    expect(!apply_reboot_marker(already, bare, false) && already.status == before,
-           "095-2: an outcome that already offers Restart is left as it is");
-    JobOutcome err;
-    err.status = "Could not reach the server.";
-    expect(apply_reboot_marker(err, bare, true) && err.offer_restart &&
-               err.status.rfind("Restart this computer", 0) == 0 &&
-               contains(err.status, "\nCould not reach the server."),
-           "095-2: lead puts the notice above an error");
-    JobOutcome plain;
-    plain.status = "You're up to date.";
-    expect(!apply_reboot_marker(plain, none, false) && !plain.offer_restart && plain.status == "You're up to date.",
-           "095-2: no marker leaves the outcome alone");
   }
 
   auto write_file = [](const std::string& path, const std::string& text) {
@@ -2227,23 +2215,27 @@ int main()
     UpdatesWindow* window = new_window();
     expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),
            "095-2: launch with the marker shows Restart");
-    expect(window->status_text_for_test() == kNeeded, "095-2: launch names the package once");
+    expect(window->restart_note_for_test() == kNeeded && window->restart_note_visible_for_test() &&
+               window->status_text_for_test() == "Check for updates.",
+           "095-4: launch names the package once, in its own notice line");
     expect(window->check_is_default_for_test() && !window->restart_is_default_for_test(),
            "095-2: on launch Enter still means Check, not Restart");
     window->test_click_restart();
     expect(window->restart_default_is_cancel_for_test(), "095-2: the marker's Restart still asks first");
     window->test_cancel_restart();
     pump_for(50);
-    expect(window->restart_visible_for_test(), "095-2: Don't restart keeps the notice");
+    expect(window->restart_visible_for_test() && window->restart_note_visible_for_test(),
+           "095-2: Don't restart keeps the notice");
 
     window->test_click_check();
-    expect(!window->restart_visible_for_test(), "095-2: Restart is hidden while Check runs");
+    expect(!window->restart_visible_for_test() && !window->restart_note_visible_for_test(),
+           "095-2: Restart and its notice are hidden while Check runs");
     pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
-    expect(contains(window->status_text_for_test(), "You're up to date.") &&
-               contains(window->status_text_for_test(), kNeeded),
+    expect(window->status_text_for_test() == "You're up to date." && window->restart_note_for_test() == kNeeded &&
+               window->restart_note_visible_for_test(),
            "095-2: an up-to-date Check keeps the restart notice");
-    expect(count_in(window->status_text_for_test(), "Restart this computer") == 1,
-           "095-2: the notice appears once after Check");
+    expect(count_in(window->status_text_for_test(), "Restart this computer") == 0,
+           "095-4: the notice is not repeated in the status");
     expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),
            "095-2: Restart is offered after an up-to-date Check");
     destroy_window(window, pidfile);
@@ -2256,8 +2248,9 @@ int main()
     window->test_click_check();
     pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
     const std::string status = window->status_text_for_test();
-    expect(status.rfind(kNeeded, 0) == 0 && contains(status, "Failed to fetch"),
-           "095-2: a failed Check puts the restart notice above the error");
+    expect(contains(status, "Failed to fetch") && window->restart_note_for_test() == kNeeded &&
+               window->restart_note_visible_for_test(),
+           "095-2: a failed Check keeps the restart notice beside the error");
     expect(window->restart_visible_for_test(), "095-2: Restart is offered after a failed Check");
     destroy_window(window, pidfile);
   }
@@ -2268,13 +2261,14 @@ int main()
     UpdatesWindow* window = new_window();
     window->test_click_check();
     pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
-    expect(window->restart_visible_for_test() && contains(window->status_text_for_test(), kNeeded),
+    expect(window->restart_visible_for_test() && window->restart_note_for_test() == kNeeded &&
+               window->restart_note_visible_for_test(),
            "095-2: a Check that lists updates keeps the restart notice");
     expect(window->install_is_default_for_test(), "095-2: with updates listed Enter still means Install");
     window->test_click_install();
     pump_until(3000, [&]() { return window->check_sensitive_for_test() && !window->install_sensitive_for_test(); });
     expect(contains(window->status_text_for_test(), "Updates installed.") &&
-               contains(window->status_text_for_test(), kNeeded),
+               window->restart_note_for_test() == kNeeded && window->restart_note_visible_for_test(),
            "095-2: an Install the helper did not flag still shows the marker's notice");
     expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),
            "095-2: Restart is offered after Install");
@@ -2291,7 +2285,7 @@ int main()
     pump_until(3000, [&]() { return window->restart_visible_for_test(); });
     const std::string status = window->status_text_for_test();
     expect(contains(status, "A restart is still needed for an earlier update (linux-image-amd64).") &&
-               count_in(status, "Restart this computer") == 0,
+               count_in(status, "Restart this computer") == 0 && !window->restart_note_visible_for_test(),
            "095-2: the helper's post-install wording is unchanged and not doubled");
     expect(window->restart_is_default_for_test(), "095-2: after Install Restart is still the default");
     destroy_window(window, pidfile);
@@ -2304,7 +2298,8 @@ int main()
     set_mode("ready-exit");
     UpdatesWindow* window = new_window();
     expect(window->restart_visible_for_test() &&
-               contains(window->status_text_for_test(), "finish a system update (such as a kernel or firmware update)"),
+               contains(window->restart_note_for_test(), "finish a system update (such as a kernel or firmware update)") &&
+               window->restart_note_visible_for_test(),
            "095-2: a marker without .pkgs still offers Restart on launch");
     destroy_window(window, pidfile);
   }
@@ -2315,11 +2310,13 @@ int main()
     unlink(pidfile.c_str());
     set_mode("ready-exit");
     UpdatesWindow* window = new_window();
-    expect(!window->restart_visible_for_test() && window->status_text_for_test() == "Check for updates.",
+    expect(!window->restart_visible_for_test() && !window->restart_note_visible_for_test() &&
+               window->status_text_for_test() == "Check for updates.",
            "095-2: no marker, no notice on launch");
     window->test_click_check();
     pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
-    expect(!window->restart_visible_for_test() && window->status_text_for_test() == "You're up to date.",
+    expect(!window->restart_visible_for_test() && !window->restart_note_visible_for_test() &&
+               window->status_text_for_test() == "You're up to date.",
            "095-2: no marker, no notice after Check");
     destroy_window(window, pidfile);
   }
@@ -2433,6 +2430,132 @@ int main()
         destroy_window(window, pidfile);
       }
     }
+    unlink(reboot_marker.c_str());
+    unlink(reboot_pkgs.c_str());
+  }
+
+  /* 0.9.5-4 (095-03 real-ISO QA): with the Devuan mirror unreachable the
+   * status showed only apt's W:/Err: lines; the restart notice was appended
+   * below them and the 160px status scroller hid it. Replay Chloe's captured
+   * output through the real helper (its apt-get update parsing and protocol)
+   * and the real window code. */
+  {
+    const std::string C = "_Cancel", I = "_Install updates", K = "_Check for updates", S = "_Restart";
+    write_file(reboot_marker, "*** System restart required ***\n");
+    write_file(reboot_pkgs, "linux-image-7.2.6-lunduke\n");
+    if (helper_path.empty() || fixtures.empty() || access(helper_path.c_str(), X_OK) != 0) {
+      expect(false, "095-4: test-window needs the helper path and the fixtures dir");
+    } else {
+      const std::string replay = dir + "/replay";
+      mkdir(replay.c_str(), 0755);
+      for (const char* sub : {"/lists", "/state", "/updates"})
+        mkdir((replay + sub).c_str(), 0755);
+      write_file(replay + "/status",
+                 "Package: lcos-updates\nStatus: install ok installed\nVersion: 0.9.5-3\nArchitecture: amd64\n\n");
+      /* pkexec's argv is the helper path and its arguments: run the real
+       * helper as this (non-root) user instead. */
+      write_file(replay + "/pkexec", "#!/bin/sh\nshift\nexec \"$LCOS_REPLAY_HELPER\" \"$@\"\n");
+      chmod((replay + "/pkexec").c_str(), 0755);
+      setenv("LCOS_REPLAY_HELPER", helper_path.c_str(), 1);
+      setenv("LCOS_UPDATES_APT_GET", (replay + "/apt-get").c_str(), 1);
+      setenv("LCOS_UPDATES_DPKG", "/bin/true", 1);
+      setenv("LCOS_UPDATES_DPKG_STATUS", (replay + "/status").c_str(), 1);
+      setenv("LCOS_UPDATES_DPKG_UPDATES_DIR", (replay + "/updates").c_str(), 1);
+      setenv("LCOS_UPDATES_LISTS_DIR", (replay + "/lists").c_str(), 1);
+      setenv("LCOS_UPDATES_STATE_DIR", (replay + "/state").c_str(), 1);
+      setenv("LCOS_UPDATES_TEST_PKEXEC", (replay + "/pkexec").c_str(), 1);
+      set_timeout_ms(15000);
+      struct ReplayCase {
+        const char* stdout_file;
+        const char* rc;
+        bool total;
+      };
+      const ReplayCase cases[] = {{"update-partial.stdout", "0", false},
+                                  {"update-partial.stdout", "100", false},
+                                  {"update-total.stdout", "0", true},
+                                  {"update-total.stdout", "100", true}};
+      for (const ReplayCase& c : cases) {
+        const std::string tag = std::string(c.total ? "every source down" : "Devuan mirror down") + ", apt rc " + c.rc;
+        /* The helper runs apt with a cleaned environment, so the replay
+         * apt-get has the fixture paths and exit code written into it. */
+        write_file(replay + "/apt-get",
+                   "#!/bin/sh\n"
+                   "case \" $* \" in\n"
+                   "  *\" update \"*) cat '" + fixtures + "/chloe-095-03/" + c.stdout_file + "'; cat '" + fixtures +
+                       "/chloe-095-03/update.stderr' >&2; exit " + c.rc + ";;\n"
+                   "esac\n"
+                   "echo '0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.'\n"
+                   "exit 0\n");
+        chmod((replay + "/apt-get").c_str(), 0755);
+        UpdatesWindow* window = new_window();
+        window->test_click_check();
+        const bool done = pump_until(10000, [&]() { return window->check_sensitive_for_test(); });
+        pump_for(200);
+        const std::string status = window->status_text_for_test();
+        expect(done && contains(status, "W: Failed to fetch http://ftp.fau.de/devuan/merged/dists/excalibur/InRelease  "
+                                        "Unable to connect to ftp.fau.de:http:"),
+               ("095-4 replay (" + tag + "): the real helper's apt lines reach the status").c_str());
+        if (c.total)
+          expect(contains(status, "Could not connect to the update server"),
+                 ("095-4 replay (" + tag + "): the check failed with the plain sentence").c_str());
+        else
+          expect(status.rfind("W: Failed to fetch", 0) == 0 && contains(status, "You're up to date."),
+                 ("095-4 replay (" + tag + "): the status starts with W: as on Chloe's screen").c_str());
+        expect(window->status_overflows_for_test(),
+               ("095-4 replay (" + tag + "): the status is taller than its scroller (the case that hid the notice)").c_str());
+        expect(window->restart_note_for_test() == kNeeded && window->restart_note_visible_for_test(),
+               ("095-4 replay (" + tag + "): the restart notice is shown, laid out and outside the scroller").c_str());
+        expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),
+               ("095-4 replay (" + tag + "): Restart is offered").c_str());
+        expect(window->check_is_default_for_test(),
+               ("095-4 replay (" + tag + "): Check stays the default").c_str());
+        expect_button_order(window, "095-4 replay, " + tag, {C, I, K, S});
+        destroy_window(window, pidfile);
+      }
+      for (const char* key : {"LCOS_UPDATES_APT_GET", "LCOS_UPDATES_DPKG", "LCOS_UPDATES_DPKG_STATUS",
+                              "LCOS_UPDATES_DPKG_UPDATES_DIR", "LCOS_UPDATES_LISTS_DIR", "LCOS_UPDATES_STATE_DIR",
+                              "LCOS_REPLAY_HELPER"})
+        unsetenv(key);
+      setenv("LCOS_UPDATES_TEST_PKEXEC", script.c_str(), 1);
+      set_timeout_ms(5000);
+    }
+
+    /* Every other way a Check can fail keeps the notice too. */
+    struct FailCase {
+      const char* mode;
+      const char* says;
+      int timeout_ms;
+      bool cancel;
+    };
+    const FailCase fails[] = {{"exit127", "Could not run the update helper", 5000, false},
+                              {"notauth", "", 5000, false},
+                              {"dismiss", "", 5000, false},
+                              {"never-ready", "Timed out waiting for authentication", 600, false},
+                              {"never-ready", "cancelled", 5000, true},
+                              {"many-lines", "Failed to fetch", 5000, false}};
+    for (const FailCase& f : fails) {
+      const std::string tag = std::string(f.mode) + (f.cancel ? " + Cancel" : "");
+      unlink(pidfile.c_str());
+      set_mode(f.mode);
+      set_timeout_ms(f.timeout_ms);
+      UpdatesWindow* window = new_window();
+      window->test_click_check();
+      if (f.cancel) {
+        pump_for(200);
+        window->test_click_cancel();
+      }
+      pump_until(4000, [&]() { return window->check_sensitive_for_test(); });
+      pump_for(100);
+      const std::string status = window->status_text_for_test();
+      expect(window->check_sensitive_for_test() && (f.says[0] == '\0' || contains(status, f.says)) &&
+                 status != "Checking for updates…",
+             ("095-4 (" + tag + "): the Check ended with its own message: " + status.substr(0, 60)).c_str());
+      expect(window->restart_note_for_test() == kNeeded && window->restart_note_visible_for_test() &&
+                 window->restart_visible_for_test(),
+             ("095-4 (" + tag + "): the restart notice and Restart stay").c_str());
+      destroy_window(window, pidfile);
+    }
+    set_timeout_ms(5000);
     unlink(reboot_marker.c_str());
     unlink(reboot_pkgs.c_str());
   }

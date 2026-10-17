@@ -246,7 +246,8 @@ xvfb = find_program('xvfb-run', required: true)
 test(
   'window',
   xvfb,
-  args: ['-a', test_window.full_path()],
+  args: ['-a', test_window.full_path(), helper.full_path(), meson.project_source_root() / 'tests' / 'fixtures'],
+  depends: helper,
   timeout: 120,
 )
 

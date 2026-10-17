@@ -438,6 +438,13 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_warning.set_no_show_all(true);
   m_warning.hide();
 
+  /* 0.9.5-4: the restart-marker notice, outside the scrolling status. */
+  m_restart_note.set_line_wrap(true);
+  m_restart_note.set_xalign(0.0f);
+  m_restart_note.set_max_width_chars(64);
+  m_restart_note.set_no_show_all(true);
+  m_restart_note.hide();
+
   /* Spinner lives beside status (not in ButtonBox — GtkButtonBox is for buttons). */
   m_spinner.set_no_show_all(true);
   m_spinner.set_size_request(18, 18);
@@ -535,6 +542,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_repair.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_repair_clicked));
 
   m_content.set_border_width(12);
+  m_content.pack_start(m_restart_note, Gtk::PACK_SHRINK);
   m_content.pack_start(m_status_row, Gtk::PACK_SHRINK);
   m_content.pack_start(m_commit_note, Gtk::PACK_SHRINK);
   m_content.pack_start(m_warning, Gtk::PACK_SHRINK);
@@ -551,7 +559,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   add(m_vbox);
   show_all_children();
   /* Refit whenever an optional row comes or goes. */
-  for (Gtk::Widget* w : std::initializer_list<Gtk::Widget*>{&m_progress, &m_warning, &m_commit_note,
+  for (Gtk::Widget* w : std::initializer_list<Gtk::Widget*>{&m_progress, &m_warning, &m_commit_note, &m_restart_note,
                                                            &m_new_scroller}) {
     w->signal_show().connect(sigc::mem_fun(*this, &UpdatesWindow::queue_fit));
     w->signal_hide().connect(sigc::mem_fun(*this, &UpdatesWindow::queue_fit));
@@ -584,15 +592,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   /* 0.9.5-2: a restart the system is waiting for is shown as soon as the
    * window opens, before any check or password. */
   {
-    const RebootMarker marker = read_reboot_marker();
-    if (marker.present) {
-      if (m_repair.get_visible())
-        offer_restart_for_marker(true);
-      else {
-        set_idle_status(reboot_marker_sentence(marker));
-        show_restart(false);
-      }
-    }
+    offer_restart_for_marker();
   }
 
   if (check_on_start)
@@ -775,6 +775,7 @@ void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
     m_cleanup.hide();
     m_restart.hide();
     m_restart.set_sensitive(false);
+    hide_restart_note();
     m_spinner.show();
     m_spinner.start();
     /* The bar stays hidden until HELPER_READY. During the password dialog
@@ -1399,14 +1400,9 @@ void UpdatesWindow::maybe_note_dpkg()
                                             : "Checking for updates…");
 }
 
-void UpdatesWindow::present_outcome(const JobOutcome& job_outcome, const std::vector<PackageUpgrade>& packages,
-                                     const std::vector<PackageUpgrade>& new_packages, bool reboot_lead)
+void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages,
+                                     const std::vector<PackageUpgrade>& new_packages)
 {
-  /* 0.9.5-2: a restart the system still needs is offered after every job,
-   * not only after an Install that created the marker. */
-  JobOutcome outcome = job_outcome;
-  const bool job_restart = outcome.offer_restart;
-  apply_reboot_marker(outcome, read_reboot_marker(), reboot_lead);
   if (outcome.packages == PackageListAction::Show) {
     show_packages(packages);
     show_new_packages(new_packages);
@@ -1415,11 +1411,16 @@ void UpdatesWindow::present_outcome(const JobOutcome& job_outcome, const std::ve
   set_idle_status(outcome.status);
   m_check.set_sensitive(outcome.check_enabled);
   m_install.set_sensitive(outcome.install_enabled);
+  hide_restart_note();
   if (outcome.offer_restart) {
-    show_restart(job_restart);
+    /* The job's own restart sentence is in the status (post-install). */
+    show_restart(true);
   } else {
     m_restart.set_sensitive(false);
     m_restart.hide();
+    /* 0.9.5-2/-4: a restart the system still needs is offered after every
+     * job, failed or not, in its own line outside the status scroller. */
+    offer_restart_for_marker();
   }
 }
 
@@ -1447,24 +1448,25 @@ void UpdatesWindow::show_restart(bool make_default)
   }
 }
 
-void UpdatesWindow::offer_restart_for_marker(bool lead)
+void UpdatesWindow::offer_restart_for_marker()
 {
   if (m_restart.get_visible())
     return;
   const RebootMarker marker = read_reboot_marker();
   if (!marker.present)
     return;
-  const std::string sentence = reboot_marker_sentence(marker);
-  const std::string current = m_status.get_text();
-  std::string text;
-  if (current.empty())
-    text = sentence;
-  else if (lead)
-    text = sentence + "\n" + current;
-  else
-    text = current + (current.back() == '\n' ? "" : " ") + sentence;
-  set_status_text(text);
+  /* 0.9.5-4: the notice has its own label above the status. In the status
+   * text it was appended after a partial-fetch warning ("W: Failed to
+   * fetch ...") and the 160px status scroller hid it below the fold. */
+  m_restart_note.set_text(reboot_marker_sentence(marker));
+  m_restart_note.show();
   show_restart(false);
+}
+
+void UpdatesWindow::hide_restart_note()
+{
+  m_restart_note.hide();
+  m_restart_note.set_text("");
 }
 
 void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
@@ -1623,7 +1625,7 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
     m_closing = false;
 
   if (m_background) {
-    notify_and_leave(m_status.get_text());
+    notify_and_leave(notification_body());
     return;
   }
 
@@ -1646,8 +1648,7 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
       shown.error_msg = auth;
   }
   const bool have_rows = !m_store->children().empty();
-  present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages,
-                  shown.status == SimulateResult::Error);
+  present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages);
   if (shown.status != SimulateResult::Error)
     offer_cleanup(shown.unused);
   if (shown.status != SimulateResult::Error)
@@ -1870,7 +1871,7 @@ void UpdatesWindow::apply_repair_result(const SimulateResult& result, int wait_s
     m_repair.hide();
     m_repair.set_sensitive(false);
     use_check_as_default();
-    offer_restart_for_marker(false);
+    offer_restart_for_marker();
     return;
   }
   {
@@ -1892,7 +1893,7 @@ void UpdatesWindow::apply_repair_result(const SimulateResult& result, int wait_s
     m_repair.set_sensitive(false);
     use_check_as_default();
   }
-  offer_restart_for_marker(true);
+  offer_restart_for_marker();
   queue_fit();
 }
 
@@ -1982,7 +1983,7 @@ void UpdatesWindow::show_close_dialog()
         m_leave_helper_running = false;
         m_background = true;
         hide();
-        notify_and_leave(m_status.get_text());
+        notify_and_leave(notification_body());
         return;
       }
       m_leave_helper_running = true;
@@ -2732,5 +2733,32 @@ std::vector<std::string> UpdatesWindow::button_order_for_test(bool visible_only)
       out.push_back(button->get_label());
   }
   return out;
+}
+#endif
+
+/* 0.9.5-4: a background notification still mentions a pending restart. */
+Glib::ustring UpdatesWindow::notification_body() const
+{
+  Glib::ustring body = m_status.get_text();
+  if (m_restart_note.get_visible() && !m_restart_note.get_text().empty())
+    body += "\n" + m_restart_note.get_text();
+  return body;
+}
+
+#ifdef LCOS_UPDATES_TEST
+/* Shown, laid out with real height inside the window, and not inside the
+ * status scroller (which can hide lines below its 160px cap). */
+bool UpdatesWindow::restart_note_visible_for_test() const
+{
+  if (!m_restart_note.get_visible() || !m_restart_note.get_mapped() || m_restart_note.get_text().empty())
+    return false;
+  if (m_restart_note.is_ancestor(const_cast<Gtk::ScrolledWindow&>(m_status_scroll)))
+    return false;
+  const int h = m_restart_note.get_allocated_height();
+  int x = 0;
+  int y = 0;
+  if (!gtk_widget_translate_coordinates(GTK_WIDGET(m_restart_note.gobj()), GTK_WIDGET(gobj()), 0, 0, &x, &y))
+    return false;
+  return h > 0 && y >= 0 && y + h <= get_allocated_height();
 }
 #endif
