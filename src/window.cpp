@@ -9,11 +9,13 @@
 #include "timeouts.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <fcntl.h>
 #include <gio/gio.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -51,6 +53,55 @@ std::string read_status_file()
     text.clear();
   }
   return text;
+}
+
+/* 0.9.5-2: lcos-base's dpkg trigger writes this marker (and .pkgs) after a
+ * kernel, firmware or microcode install. It is world-readable, so the window
+ * reads it without a password. Only the test build can point elsewhere. */
+const char* reboot_marker_path()
+{
+#ifdef LCOS_UPDATES_TEST
+  const char* env = std::getenv("LCOS_UPDATES_TEST_REBOOT_FILE");
+  if (env != nullptr && env[0] == '/')
+    return env;
+#endif
+  return "/var/run/reboot-required";
+}
+
+std::string read_small_file(const std::string& path, std::size_t cap)
+{
+  std::string text;
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0)
+    return text;
+  struct stat st {};
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    ::close(fd);
+    return text;
+  }
+  char buf[4096];
+  while (text.size() < cap) {
+    const ssize_t n = ::read(fd, buf, std::min(sizeof buf, cap - text.size()));
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      break;
+    text.append(buf, static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  return text;
+}
+
+RebootMarker read_reboot_marker()
+{
+  RebootMarker marker;
+  const std::string path = reboot_marker_path();
+  struct stat st {};
+  if (::stat(path.c_str(), &st) != 0)
+    return marker;
+  marker.present = true;
+  marker.pkgs = parse_reboot_marker_pkgs(read_small_file(path + ".pkgs", 64 * 1024));
+  return marker;
 }
 
 const char* pkexec_path()
@@ -526,6 +577,20 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
       broken.error_msg = unfinished_message(unfinished, false);
       set_idle_status(broken.error_msg);
       offer_repair_for(broken);
+    }
+  }
+
+  /* 0.9.5-2: a restart the system is waiting for is shown as soon as the
+   * window opens, before any check or password. */
+  {
+    const RebootMarker marker = read_reboot_marker();
+    if (marker.present) {
+      if (m_repair.get_visible())
+        offer_restart_for_marker(true);
+      else {
+        set_idle_status(reboot_marker_sentence(marker));
+        show_restart(false);
+      }
     }
   }
 
@@ -1336,9 +1401,14 @@ void UpdatesWindow::maybe_note_dpkg()
                                             : "Checking for updates…");
 }
 
-void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages,
-                                     const std::vector<PackageUpgrade>& new_packages)
+void UpdatesWindow::present_outcome(const JobOutcome& job_outcome, const std::vector<PackageUpgrade>& packages,
+                                     const std::vector<PackageUpgrade>& new_packages, bool reboot_lead)
 {
+  /* 0.9.5-2: a restart the system still needs is offered after every job,
+   * not only after an Install that created the marker. */
+  JobOutcome outcome = job_outcome;
+  const bool job_restart = outcome.offer_restart;
+  apply_reboot_marker(outcome, read_reboot_marker(), reboot_lead);
   if (outcome.packages == PackageListAction::Show) {
     show_packages(packages);
     show_new_packages(new_packages);
@@ -1348,12 +1418,24 @@ void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector
   m_check.set_sensitive(outcome.check_enabled);
   m_install.set_sensitive(outcome.install_enabled);
   if (outcome.offer_restart) {
-    m_restart.show();
-    m_restart.set_sensitive(true);
+    show_restart(job_restart);
+  } else {
+    m_restart.set_sensitive(false);
+    m_restart.hide();
+  }
+}
+
+void UpdatesWindow::show_restart(bool make_default)
+{
+  m_restart.show();
+  m_restart.set_sensitive(true);
+  m_restart.set_can_default(true);
+  if (make_default) {
     order_trailing(m_restart);
-    m_restart.set_can_default(true);
     set_default(m_restart);
     m_restart.grab_default();
+  }
+  {
     queue_resize();
     int min_h = 0;
     int nat_h = 0;
@@ -1365,10 +1447,27 @@ void UpdatesWindow::present_outcome(const JobOutcome& outcome, const std::vector
       width = 560;
     if (nat_h > height)
       resize(width, nat_h);
-  } else {
-    m_restart.set_sensitive(false);
-    m_restart.hide();
   }
+}
+
+void UpdatesWindow::offer_restart_for_marker(bool lead)
+{
+  if (m_restart.get_visible())
+    return;
+  const RebootMarker marker = read_reboot_marker();
+  if (!marker.present)
+    return;
+  const std::string sentence = reboot_marker_sentence(marker);
+  const std::string current = m_status.get_text();
+  std::string text;
+  if (current.empty())
+    text = sentence;
+  else if (lead)
+    text = sentence + "\n" + current;
+  else
+    text = current + (current.back() == '\n' ? "" : " ") + sentence;
+  set_status_text(text);
+  show_restart(false);
 }
 
 void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
@@ -1551,7 +1650,8 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
       shown.error_msg = auth;
   }
   const bool have_rows = !m_store->children().empty();
-  present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages);
+  present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages,
+                  shown.status == SimulateResult::Error);
   if (shown.status != SimulateResult::Error)
     offer_cleanup(shown.unused);
   if (shown.status != SimulateResult::Error)
@@ -1775,6 +1875,7 @@ void UpdatesWindow::apply_repair_result(const SimulateResult& result, int wait_s
     m_repair.hide();
     m_repair.set_sensitive(false);
     use_check_as_default();
+    offer_restart_for_marker(false);
     return;
   }
   {
@@ -1797,6 +1898,7 @@ void UpdatesWindow::apply_repair_result(const SimulateResult& result, int wait_s
     m_repair.set_sensitive(false);
     use_check_as_default();
   }
+  offer_restart_for_marker(true);
   queue_fit();
 }
 

@@ -2133,6 +2133,63 @@ JobOutcome outcome_cleanup(const SimulateResult& result, int exit_code)
   return out;
 }
 
+std::vector<std::string> parse_reboot_marker_pkgs(const std::string& text)
+{
+  std::vector<std::string> pkgs;
+  std::size_t start = 0;
+  while (start < text.size()) {
+    std::size_t end = text.find('\n', start);
+    if (end == std::string::npos)
+      end = text.size();
+    std::string line = text.substr(start, end - start);
+    start = end + 1;
+    const std::size_t first = line.find_first_not_of(" \t\r");
+    if (first == std::string::npos)
+      continue;
+    const std::size_t last = line.find_last_not_of(" \t\r");
+    line = line.substr(first, last - first + 1);
+    /* A package name has no control characters; skip anything that does. */
+    bool clean = true;
+    for (unsigned char c : line) {
+      if (c < 0x20 || c == 0x7f)
+        clean = false;
+    }
+    if (!clean)
+      continue;
+    if (std::find(pkgs.begin(), pkgs.end(), line) == pkgs.end())
+      pkgs.push_back(line);
+  }
+  return pkgs;
+}
+
+std::string reboot_marker_sentence(const RebootMarker& marker)
+{
+  if (!marker.present)
+    return {};
+  if (marker.pkgs.empty())
+    return "Restart this computer to finish a system update (such as a kernel or firmware update).";
+  const std::size_t cap = 6;
+  std::vector<std::string> shown(marker.pkgs.begin(),
+                                 marker.pkgs.begin() + static_cast<std::ptrdiff_t>(std::min(cap, marker.pkgs.size())));
+  std::string names = join_names(shown);
+  if (marker.pkgs.size() > cap)
+    names += " and " + std::to_string(marker.pkgs.size() - cap) + " more";
+  return "Restart this computer to finish installing updates (needed by " + names + ").";
+}
+
+bool apply_reboot_marker(JobOutcome& out, const RebootMarker& marker, bool lead)
+{
+  if (!marker.present || out.offer_restart)
+    return false;
+  out.offer_restart = true;
+  const std::string sentence = reboot_marker_sentence(marker);
+  if (lead && !out.status.empty())
+    out.status = sentence + "\n" + out.status;
+  else
+    append_sentence(out.status, sentence);
+  return true;
+}
+
 bool needs_reboot_package(const std::string& raw)
 {
   std::string name = raw;
