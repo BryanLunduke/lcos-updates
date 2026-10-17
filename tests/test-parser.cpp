@@ -547,7 +547,7 @@ int main(int argc, char** argv)
   }
 
   {
-    const char* restart = "Restart to finish installing updates.";
+    const char* restart = "Restart this computer to finish installing updates";
     SimulateResult clean;
     clean.status = SimulateResult::Success;
     clean.upgraded_count = 1;
@@ -609,7 +609,7 @@ int main(int argc, char** argv)
     pending.reboot_pending_pkgs.push_back("linux-image-amd64");
     const JobOutcome old_flag = outcome_install(pending, 0, false);
     expect(old_flag.status.find("Updates installed.") == 0, "an old reboot flag still says Updates installed");
-    expect(old_flag.status.find("A restart was already pending. (needed by linux-image-amd64).") !=
+    expect(old_flag.status.find("A restart is still needed for an earlier update (linux-image-amd64).") !=
                std::string::npos,
            "an old reboot flag is a separate sentence");
     expect(old_flag.status.find(restart) == std::string::npos,
@@ -621,7 +621,7 @@ int main(int argc, char** argv)
     grew.reboot_pending_pkgs = {"bash"};
     const JobOutcome both = outcome_install(grew, 0, false);
     expect(count_phrase(both.status, restart) == 1, "a grown reboot flag restarts once");
-    expect(both.status.find("A restart was already pending. (needed by bash).") != std::string::npos,
+    expect(both.status.find("A restart is still needed for an earlier update (bash).") != std::string::npos,
            "packages already pending stay on the old-flag sentence");
 
     SimulateResult missing = clean;
@@ -974,7 +974,7 @@ int main(int argc, char** argv)
     reboot.reboot_pkgs.push_back("linux-image-amd64");
     const JobOutcome installed = outcome_install(reboot, 0, false);
     expect(installed.offer_restart, "a reboot flag offers Restart");
-    expect(installed.status.find("Restart to finish installing updates. (needed by linux-image-amd64).") !=
+    expect(installed.status.find("Restart this computer to finish installing updates (needed by linux-image-amd64).") !=
                std::string::npos,
            "a reboot package is named as needed by that package");
     expect(!outcome_install(SimulateResult{}, 0, false).offer_restart,

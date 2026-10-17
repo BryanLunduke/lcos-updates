@@ -3,8 +3,8 @@
 
 simulate checks, upgrade installs, repair repairs; argv1 keeps them apart.
 allow_any and allow_inactive are no. Round 11: only the check action
-(argv1 simulate) may use auth_admin_keep. Install and repair stay
-auth_admin, so a cached authorization never lets another program install,
+(argv1 simulate) may use auth_admin_keep. Install, repair and (round 15)
+cleanup stay auth_admin, so a cached authorization never lets another program install,
 remove or configure packages (round 10, U-4).
 """
 
@@ -46,12 +46,12 @@ def main() -> int:
             }
         )
 
-    if len(matched) != 3:
-        print(f"expected 3 helper actions, found {len(matched)}", file=sys.stderr)
+    if len(matched) != 4:
+        print(f"expected 4 helper actions, found {len(matched)}", file=sys.stderr)
         return 1
 
     for action in matched:
-        if action["argv1"] not in ("simulate", "upgrade", "repair"):
+        if action["argv1"] not in ("simulate", "upgrade", "repair", "cleanup"):
             print(f"{action['id']} missing argv1 simulate|upgrade|repair", file=sys.stderr)
             return 1
         if not action["allow_gui"]:
@@ -61,6 +61,10 @@ def main() -> int:
     simulate = next(a for a in matched if a["argv1"] == "simulate")
     upgrade = next(a for a in matched if a["argv1"] == "upgrade")
     repair = next(a for a in matched if a["argv1"] == "repair")
+    cleanup = next(a for a in matched if a["argv1"] == "cleanup")
+    if "remove unused" not in cleanup["message"].lower():
+        print(f"cleanup message is not about removing unused packages: {cleanup['message']}", file=sys.stderr)
+        return 1
     if "repair" not in repair["message"].lower():
         print(f"repair message is not about repairing: {repair['message']}", file=sys.stderr)
         return 1
@@ -75,7 +79,7 @@ def main() -> int:
         print("install message should stay the authentication sentence", file=sys.stderr)
         return 1
 
-    for action in (simulate, upgrade, repair):
+    for action in (simulate, upgrade, repair, cleanup):
         if action["allow_any"] != "no" or action["allow_inactive"] != "no":
             print(
                 f"{action['id']} must deny inactive and non-local subjects "
@@ -87,7 +91,7 @@ def main() -> int:
     if simulate["allow_active"] != "auth_admin_keep":
         print(f"check allow_active should be auth_admin_keep, got {simulate['allow_active']}", file=sys.stderr)
         return 1
-    for action in (upgrade, repair):
+    for action in (upgrade, repair, cleanup):
         if action["allow_active"] != "auth_admin":
             print(
                 f"{action['id']} allow_active should be auth_admin, got {action['allow_active']}",

@@ -1,3 +1,23 @@
+lcos-updates (0.9.5-1) unstable; urgency=medium
+
+  * Version moves to the LCOS 0.9.5 track.
+  * Round 15 U-1: after Install, Restart is offered when the transaction
+    included linux-image-*, linux-signed-*, firmware-*, linux-firmware,
+    or *-microcode, even if nothing wrote
+    /var/run/reboot-required. An existing reboot-required marker also
+    offers Restart, and Restart stays offered after a cleanup. Clearer
+    restart wording (no ". (" double punctuation).
+  * U-2: Install passes APT::Keep-Downloaded-Packages=false and runs
+    apt-get clean after a successful Install or Repair, so downloaded debs
+    no longer pile up in /var/cache/apt/archives. Check and Install report
+    packages apt-get autoremove would remove; a new "Remove Unused
+    Packages" button asks for confirmation and runs the new helper command
+    "cleanup" (own polkit action, auth_admin), which re-simulates and
+    refuses unless the set matches exactly. Never purges.
+  * U-3: AppStream metainfo (org.lunduke.LcosUpdates.metainfo.xml).
+
+ -- LCOS <lcos@lunduke.com>  Fri, 16 Oct 2026 21:30:00 -0500
+
 lcos-updates (0.9.4-7) unstable; urgency=medium
 
   * Round 14 U-1: the helper no longer makes a private download folder;

@@ -389,6 +389,18 @@ case "$mode" in
       printf 'STATUS upgrades\nCOUNT 1\nPKG libc6 1 2\n'
     fi
     ;;
+  install-then-unused)
+    echo HELPER_READY >&2
+    if [ "$cmd" = "upgrade" ]; then
+      printf 'STATUS success\nREBOOT linux-image-7.2.6-lunduke\nUNUSED libold1\nUNUSED oldtool\n'
+    elif [ "$cmd" = "cleanup" ]; then
+      echo 'PHASE remove' >&2
+      echo DPKG_STARTED >&2
+      printf 'STATUS success\nREMOVED_UNUSED 2\n'
+    else
+      printf 'STATUS upgrades\nCOUNT 1\nPKG linux-image-7.2.6-lunduke 7.2.6-lcos24 7.2.6-lcos25\n'
+    fi
+    ;;
   list-then-reboot-already)
     echo HELPER_READY >&2
     if [ "$cmd" = "upgrade" ]; then
@@ -1174,12 +1186,12 @@ int main()
     expect(listed, "a package is offered before the reboot install");
     window->test_click_install();
     const bool done = pump_until(2000, [&]() {
-      return contains(window->status_text_for_test(), "Restart to finish installing updates.");
+      return contains(window->status_text_for_test(), "Restart this computer to finish installing updates");
     });
     expect(done, "a reboot flag says to restart");
     const std::string status = window->status_text_for_test();
     expect(status.find("Updates installed.") == 0, "a restart starts with Updates installed");
-    expect(count_in(status, "Restart to finish installing updates.") == 1,
+    expect(count_in(status, "Restart this computer to finish installing updates") == 1,
            "the restart sentence is printed once");
     expect(status.find("linux-image-amd64") != std::string::npos, "a reboot flag names the package");
     expect(status.find("You're up to date.") == std::string::npos, "a reboot flag is not up to date");
@@ -1288,7 +1300,7 @@ int main()
       out << "go\n";
     }
     const bool noted = pump_until(3000, [&]() {
-      return contains(window->notification_text_for_test(), "Restart to finish installing updates.");
+      return contains(window->notification_text_for_test(), "Restart this computer to finish installing updates");
     });
     expect(noted, "the notification says a restart is needed");
     const std::string note = window->notification_text_for_test();
@@ -1299,7 +1311,7 @@ int main()
            "the notification does not say the system is up to date");
     expect(note.find("Updates installed.") != std::string::npos,
            "the notification starts from Updates installed");
-    expect(count_in(note, "Restart to finish installing updates.") == 1,
+    expect(count_in(note, "Restart this computer to finish installing updates") == 1,
            "the notification prints the restart sentence once");
     pump_until(1000, [&]() { return !alive(pid); });
     app->remove_window(*window);
@@ -1379,7 +1391,7 @@ int main()
     });
     expect(noted, "Close after the helper exited sends the result");
     const std::string note = window->notification_text_for_test();
-    expect(count_in(note, "Restart to finish installing updates.") == 1,
+    expect(count_in(note, "Restart this computer to finish installing updates") == 1,
            "the late Close notification restarts once");
     expect(!window->closing_for_test(), "Close after finish clears the close latch");
     pump_until(1000, [&]() { return !window->background_for_test(); });
@@ -1533,12 +1545,12 @@ int main()
     expect(listed, "already-pending reboot listed a package");
     window->test_click_install();
     const bool done = pump_until(2000, [&]() {
-      return contains(window->status_text_for_test(), "A restart was already pending.");
+      return contains(window->status_text_for_test(), "A restart is still needed for an earlier update");
     });
     expect(done, "an old reboot flag says a restart was already pending");
     const std::string status = window->status_text_for_test();
     expect(status.find("Updates installed.") == 0, "an old flag still says updates were installed");
-    expect(status.find("Restart to finish installing updates.") == std::string::npos,
+    expect(status.find("Restart this computer to finish installing updates") == std::string::npos,
            "an old flag does not use the restart sentence");
     expect(status.find("linux-image-amd64") != std::string::npos, "an old flag names the package");
     destroy_window(window, pidfile);
@@ -1863,7 +1875,7 @@ int main()
     window->test_click_install();
     const bool done = pump_until(2000, [&]() {
       return window->restart_visible_for_test() &&
-             contains(window->status_text_for_test(), "Restart to finish installing updates.");
+             contains(window->status_text_for_test(), "Restart this computer to finish installing updates");
     });
     expect(done, "a reboot flag shows a Restart button");
     expect(contains(window->status_text_for_test(), "linux-image-amd64"),
@@ -1877,7 +1889,7 @@ int main()
     expect(window->restart_is_default_for_test(), "Restart is the default after an install that needs it");
     window->test_click_restart();
     pump_for(40);
-    expect(contains(window->status_text_for_test(), "Restart to finish installing updates."),
+    expect(contains(window->status_text_for_test(), "Restart this computer to finish installing updates"),
            "opening the question does not restart yet");
     expect(window->restart_default_is_cancel_for_test(), "the restart question defaults to Don't restart");
     expect(window->restart_primary_for_test() == "Restart this computer now?",
@@ -1888,7 +1900,7 @@ int main()
     window->test_cancel_restart();
     pump_for(80);
     expect(slurp(loginctl_log).empty(), "Cancel does not run loginctl");
-    expect(contains(window->status_text_for_test(), "Restart to finish installing updates."),
+    expect(contains(window->status_text_for_test(), "Restart this computer to finish installing updates"),
            "Cancel leaves the restart sentence");
     window->test_click_restart();
     pump_for(40);
@@ -2083,6 +2095,39 @@ int main()
     expect(contains(window->status_text_for_test(), "post-installation script"),
            "U-1: a failed repair shows dpkg's reason");
     expect(window->repair_visible_for_test(), "U-1: a failed repair can be tried again");
+    destroy_window(window, pidfile);
+  }
+
+  /* Round 15 (U-1, U-2): Restart after a kernel install; Remove Unused
+   * Packages asks first and passes exactly the listed names. */
+  {
+    unlink(pidfile.c_str());
+    set_mode("install-then-unused");
+    UpdatesWindow* window = new_window();
+    window->test_click_check();
+    pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
+    window->test_click_install();
+    pump_until(3000, [&]() { return window->cleanup_visible_for_test(); });
+    expect(window->restart_visible_for_test(), "U-1 r15: a kernel install offers Restart");
+    expect(contains(window->status_text_for_test(), "Restart this computer to finish installing updates"),
+           "U-1 r15: the restart sentence is shown");
+    expect(window->cleanup_visible_for_test() &&
+               contains(window->status_text_for_test(), "2 packages are no longer needed"),
+           "U-2 r15: unused packages are offered");
+    window->test_click_cleanup();
+    expect(window->cleanup_dialog_for_test() != nullptr, "U-2 r15: Remove Unused Packages asks first");
+    window->test_respond_cleanup(Gtk::RESPONSE_CANCEL);
+    pump_until(300, [&]() { return false; });
+    expect(window->cleanup_visible_for_test() && window->cleanup_dialog_for_test() == nullptr,
+           "U-2 r15: Cancel removes nothing and keeps the button");
+    window->test_click_cleanup();
+    window->test_respond_cleanup(Gtk::RESPONSE_ACCEPT);
+    pump_until(3000, [&]() { return contains(window->status_text_for_test(), "Removed 2 unused packages."); });
+    expect(contains(window->status_text_for_test(), "Removed 2 unused packages."), "U-2 r15: cleanup result shown");
+    expect(!window->cleanup_visible_for_test(), "U-2 r15: the button goes away when nothing is left");
+    expect(window->restart_visible_for_test(), "U-1 r15: Restart is still offered after the cleanup");
+    const std::string pk = slurp(log);
+    expect(contains(pk, " cleanup libold1 oldtool\n"), "U-2 r15: the helper gets exactly the listed names");
     destroy_window(window, pidfile);
   }
 

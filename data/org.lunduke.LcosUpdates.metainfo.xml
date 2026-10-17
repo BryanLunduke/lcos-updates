@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.lunduke.LcosUpdates</id>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Check for updates…</name>
+  <summary>Download and install updates from Devuan and LCOS</summary>
+  <description>
+    <p>
+      A small GTK 3 tool that checks for and installs software updates from
+      Devuan and LCOS. It runs only when you open it: no background daemon,
+      no tray icon and no automatic installs.
+    </p>
+    <p>
+      It shows each update before installing, offers Restart when a new
+      kernel, firmware or microcode needs one, can finish an interrupted
+      install with Repair, and can remove packages that are no longer needed.
+    </p>
+  </description>
+  <url type="homepage">https://lunduke.com</url>
+  <launchable type="desktop-id">org.lunduke.LcosUpdates.desktop</launchable>
+  <provides>
+    <binary>lcos-updates</binary>
+  </provides>
+  <developer_name>The Lunduke Journal</developer_name>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>System</category>
+  </categories>
+  <releases>
+    <release version="0.9.5" date="2026-10-16">
+      <description>
+        <p>Offers Restart after kernel, firmware and microcode updates, deletes downloaded package files after installing, and can remove packages that are no longer needed.</p>
+      </description>
+    </release>
+    <release version="0.9.4" date="2026-10-13">
+      <description>
+        <p>Repair for interrupted installs, setup-question notices and answers, package sizes, and many fixes.</p>
+      </description>
+    </release>
+  </releases>
+</component>
