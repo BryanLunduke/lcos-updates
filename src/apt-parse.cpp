@@ -1208,6 +1208,10 @@ static void emit_extra(std::ostringstream& out, const SimulateResult& result)
     for (const auto& name : result.reboot_pending_pkgs)
       out << "REBOOT_ALREADY " << esc(name) << "\n";
   }
+  for (const auto& name : result.unused)
+    out << "UNUSED " << esc(name) << "\n";
+  if (result.removed_unused >= 0)
+    out << "REMOVED_UNUSED " << result.removed_unused << "\n";
   for (const auto& removal : result.kept_removals) {
     if (removal.removes.empty())
       out << "REMOVE " << tok(removal.package) << "\n";
@@ -1406,6 +1410,16 @@ SimulateResult parse_protocol(const std::string& text)
       const std::string name = protocol_unescape(line.substr(15));
       if (!name.empty())
         result.reboot_pending_pkgs.push_back(name);
+    } else if (line.compare(0, 7, "UNUSED ") == 0) {
+      const std::string name = protocol_unescape(line.substr(7));
+      if (!name.empty() && result.unused.size() < 4096)
+        result.unused.push_back(name);
+    } else if (line.compare(0, 15, "REMOVED_UNUSED ") == 0) {
+      try {
+        result.removed_unused = std::stoi(line.substr(15));
+      } catch (...) {
+        result.removed_unused = -1;
+      }
     } else if (line == "REBOOT") {
       result.reboot_required = true;
     } else if (line.compare(0, 7, "REBOOT ") == 0) {
@@ -1904,20 +1918,20 @@ static std::string reboot_sentence(const SimulateResult& result)
 {
   if (!result.reboot_required)
     return {};
-  std::string sentence = "Restart to finish installing updates.";
-  if (!result.reboot_pkgs.empty())
-    sentence += " (needed by " + join_names(result.reboot_pkgs) + ").";
-  return sentence;
+  /* Round 15 (U-1): one clear sentence, no ". (" double punctuation. */
+  if (result.reboot_pkgs.empty())
+    return "Restart this computer to finish installing updates.";
+  return "Restart this computer to finish installing updates (needed by " + join_names(result.reboot_pkgs) +
+         "). Until then the old version stays in use.";
 }
 
 static std::string pending_sentence(const SimulateResult& result)
 {
   if (!result.reboot_already)
     return {};
-  std::string sentence = "A restart was already pending.";
-  if (!result.reboot_pending_pkgs.empty())
-    sentence += " (needed by " + join_names(result.reboot_pending_pkgs) + ").";
-  return sentence;
+  if (result.reboot_pending_pkgs.empty())
+    return "A restart is still needed for an earlier update.";
+  return "A restart is still needed for an earlier update (" + join_names(result.reboot_pending_pkgs) + ").";
 }
 
 static std::string with_warning_text(std::string status, const std::string& warning, JobKind kind)
@@ -1941,6 +1955,8 @@ static void append_sentence(std::string& status, const std::string& sentence)
   status += sentence;
 }
 
+static std::string unused_sentence(const SimulateResult& result);
+
 JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_rows)
 {
   JobOutcome out;
@@ -1949,7 +1965,9 @@ JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_
       !has_remaining(result)) {
     out.packages = PackageListAction::Hide;
     out.install_enabled = false;
-    out.status = with_warning_text("You're up to date.", result.warning, JobKind::Check);
+    std::string status = "You're up to date.";
+    append_sentence(status, unused_sentence(result));
+    out.status = with_warning_text(status, result.warning, JobKind::Check);
     return out;
   }
   if (result.status == SimulateResult::Upgrades && !result.packages.empty()) {
@@ -2005,6 +2023,15 @@ JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_
   out.packages = have_rows ? PackageListAction::Keep : PackageListAction::Hide;
   out.install_enabled = have_rows;
   return out;
+}
+
+static std::string unused_sentence(const SimulateResult& result)
+{
+  if (result.unused.empty())
+    return {};
+  if (result.unused.size() == 1)
+    return "1 package is no longer needed (" + result.unused.front() + "). Use Remove Unused Packages to free space.";
+  return std::to_string(result.unused.size()) + " packages are no longer needed. Use Remove Unused Packages to free space.";
 }
 
 JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool have_rows)
@@ -2068,9 +2095,99 @@ JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool hav
   append_sentence(status, pending);
   out.packages = PackageListAction::Hide;
   out.install_enabled = false;
-  out.offer_restart = result.reboot_required;
+  append_sentence(status, unused_sentence(result));
+  /* Round 15 (U-1): any restart that is still needed is offered. */
+  out.offer_restart = result.reboot_required || result.reboot_already;
   out.status = with_warning_text(status, result.warning, JobKind::Install);
   return out;
+}
+
+JobOutcome outcome_cleanup(const SimulateResult& result, int exit_code)
+{
+  JobOutcome out;
+  out.check_enabled = true;
+  out.install_enabled = false;
+  out.packages = PackageListAction::Keep;
+  if (result.status == SimulateResult::Error) {
+    std::string msg = result.error_msg;
+    if (msg.empty() || msg == "No STATUS from helper") {
+      if (exit_code == 127 || exit_code == 126)
+        msg = "Could not run the update helper (pkexec).";
+      else
+        msg = "Could not remove unused packages.";
+    }
+    if (msg == "Cleanup was cancelled")
+      msg = "Removing unused packages was cancelled. Nothing was removed.";
+    out.status = msg;
+    return out;
+  }
+  const int n = result.removed_unused < 0 ? 0 : result.removed_unused;
+  if (n == 0)
+    out.status = "No unused packages were removed.";
+  else if (n == 1)
+    out.status = "Removed 1 unused package.";
+  else
+    out.status = "Removed " + std::to_string(n) + " unused packages.";
+  append_sentence(out.status, "Downloaded package files were deleted to free disk space.");
+  append_sentence(out.status, unused_sentence(result));
+  return out;
+}
+
+bool needs_reboot_package(const std::string& raw)
+{
+  std::string name = raw;
+  const std::string::size_type colon = name.find(':');
+  if (colon != std::string::npos)
+    name.erase(colon);
+  auto starts = [&name](const char* prefix) {
+    const std::size_t n = std::strlen(prefix);
+    return name.size() > n && name.compare(0, n, prefix) == 0;
+  };
+  auto ends = [&name](const char* suffix) {
+    const std::size_t n = std::strlen(suffix);
+    return name.size() > n && name.compare(name.size() - n, n, suffix) == 0;
+  };
+  if (starts("linux-image-") || starts("linux-signed-") || starts("firmware-"))
+    return true;
+  if (name == "linux-firmware" || name == "linux-firmware-free" || name == "linux-firmware-nonfree")
+    return true;
+  /* libc6 is left out on purpose: a restart for every glibc security update
+   * would train people to ignore the prompt. Its own scripts restart services. */
+  return ends("-microcode");
+}
+
+std::vector<std::string> reboot_trigger_packages(const std::vector<std::string>& names)
+{
+  std::vector<std::string> found;
+  for (const auto& raw : names) {
+    std::string name = raw;
+    const std::string::size_type eq = name.find('=');
+    if (eq != std::string::npos)
+      name.erase(eq);
+    if (!needs_reboot_package(name))
+      continue;
+    if (std::find(found.begin(), found.end(), name) == found.end())
+      found.push_back(name);
+  }
+  return found;
+}
+
+std::vector<std::string> parse_autoremove(const std::string& text)
+{
+  std::vector<std::string> names;
+  std::istringstream in(text);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.compare(0, 5, "Remv ") != 0)
+      continue;
+    std::istringstream ls(line.substr(5));
+    std::string name;
+    if (!(ls >> name) || name.empty())
+      continue;
+    if (std::find(names.begin(), names.end(), name) == names.end() && names.size() < 4096)
+      names.push_back(name);
+  }
+  return names;
 }
 
 JobOutcome outcome_timeout(bool installing, bool helper_ready, bool have_rows)

@@ -67,6 +67,11 @@ struct SimulateResult {
   bool reboot_required = false;
   /* reboot-required was already present and this install did not add packages. */
   bool reboot_already = false;
+  /* Round 15 (U-2): packages apt-get autoremove would remove (no longer
+   * needed). Offered as "Remove Unused Packages", never removed silently. */
+  std::vector<std::string> unused;
+  /* Round 15 (U-2): a cleanup run removed this many packages. -1 if none ran. */
+  int removed_unused = -1;
   /* The install log had no apt summary line, so kept-back packages are unknown. */
   bool summary_missing = false;
   /* From the apt summary line. -1 when that line was not present. */
@@ -251,6 +256,14 @@ struct JobOutcome {
 
 JobOutcome outcome_check(const SimulateResult& result, int exit_code, bool have_rows);
 JobOutcome outcome_install(const SimulateResult& result, int exit_code, bool have_rows);
+/* Round 15 (U-2): result of "Remove Unused Packages". */
+JobOutcome outcome_cleanup(const SimulateResult& result, int exit_code);
+/* Round 15 (U-1): packages whose install needs a restart even when nothing
+ * wrote /var/run/reboot-required: kernels, firmware and CPU microcode. */
+bool needs_reboot_package(const std::string& name);
+std::vector<std::string> reboot_trigger_packages(const std::vector<std::string>& names);
+/* Round 15 (U-2): package names from "Remv" lines of apt-get -s autoremove. */
+std::vector<std::string> parse_autoremove(const std::string& text);
 JobOutcome outcome_timeout(bool installing, bool helper_ready, bool have_rows);
 /* Round 11: a Repair timeout is worded as a repair, not as an install. */
 JobOutcome outcome_repair_timeout(bool helper_ready);

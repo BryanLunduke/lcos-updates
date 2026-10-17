@@ -14,7 +14,7 @@
 #include <vector>
 
 namespace lcos_updates {
-constexpr const char* kVersion = "0.9.4";
+constexpr const char* kVersion = "0.9.5";
 constexpr const char* kProductName = "LCOS Updates";
 constexpr const char* kAppId = "org.lunduke.LcosUpdates";
 /* Real hicolor artwork is not in the tree. The SVG only references a missing
@@ -42,7 +42,16 @@ public:
   void test_click_check() { on_check_clicked(); }
   void test_click_install() { on_install_clicked(); }
   void test_click_repair() { on_repair_clicked(); }
+  void test_click_cleanup() { on_cleanup_clicked(); }
+  Gtk::MessageDialog* cleanup_dialog_for_test() const { return m_cleanup_dialog; }
+  void test_respond_cleanup(int response)
+  {
+    if (m_cleanup_dialog != nullptr)
+      m_cleanup_dialog->response(response);
+  }
   bool repair_visible_for_test() const { return m_repair.get_visible(); }
+  bool cleanup_visible_for_test() const { return m_cleanup.get_visible() && m_cleanup.get_sensitive(); }
+  const std::vector<std::string>& unused_for_test() const { return m_unused; }
   bool repair_sensitive_for_test() const { return m_repair.get_sensitive(); }
   bool repair_is_default_for_test() const { return get_default_widget() == &m_repair; }
   void test_click_cancel() { on_cancel_clicked(); }
@@ -125,14 +134,16 @@ protected:
   void on_check_clicked();
   void on_install_clicked();
   void on_repair_clicked();
+  void on_cleanup_clicked();
+  void offer_cleanup(const std::vector<std::string>& unused);
   void on_about();
   bool on_delete_event(GdkEventAny* event) override;
   bool on_key_press_event(GdkEventKey* event) override;
 
 private:
-  enum class Job { None, Check, Install, Repair };
+  enum class Job { None, Check, Install, Repair, Cleanup };
   /* Install and Repair both run dpkg as root and cannot be cancelled once dpkg starts. */
-  bool installing() const { return m_job == Job::Install || m_job == Job::Repair; }
+  bool installing() const { return m_job == Job::Install || m_job == Job::Repair || m_job == Job::Cleanup; }
 
   void set_busy(bool busy, const Glib::ustring& status);
   void set_idle_status(const Glib::ustring& status);
@@ -157,6 +168,7 @@ private:
   void apply_check_result(const SimulateResult& result, int wait_status);
   void apply_install_result(const SimulateResult& result, int wait_status);
   void apply_repair_result(const SimulateResult& result, int wait_status);
+  void apply_cleanup_result(const SimulateResult& result, int wait_status);
   /* Shows Repair when an error says the package system is left broken. */
   void refresh_rows_after_failure();
   void offer_repair_for(const SimulateResult& result);
@@ -226,6 +238,12 @@ private:
   Gtk::Button m_install{"_Install updates", true};
   Gtk::Button m_restart{"_Restart", true};
   Gtk::Button m_repair{"_Repair", true};
+  /* Round 15 (U-2): apt-get autoremove, only after a confirmation. */
+  Gtk::Button m_cleanup{"Remove _Unused Packages", true};
+  std::vector<std::string> m_unused;
+  /* An install in this session asked for a restart; a cleanup keeps offering it. */
+  bool m_restart_pending = false;
+  Gtk::MessageDialog* m_cleanup_dialog = nullptr;
 
   class ModelColumns : public Gtk::TreeModel::ColumnRecord {
   public:

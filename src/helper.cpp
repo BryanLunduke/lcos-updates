@@ -1315,6 +1315,28 @@ void note_reboot_delta(SimulateResult& result, const RebootSnap& before)
   result.reboot_pending_pkgs = after.pkgs;
 }
 
+void note_transaction_reboot(SimulateResult& result, const std::vector<std::string>& pins)
+{
+  const std::vector<std::string> found = reboot_trigger_packages(pins);
+  if (found.empty())
+    return;
+  if (!result.reboot_required)
+    result.reboot_pkgs.clear();
+  result.reboot_required = true;
+  for (const auto& name : found) {
+    if (std::find(result.reboot_pkgs.begin(), result.reboot_pkgs.end(), name) == result.reboot_pkgs.end())
+      result.reboot_pkgs.push_back(name);
+  }
+  /* Already-pending names stay in reboot_pending_pkgs only. */
+  std::vector<std::string> pending;
+  for (const auto& name : result.reboot_pending_pkgs) {
+    if (std::find(result.reboot_pkgs.begin(), result.reboot_pkgs.end(), name) == result.reboot_pkgs.end())
+      pending.push_back(name);
+  }
+  result.reboot_pending_pkgs = pending;
+  result.reboot_already = !pending.empty();
+}
+
 void append_unique(std::vector<std::string>& dst, const std::vector<std::string>& src)
 {
   for (const auto& name : src) {
@@ -2312,6 +2334,33 @@ std::string pin_for_message(const char* raw)
   return pin;
 }
 
+/* Round 15 (U-2): what apt-get autoremove would remove. Simulation only.
+ * An error or timeout reports nothing rather than failing the job. */
+std::vector<std::string> simulate_unused()
+{
+  const std::string apt = apt_get_path();
+  std::string out;
+  std::string err;
+  const std::vector<const char*> argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "-s", "-q", "autoremove"};
+  const AptClock clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+  if (run_apt(argv, clock.idle_sec, clock.hard_sec, out, err, false) != 0)
+    return {};
+  return parse_autoremove(out + "\n" + err);
+}
+
+/* Round 15 (U-2): delete downloaded .debs from /var/cache/apt/archives once
+ * they are installed, so they do not pile up release after release. Check
+ * still downloads into the cache so Install can reuse them. Best effort. */
+void clean_archive_cache()
+{
+  const std::string apt = apt_get_path();
+  std::string out;
+  std::string err;
+  const std::vector<const char*> argv = {apt.c_str(), "-q", "clean"};
+  const AptClock clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+  (void)run_apt(argv, clock.idle_sec, clock.hard_sec, out, err, false);
+}
+
 int do_simulate()
 {
   if (stop_requested()) {
@@ -2357,6 +2406,8 @@ int do_simulate()
   }
   if (!update_warning.empty())
     result.warning = update_warning;
+  if (result.status != SimulateResult::Error)
+    result.unused = simulate_unused();
   save_check_snap(result);
   emit(result);
   return result.status == SimulateResult::Error ? 1 : 0;
@@ -2485,6 +2536,9 @@ int do_upgrade(const std::vector<std::string>& pins)
   argv_store.push_back(kConfold);
   argv_store.push_back("-o");
   argv_store.push_back(kNoRecommends);
+  /* Round 15 (U-2): apt-get keeps installed debs by default; do not. */
+  argv_store.push_back("-o");
+  argv_store.push_back("APT::Keep-Downloaded-Packages=false");
   argv_store.push_back("install");
   /* New packages are not installed yet, so --only-upgrade would skip them.
    * The reviewed pins are the whole set, including those new packages. */
@@ -2558,6 +2612,11 @@ int do_upgrade(const std::vector<std::string>& pins)
   else
     result.status = SimulateResult::Success;
   note_reboot_delta(result, reboot_before);
+  /* Round 15 (U-1): kernels, firmware and microcode need a restart even when
+   * no package script wrote /var/run/reboot-required. */
+  note_transaction_reboot(result, pins);
+  clean_archive_cache();
+  result.unused = simulate_unused();
   /* Round 12 (U-1): report what the non-interactive frontend answered. */
   result.debconf_pkgs = sim.debconf_pkgs;
   result.debconf_answers = answers;
@@ -2753,6 +2812,107 @@ int do_repair()
   }
   result.debconf_answers = g_error_answers;
   g_error_answers.clear();
+  clean_archive_cache();
+  emit(result);
+  return 0;
+}
+
+/* Round 15 (U-2): "Remove Unused Packages". The GUI passes the names it
+ * showed; the helper simulates autoremove again and refuses unless that
+ * set is exactly the same, and unless the plan only removes. Never purges,
+ * never installs. */
+bool valid_package_name(const std::string& name)
+{
+  if (name.empty() || name.size() > 200)
+    return false;
+  const unsigned char first = static_cast<unsigned char>(name[0]);
+  if (!std::islower(first) && !std::isdigit(first))
+    return false;
+  std::size_t colons = 0;
+  for (char ch : name) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c == ':') {
+      if (++colons > 1)
+        return false;
+      continue;
+    }
+    if (!std::islower(c) && !std::isdigit(c) && c != '+' && c != '-' && c != '.')
+      return false;
+  }
+  return name.back() != ':';
+}
+
+int do_cleanup(const std::vector<std::string>& names)
+{
+  if (stop_requested()) {
+    emit_error("Cleanup was cancelled");
+    return 1;
+  }
+  announce_ready();
+  if (report_unfinished())
+    return 1;
+  emit_phase("simulate");
+  const std::string apt = apt_get_path();
+  std::string out;
+  std::string err;
+  const std::vector<const char*> sim_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, "-s", "-q", "autoremove"};
+  const AptClock sim_clock = apt_clock(kSimulateIdleSec, kSimulateHardCapSec);
+  int rc = run_apt(sim_argv, sim_clock.idle_sec, sim_clock.hard_sec, out, err, false);
+  if (rc != 0) {
+    if (error_says_locked(err + "\n" + out)) {
+      emit_error(kAnotherInstaller);
+      return 1;
+    }
+    emit_error("Could not check which packages are unused.\n" + strip_install_wording(first_error_line(out, err)));
+    return 1;
+  }
+  const std::string sim_text = out + "\n" + err;
+  const InstallPlan plan = parse_install_plan(sim_text);
+  const std::vector<std::string> now = parse_autoremove(sim_text);
+  if (!plan.inst.empty() || !plan.newly.empty() || !plan.downgraded.empty() || plan.downgrade_count > 0) {
+    emit_error("Nothing was removed: removing unused packages would also change other packages.");
+    return 1;
+  }
+  if (!same_names(now, names)) {
+    SimulateResult changed;
+    changed.status = SimulateResult::Error;
+    changed.error_msg = "The list of unused packages changed. Nothing was removed.";
+    changed.unused = now;
+    emit(changed);
+    return 1;
+  }
+  if (stop_requested()) {
+    emit_error("Cleanup was cancelled");
+    return 1;
+  }
+  emit_phase("remove");
+  g_dpkg_committed = 1;
+  g_stop = 0;
+  write_all_fd(STDERR_FILENO, "DPKG_STARTED\n");
+  out.clear();
+  err.clear();
+  const AptClock clock = apt_clock(kUpgradeIdleSec, kUpgradeHardCapSec);
+  const std::vector<const char*> rm_argv = {apt.c_str(), kSimNoteOpt, kSimNoteVal, kSimNoteOpt, kQuietVal,
+                                            "-y",        "-o",        kConfdef,    "-o",        kConfold,
+                                            "autoremove"};
+  g_debconf_mark_seen = true;
+  rc = run_apt(rm_argv, clock.idle_sec, clock.hard_sec, out, err, true);
+  g_debconf_mark_seen = false;
+  out = strip_debconf_trace(out);
+  err = strip_debconf_trace(err);
+  if (rc != 0) {
+    if (error_says_locked(err + "\n" + out)) {
+      emit_error(kAnotherInstaller);
+      return 1;
+    }
+    emit_error("Could not remove unused packages.\n" + strip_install_wording(first_error_line(out, err)));
+    return 1;
+  }
+  clean_archive_cache();
+  SimulateResult result;
+  result.status = SimulateResult::Success;
+  result.removed_unused = static_cast<int>(names.size());
+  result.unused = simulate_unused();
   emit(result);
   return 0;
 }
@@ -2824,7 +2984,7 @@ int main(int argc, char** argv)
   sigaction(SIGHUP, &sa, nullptr);
 
   if (argc < 2 || argv[1] == nullptr) {
-    emit_error("refused: helper accepts only simulate, upgrade or repair");
+    emit_error("refused: helper accepts only simulate, upgrade, repair or cleanup");
     return 2;
   }
 
@@ -2841,7 +3001,7 @@ int main(int argc, char** argv)
   const std::string cmd = argv[1];
   if (cmd == "simulate") {
     if (argc != 2) {
-      emit_error("refused: helper accepts only simulate, upgrade or repair");
+      emit_error("refused: helper accepts only simulate, upgrade, repair or cleanup");
       return 2;
     }
     if (!caller_is_updates_app()) {
@@ -2856,6 +3016,21 @@ int main(int argc, char** argv)
       return 2;
     }
     return do_repair();
+  }
+  if (cmd == "cleanup") {
+    std::vector<std::string> names;
+    for (int i = 2; i < argc; ++i) {
+      if (argv[i] == nullptr || !valid_package_name(argv[i])) {
+        emit_error("refused: invalid package name");
+        return 2;
+      }
+      names.emplace_back(argv[i]);
+    }
+    if (names.empty() || names.size() > 4096) {
+      emit_error("refused: cleanup requires the reviewed package list");
+      return 2;
+    }
+    return do_cleanup(names);
   }
   if (cmd == "upgrade") {
     std::vector<std::string> pins;
@@ -2894,6 +3069,6 @@ int main(int argc, char** argv)
     }
     return do_upgrade(pins);
   }
-  emit_error("refused: helper accepts only simulate, upgrade or repair");
+  emit_error("refused: helper accepts only simulate, upgrade, repair or cleanup");
   return 2;
 }

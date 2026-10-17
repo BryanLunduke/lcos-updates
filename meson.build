@@ -1,7 +1,7 @@
 project(
   'lcos-updates',
   'cpp',
-  version: '0.9.4',
+  version: '0.9.5',
   license: 'GPL-3.0-or-later',
   meson_version: '>=0.56',
   default_options: [
@@ -58,6 +58,11 @@ helper = executable(
 install_data(
   'data/org.lunduke.LcosUpdates.desktop',
   install_dir: get_option('datadir') / 'applications',
+)
+
+install_data(
+  'data/org.lunduke.LcosUpdates.metainfo.xml',
+  install_dir: get_option('datadir') / 'metainfo',
 )
 
 
@@ -208,6 +213,21 @@ test(
   'round14-cache-reuse-stale-dirs-repair-answers',
   test_r14,
   args: [helper.full_path()],
+  timeout: 120,
+)
+
+test_r15 = executable(
+  'test-r15',
+  'tests/test-r15.cpp',
+  include_directories: inc,
+  link_with: apt_parse,
+  install: false,
+)
+
+test(
+  'round15-restart-cleanup-metainfo',
+  test_r15,
+  args: [helper.full_path(), meson.project_source_root()],
   timeout: 120,
 )
 

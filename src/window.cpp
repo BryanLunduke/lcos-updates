@@ -471,6 +471,11 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
                             "Nothing is removed.");
   m_repair.hide();
   m_buttons.pack_start(m_repair, Gtk::PACK_SHRINK);
+  m_cleanup.set_no_show_all(true);
+  m_cleanup.set_tooltip_text("Remove packages that were installed as dependencies and are no longer needed.");
+  m_cleanup.hide();
+  m_buttons.pack_start(m_cleanup, Gtk::PACK_SHRINK);
+  m_cleanup.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_cleanup_clicked));
   m_check.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_check_clicked));
   m_install.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_install_clicked));
   m_cancel.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_cancel_clicked));
@@ -547,6 +552,11 @@ UpdatesWindow::~UpdatesWindow()
   if (m_close_dialog != nullptr) {
     Gtk::MessageDialog* dialog = m_close_dialog;
     m_close_dialog = nullptr;
+    delete dialog;
+  }
+  if (m_cleanup_dialog != nullptr) {
+    Gtk::MessageDialog* dialog = m_cleanup_dialog;
+    m_cleanup_dialog = nullptr;
     delete dialog;
   }
   if (m_restart_dialog != nullptr) {
@@ -696,6 +706,7 @@ void UpdatesWindow::set_busy(bool busy, const Glib::ustring& status)
   m_pulse.disconnect();
   if (busy) {
     m_repair.hide();
+    m_cleanup.hide();
     m_restart.hide();
     m_restart.set_sensitive(false);
     m_spinner.show();
@@ -886,7 +897,7 @@ bool UpdatesWindow::on_view_tooltip(int x, int y, bool /*keyboard_tooltip*/,
 
 void UpdatesWindow::order_trailing(Gtk::Button& trailing)
 {
-  Gtk::Button* buttons[] = {&m_cancel, &m_install, &m_check, &m_restart, &m_repair};
+  Gtk::Button* buttons[] = {&m_cancel, &m_install, &m_check, &m_restart, &m_repair, &m_cleanup};
   int pos = 0;
   for (Gtk::Button* button : buttons) {
     if (button == &trailing)
@@ -965,7 +976,7 @@ void UpdatesWindow::request_stop()
   m_check.set_sensitive(false);
   m_install.set_sensitive(false);
   set_status_text(job == Job::Check ? "Stopping the update check…"
-                                    : job == Job::Repair ? "Stopping the repair…" : "Stopping the update…");
+                                    : job == Job::Repair ? "Stopping the repair…" : job == Job::Cleanup ? "Stopping…" : "Stopping the update…");
   if (m_helper_ready || !m_have_pid)
     return;
   const pid_t child = static_cast<pid_t>(m_pid);
@@ -1274,6 +1285,7 @@ void UpdatesWindow::maybe_rearm_job_timeout()
   show_job_progress();
   if (!m_dpkg_started && m_phase.empty() && m_progress_line.empty())
     set_status_text(m_job == Job::Repair    ? "Repairing…"
+                    : m_job == Job::Cleanup ? "Removing unused packages…"
                     : m_job == Job::Install ? "Installing updates…"
                                             : "Checking for updates…");
   apply_phase_status();
@@ -1319,6 +1331,7 @@ void UpdatesWindow::maybe_note_dpkg()
   apply_phase_status();
   if (m_progress_line.empty() && m_phase.empty())
     set_status_text(m_job == Job::Repair    ? "Repairing…"
+                    : m_job == Job::Cleanup ? "Removing unused packages…"
                     : m_job == Job::Install ? "Installing updates…"
                                             : "Checking for updates…");
 }
@@ -1372,6 +1385,15 @@ void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
     return;
   }
   const bool keep = !m_store->children().empty();
+  if (job == Job::Cleanup) {
+    JobOutcome outcome;
+    outcome.install_enabled = keep;
+    outcome.status = helper_ready ? "Removing unused packages took too long and was stopped."
+                                  : "Timed out waiting for authentication. Nothing was removed.";
+    present_outcome(outcome, {}, {});
+    offer_cleanup(m_unused);
+    return;
+  }
   const JobOutcome outcome = outcome_timeout(job == Job::Install, helper_ready, keep);
   present_outcome(outcome, {}, {});
 }
@@ -1479,6 +1501,7 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
   if (user_stopped && !timed_out && job != Job::None) {
     const std::string want = job == Job::Install  ? "Install was cancelled"
                              : job == Job::Repair ? "Repair was cancelled"
+                             : job == Job::Cleanup ? "Cleanup was cancelled"
                                                   : "Update check was cancelled";
     const bool said = parsed.status == SimulateResult::Error &&
                       parsed.error_msg.find("cancelled") != std::string::npos;
@@ -1494,6 +1517,8 @@ void UpdatesWindow::on_child_exited(Glib::Pid /*pid*/, int wait_status)
     apply_install_result(parsed, wait_status);
   else if (job == Job::Repair)
     apply_repair_result(parsed, wait_status);
+  else if (job == Job::Cleanup)
+    apply_cleanup_result(parsed, wait_status);
   else
     set_idle_status(m_status.get_text());
 
@@ -1528,8 +1553,91 @@ void UpdatesWindow::apply_check_result(const SimulateResult& result, int wait_st
   const bool have_rows = !m_store->children().empty();
   present_outcome(outcome_check(shown, exit_code, have_rows), shown.packages, shown.new_packages);
   if (shown.status != SimulateResult::Error)
+    offer_cleanup(shown.unused);
+  if (shown.status != SimulateResult::Error)
     m_debconf_pkgs = shown.debconf_pkgs;
   offer_repair_for(shown);
+}
+
+void UpdatesWindow::offer_cleanup(const std::vector<std::string>& unused)
+{
+  m_unused = unused;
+  if (m_unused.empty()) {
+    m_cleanup.set_sensitive(false);
+    m_cleanup.hide();
+  } else {
+    m_cleanup.show();
+    m_cleanup.set_sensitive(true);
+  }
+  queue_fit();
+}
+
+void UpdatesWindow::apply_cleanup_result(const SimulateResult& result, int wait_status)
+{
+  SimulateResult shown = result;
+  const int exit_code = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+  if (shown.status == SimulateResult::Error &&
+      (shown.error_msg.empty() || shown.error_msg == "No STATUS from helper")) {
+    const std::string auth = authentication_message({}, exit_code);
+    if (!auth.empty())
+      shown.error_msg = auth;
+  }
+  const bool have_rows = !m_store->children().empty();
+  JobOutcome outcome = outcome_cleanup(shown, exit_code);
+  outcome.install_enabled = have_rows;
+  outcome.offer_restart = m_restart_pending;
+  if (m_restart_pending)
+    outcome.status += " Restart this computer to finish installing updates.";
+  present_outcome(outcome, {}, {});
+  if (shown.status == SimulateResult::Error && shown.unused.empty() &&
+      shown.error_msg.find("changed") == std::string::npos)
+    offer_cleanup(m_unused);
+  else
+    offer_cleanup(shown.unused);
+  offer_repair_for(shown);
+}
+
+void UpdatesWindow::on_cleanup_clicked()
+{
+  if (m_closing || m_job != Job::None || m_have_pid || m_cleanup_dialog != nullptr || m_unused.empty())
+    return;
+  const std::size_t n = m_unused.size();
+  const Glib::ustring primary = n == 1 ? "Remove 1 unused package?"
+                                       : "Remove " + std::to_string(n) + " unused packages?";
+  std::string list;
+  const std::size_t shown = std::min<std::size_t>(n, 12);
+  for (std::size_t i = 0; i < shown; ++i)
+    list += (i == 0 ? "" : ", ") + m_unused[i];
+  if (n > shown)
+    list += ", and " + std::to_string(n - shown) + " more";
+  auto* dialog = new Gtk::MessageDialog(*this, primary, false, Gtk::MESSAGE_QUESTION, Gtk::BUTTONS_NONE, true);
+  dialog->set_secondary_text(n == 1 ? "It was installed to support other software and nothing needs it now: " +
+                                          list + ".\nIts settings files are kept."
+                                    : "These were installed to support other software and nothing needs them now: " +
+                                          list + ".\nTheir settings files are kept.");
+  dialog->add_button("_Cancel", Gtk::RESPONSE_CANCEL);
+  dialog->add_button("_Remove", Gtk::RESPONSE_ACCEPT);
+  dialog->set_default_response(Gtk::RESPONSE_CANCEL);
+  m_cleanup_dialog = dialog;
+  dialog->signal_response().connect([this](int response) {
+    Gtk::MessageDialog* d = m_cleanup_dialog;
+    m_cleanup_dialog = nullptr;
+    if (d != nullptr) {
+      d->hide();
+      Glib::signal_idle().connect_once([d]() { delete d; });
+    }
+    if (response != Gtk::RESPONSE_ACCEPT || m_closing || m_job != Job::None || m_have_pid || m_unused.empty())
+      return;
+    std::vector<std::string> args = {"cleanup"};
+    args.insert(args.end(), m_unused.begin(), m_unused.end());
+    m_cleanup.set_sensitive(false);
+    set_busy(true, "Waiting for authentication…");
+    start_helper(args, Job::Cleanup, gui_timeout_ms(kAuthTimeoutMs));
+    if (m_job != Job::None)
+      acquire_inhibitors("Removing unused packages");
+    update_logout_warning();
+  });
+  dialog->show();
 }
 
 void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_status)
@@ -1543,7 +1651,10 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
       shown.error_msg = auth;
   }
   const bool have_rows = !m_store->children().empty();
-  present_outcome(outcome_install(shown, exit_code, have_rows), shown.packages, shown.new_packages);
+  const JobOutcome install_outcome = outcome_install(shown, exit_code, have_rows);
+  if (install_outcome.offer_restart)
+    m_restart_pending = true;
+  present_outcome(install_outcome, shown.packages, shown.new_packages);
   if (shown.status == SimulateResult::Error && have_rows)
     refresh_rows_after_failure();
   /* Round 13 (U-4): a partly failed install still lists the setup answers
@@ -1555,6 +1666,8 @@ void UpdatesWindow::apply_install_result(const SimulateResult& result, int wait_
     queue_fit();
   }
   offer_repair_for(shown);
+  if (shown.status != SimulateResult::Error)
+    offer_cleanup(shown.unused);
 }
 
 /* Round 11 (U-5): after a failed install some packages may already be on the
@@ -1747,7 +1860,9 @@ void UpdatesWindow::show_close_dialog()
     return;
   /* Round 11: a repair is named as a repair. */
   const bool repairing = m_job == Job::Repair;
-  m_close_primary = repairing ? "The repair will keep running." : "The install will keep running.";
+  m_close_primary = m_job == Job::Cleanup ? "Removing unused packages will keep running."
+                    : repairing           ? "The repair will keep running."
+                                          : "The install will keep running.";
   m_close_secondary = repairing ? "It will finish setting up packages in the background."
                                 : "It will finish in the background.";
   auto* dialog = new Gtk::MessageDialog(*this, m_close_primary, false, Gtk::MESSAGE_WARNING,
@@ -2062,7 +2177,8 @@ void UpdatesWindow::update_logout_warning()
 {
   const bool show = installing() && m_logind_fd < 0 && m_inhibit_cookie == 0;
   if (show) {
-    m_warning.set_text(m_job == Job::Repair ? "Don't log out or shut down until the repair finishes."
+    m_warning.set_text(m_job == Job::Cleanup ? "Don't log out or shut down until the unused packages are removed."
+                       : m_job == Job::Repair ? "Don't log out or shut down until the repair finishes."
                                             : "Don't log out or shut down until the install finishes.");
     m_warning.show();
   } else {
@@ -2087,7 +2203,8 @@ void UpdatesWindow::refresh_commit_note()
 {
   if (!m_install_committed)
     return;
-  Glib::ustring note = m_job == Job::Repair ? "This repair will finish on its own."
+  Glib::ustring note = m_job == Job::Cleanup ? "Removing unused packages will finish on its own."
+                       : m_job == Job::Repair ? "This repair will finish on its own."
                                             : "This install will finish on its own.";
   const int sec = m_phase_mark_us > 0
                       ? static_cast<int>((g_get_monotonic_time() - m_phase_mark_us) / G_USEC_PER_SEC)
@@ -2140,8 +2257,11 @@ void UpdatesWindow::apply_phase_status()
     text = "Finishing the interrupted install…";
   else if (m_phase == "repair")
     text = "Installing missing dependencies…";
+  else if (m_phase == "remove")
+    text = "Removing unused packages…";
   else if (m_phase == "simulate")
     text = m_job == Job::Repair    ? "Checking for missing dependencies…"
+           : m_job == Job::Cleanup ? "Checking which packages are unused…"
            : m_job == Job::Install ? "Checking the package list…"
                                    : "Checking for updates…";
   else

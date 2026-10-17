@@ -1152,6 +1152,14 @@ static int apt_stub(int argc, char** argv)
                stdout);
     return 0;
   }
+  /* Round 15 (U-2): apt-get clean and apt-get -s autoremove after a job.
+   * They do not increment the script counter. */
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "clean") == 0 || std::strcmp(argv[i], "autoremove") == 0) {
+      std::fputs("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n", stdout);
+      return 0;
+    }
+  }
   const char* script = std::getenv("LCOS_STUB_SCRIPT");
   if (script != nullptr && script[0] != '\0')
     return apt_script(script, argc, argv);
