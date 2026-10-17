@@ -1,0 +1,16 @@
+Replay of Chloe's real-ISO 095-03 Check failure (Devuan mirror ftp.fau.de unreachable).
+
+update.stderr and the Err:/continuation lines in update-*.stdout are transcribed
+verbatim from /workspace/lcos-iso-qa/results/095-03/bios-inst-u1c-after-check-maximized.png
+(and bios-inst-u1c-after-check.png). The u1-*.txt logs from that run record the
+marker and package state but not the apt-get update output or its exit code.
+
+update-partial.stdout adds Hit: lines for the two sources on the ISO that were
+still reachable (config/includes.chroot/etc/apt/sources.list.d/lcos-overlay.list
+and config/archives/brave.list.chroot in lcos-live 0.9.5). With them the real
+helper reports STATUS up-to-date plus WARN lines that start with
+"W: Failed to fetch", which is the text Chloe saw. update-total.stdout has no
+Hit: line (every source down) and gives STATUS error.
+
+apt-get update normally exits 0 when only index fetches fail; the tests replay
+both exit 0 and exit 100.

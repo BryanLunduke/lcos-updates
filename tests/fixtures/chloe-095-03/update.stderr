@@ -1,0 +1,5 @@
+W: Failed to fetch http://ftp.fau.de/devuan/merged/dists/excalibur/InRelease  Unable to connect to ftp.fau.de:http:
+W: Failed to fetch http://ftp.fau.de/devuan/merged/dists/excalibur-security/InRelease  Unable to connect to ftp.fau.de:http:
+W: Failed to fetch http://ftp.fau.de/devuan/merged/dists/excalibur-updates/InRelease  Unable to connect to ftp.fau.de:http:
+W: Failed to fetch http://ftp.fau.de/devuan/merged/dists/excalibur-backports/InRelease  Unable to connect to ftp.fau.de:http:
+W: Some index files failed to download. They have been ignored, or old ones used instead.

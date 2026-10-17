@@ -1,3 +1,20 @@
+lcos-updates (0.9.5-4) unstable; urgency=medium
+
+  * 095-03 real-ISO QA: with /var/run/reboot-required present and the Devuan
+    mirror unreachable (other sources still answering), Check showed only
+    apt's W:/Err: lines. The helper reports that case as up to date with a
+    warning, so the restart notice was appended after the warning, below
+    the 160px status scroller, out of sight. The notice now has its own
+    line above the status, outside the scroller, after every Check result
+    (failed, partly failed, up to date, updates listed, helper or pkexec
+    errors, cancelled or timed-out authentication) and after Install,
+    Repair and Remove Unused Packages. The status text no longer repeats
+    it. Button order and default buttons are unchanged from 0.9.5-3.
+  * Tests replay the captured apt-get update output (tests/fixtures/
+    chloe-095-03) through the real helper and window code.
+
+ -- LCOS <lcos@lunduke.com>  Sat, 17 Oct 2026 12:40:23 -0500
+
 lcos-updates (0.9.5-3) unstable; urgency=medium
 
   * Button order: the action area keeps one order in every state (launch,

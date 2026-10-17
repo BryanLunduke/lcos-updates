@@ -114,6 +114,10 @@ public:
   Glib::ustring new_version_at_row_for_test(int row) const;
   Glib::ustring restart_primary_for_test() const { return m_restart_primary; }
   Glib::ustring restart_secondary_for_test() const { return m_restart_secondary; }
+  /* 0.9.5-4: the restart-marker notice line. */
+  Glib::ustring restart_note_for_test() const { return m_restart_note.get_text(); }
+  bool restart_note_visible_for_test() const;
+  bool status_overflows_for_test() const { return m_status.get_allocated_height() > m_status_scroll.get_allocated_height(); }
   Glib::ustring notification_text_for_test() const { return m_notification; }
   bool background_for_test() const { return m_background; }
   bool closing_for_test() const { return m_closing; }
@@ -214,16 +218,16 @@ private:
   void note_helper_activity();
   void notify_and_leave(const Glib::ustring& body);
   void use_cancel_as_default();
-  /* reboot_lead puts the restart-marker notice above the status (a long
-   * Check error would otherwise scroll it out of view). */
   void present_outcome(const JobOutcome& outcome, const std::vector<PackageUpgrade>& packages,
-                       const std::vector<PackageUpgrade>& new_packages, bool reboot_lead = false);
+                       const std::vector<PackageUpgrade>& new_packages);
   /* 0.9.5-2: shows Restart. make_default is the post-install behaviour; a
    * restart that only comes from the system's marker does not take Enter. */
   void show_restart(bool make_default);
-  /* 0.9.5-2: when /var/run/reboot-required exists and Restart is not shown
-   * yet, add the notice to the current status and show Restart. */
-  void offer_restart_for_marker(bool lead);
+  /* 0.9.5-2/-4: when /var/run/reboot-required exists and Restart is not
+   * shown yet, show the notice in its own label and show Restart. */
+  void offer_restart_for_marker();
+  void hide_restart_note();
+  Glib::ustring notification_body() const;
   bool on_phase_tick();
   void relax_logind_inhibitor();
   void send_stall_notification(const Glib::ustring& body);
@@ -239,6 +243,7 @@ private:
   Gtk::ScrolledWindow m_status_scroll;
   Gtk::Label m_status;
   Gtk::Label m_commit_note;
+  Gtk::Label m_restart_note;
   Gtk::Label m_warning;
   Gtk::ProgressBar m_progress;
   Gtk::ScrolledWindow m_scroller;
