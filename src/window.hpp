@@ -70,6 +70,9 @@ public:
   bool check_is_default_for_test() const { return get_default_widget() == &m_check; }
   bool restart_is_default_for_test() const { return get_default_widget() == &m_restart; }
   int button_x_for_test(const Gtk::Widget& widget) const;
+  /* 0.9.5-3: button labels in action-area order (all, or only visible). */
+  std::vector<std::string> button_order_for_test(bool visible_only) const;
+  std::vector<Gtk::Widget*> button_widgets_for_test() { return m_buttons.get_children(); }
   int check_x_for_test() const { return button_x_for_test(m_check); }
   int install_x_for_test() const { return button_x_for_test(m_install); }
   int restart_x_for_test() const { return button_x_for_test(m_restart); }
@@ -193,7 +196,7 @@ private:
   void show_close_dialog();
   void show_download_dialog();
   bool install_downloading() const;
-  void order_trailing(Gtk::Button& trailing);
+  void apply_button_order();
   void on_restart_clicked();
   void spawn_reboot();
   void tune_column(int index, int width, bool expand, Pango::EllipsizeMode ellipsize, bool resizable);
