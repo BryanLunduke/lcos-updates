@@ -527,6 +527,7 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_cleanup.hide();
   m_buttons.pack_start(m_cleanup, Gtk::PACK_SHRINK);
   m_cleanup.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_cleanup_clicked));
+  apply_button_order();
   m_check.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_check_clicked));
   m_install.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_install_clicked));
   m_cancel.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_cancel_clicked));
@@ -960,21 +961,19 @@ bool UpdatesWindow::on_view_tooltip(int x, int y, bool /*keyboard_tooltip*/,
   return true;
 }
 
-void UpdatesWindow::order_trailing(Gtk::Button& trailing)
+/* 0.9.5-3: one fixed order in every state, the order the post-install
+ * Restart state has always used, so buttons never jump when one appears or
+ * the default changes. Hidden buttons take no space. */
+void UpdatesWindow::apply_button_order()
 {
-  Gtk::Button* buttons[] = {&m_cancel, &m_install, &m_check, &m_restart, &m_repair, &m_cleanup};
+  Gtk::Button* buttons[] = {&m_cancel, &m_install, &m_check, &m_repair, &m_cleanup, &m_restart};
   int pos = 0;
-  for (Gtk::Button* button : buttons) {
-    if (button == &trailing)
-      continue;
+  for (Gtk::Button* button : buttons)
     gtk_box_reorder_child(GTK_BOX(m_buttons.gobj()), GTK_WIDGET(button->gobj()), pos++);
-  }
-  gtk_box_reorder_child(GTK_BOX(m_buttons.gobj()), GTK_WIDGET(trailing.gobj()), pos);
 }
 
 void UpdatesWindow::use_check_as_default()
 {
-  order_trailing(m_check);
   m_check.set_can_default(true);
   set_default(m_check);
   m_check.grab_default();
@@ -982,7 +981,6 @@ void UpdatesWindow::use_check_as_default()
 
 void UpdatesWindow::use_install_as_default()
 {
-  order_trailing(m_install);
   m_install.set_can_default(true);
   set_default(m_install);
   m_install.grab_default();
@@ -1431,7 +1429,6 @@ void UpdatesWindow::show_restart(bool make_default)
   m_restart.set_sensitive(true);
   m_restart.set_can_default(true);
   if (make_default) {
-    order_trailing(m_restart);
     set_default(m_restart);
     m_restart.grab_default();
   }
@@ -1477,7 +1474,6 @@ void UpdatesWindow::show_timeout_message(Job job, bool helper_ready)
     present_outcome(outcome_repair_timeout(helper_ready), {}, {});
     m_repair.show();
     m_repair.set_sensitive(true);
-    order_trailing(m_repair);
     set_default(m_repair);
     m_repair.grab_default();
     queue_fit();
@@ -1846,7 +1842,6 @@ void UpdatesWindow::offer_repair_for(const SimulateResult& result)
   m_repair.set_sensitive(true);
   /* Nothing to install until the package system is repaired. */
   m_install.set_sensitive(false);
-  order_trailing(m_repair);
   set_default(m_repair);
   m_repair.grab_default();
   queue_fit();
@@ -1890,7 +1885,6 @@ void UpdatesWindow::apply_repair_result(const SimulateResult& result, int wait_s
   if (again) {
     m_repair.show();
     m_repair.set_sensitive(true);
-    order_trailing(m_repair);
     set_default(m_repair);
     m_repair.grab_default();
   } else {
@@ -2723,5 +2717,20 @@ bool UpdatesWindow::ask_default_is_cancel_for_test() const
     return false;
   const Glib::ustring label = def->get_label();
   return label == "_Keep installing" || label == "_Keep open";
+}
+#endif
+
+#ifdef LCOS_UPDATES_TEST
+std::vector<std::string> UpdatesWindow::button_order_for_test(bool visible_only) const
+{
+  std::vector<std::string> out;
+  for (const Gtk::Widget* child : m_buttons.get_children()) {
+    if (visible_only && !child->get_visible())
+      continue;
+    const auto* button = dynamic_cast<const Gtk::Button*>(child);
+    if (button != nullptr)
+      out.push_back(button->get_label());
+  }
+  return out;
 }
 #endif

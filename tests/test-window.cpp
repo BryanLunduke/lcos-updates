@@ -145,6 +145,40 @@ static std::string slurp(const std::string& path)
   return out;
 }
 
+/* 0.9.5-3: one action-area order in every state. */
+static const std::vector<std::string> kButtonOrder = {"_Cancel", "_Install updates", "_Check for updates",
+                                                      "_Repair", "Remove _Unused Packages", "_Restart"};
+
+static void expect_button_order(UpdatesWindow* window, const std::string& state,
+                                const std::vector<std::string>& visible)
+{
+  pump_for(60);
+  const std::vector<std::string> all = window->button_order_for_test(false);
+  const std::string what_all = "0.9.5-3 order (" + state + "): Cancel, Install, Check, Repair, Remove Unused, Restart";
+  expect(all == kButtonOrder, what_all.c_str());
+  const std::vector<std::string> shown = window->button_order_for_test(true);
+  std::string got;
+  for (const auto& label : shown)
+    got += (got.empty() ? "" : ", ") + label;
+  const std::string what_vis = "0.9.5-3 visible buttons (" + state + "): " + got;
+  expect(shown == visible, what_vis.c_str());
+  /* The labels are also laid out left to right in that order. */
+  int last_x = -1;
+  bool rising = true;
+  for (Gtk::Widget* child : window->button_widgets_for_test()) {
+    if (!child->get_visible())
+      continue;
+    int x = 0;
+    int y = 0;
+    gtk_widget_translate_coordinates(GTK_WIDGET(child->gobj()), GTK_WIDGET(window->gobj()), 0, 0, &x, &y);
+    if (x <= last_x)
+      rising = false;
+    last_x = x;
+  }
+  const std::string what_x = "0.9.5-3 layout (" + state + "): visible buttons run left to right in that order";
+  expect(rising, what_x.c_str());
+}
+
 static UpdatesWindow* new_window()
 {
   auto* window = new UpdatesWindow(false);
@@ -765,10 +799,10 @@ int main()
       return contains(window->status_text_for_test(), "1 update.");
     });
     expect(listed, "a simulate with packages offers updates");
-    const bool install_trailing = pump_until(1000, [&]() {
-      return window->install_x_for_test() > window->check_x_for_test();
+    const bool install_left = pump_until(1000, [&]() {
+      return window->install_x_for_test() < window->check_x_for_test();
     });
-    expect(install_trailing, "Install is the trailing button once it is the next step");
+    expect(install_left, "0.9.5-3: Install stays left of Check when it becomes the next step");
     expect(window->install_is_default_for_test(), "Install is the default once updates are listed");
     expect(window->install_sensitive_for_test(), "install is available for the reviewed list");
     window->test_click_install();
@@ -1768,8 +1802,8 @@ int main()
            "the new version is kept in full");
     expect(window->version_tip_for_test(0) == "21.0.11+9-1 → 21.0.12.1+1-1~24.04.4",
            "the version tooltip shows the full old and new versions");
-    expect(window->install_x_for_test() > window->check_x_for_test(),
-           "Install stays at the trailing edge of a long list");
+    expect(window->install_x_for_test() < window->check_x_for_test(),
+           "0.9.5-3: Install keeps its place left of Check with a long list");
     expect(window->column_count_for_test() == 5, "package, versions, size, and security are columns");
     destroy_window(window, pidfile);
   }
@@ -2301,6 +2335,106 @@ int main()
                !contains(window->status_text_for_test(), "Restart this computer"),
            "095-2: no marker, no notice after Install");
     destroy_window(window, pidfile);
+  }
+
+  /* 0.9.5-3: the action-area order is the same in every state, marker or
+   * not, so no button jumps when another appears or the default moves. */
+  {
+    const std::string C = "_Cancel", I = "_Install updates", K = "_Check for updates", R = "_Repair",
+                      U = "Remove _Unused Packages", S = "_Restart";
+    for (int with_marker = 0; with_marker <= 1; ++with_marker) {
+      const std::string tag = with_marker ? "marker, " : "no marker, ";
+      if (with_marker) {
+        write_file(reboot_marker, "*** System restart required ***\n");
+        write_file(reboot_pkgs, "linux-image-7.2.6-lunduke\n");
+      } else {
+        unlink(reboot_marker.c_str());
+        unlink(reboot_pkgs.c_str());
+      }
+      auto with_restart = [&](std::vector<std::string> v) {
+        if (with_marker && (v.empty() || v.back() != S))
+          v.push_back(S);
+        return v;
+      };
+      {
+        unlink(pidfile.c_str());
+        set_mode("ready-exit");
+        UpdatesWindow* window = new_window();
+        expect_button_order(window, tag + "launch", with_restart({C, I, K}));
+        expect(window->check_is_default_for_test(), "0.9.5-3: Check is still the default on launch");
+        window->test_click_check();
+        pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+        expect_button_order(window, tag + "Check up to date", with_restart({C, I, K}));
+        destroy_window(window, pidfile);
+      }
+      {
+        unlink(pidfile.c_str());
+        set_mode("many-lines");
+        UpdatesWindow* window = new_window();
+        window->test_click_check();
+        pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+        expect_button_order(window, tag + "Check failed", with_restart({C, I, K}));
+        destroy_window(window, pidfile);
+      }
+      {
+        unlink(pidfile.c_str());
+        set_mode("list-or-install");
+        UpdatesWindow* window = new_window();
+        window->test_click_check();
+        pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
+        expect_button_order(window, tag + "Check listed updates", with_restart({C, I, K}));
+        expect(window->install_is_default_for_test(), "0.9.5-3: Install is still the default with updates listed");
+        window->test_click_install();
+        pump_until(3000, [&]() { return window->check_sensitive_for_test() && !window->install_sensitive_for_test(); });
+        expect_button_order(window, tag + "after Install", with_restart({C, I, K}));
+        destroy_window(window, pidfile);
+      }
+      {
+        unlink(pidfile.c_str());
+        set_mode("install-then-unused");
+        UpdatesWindow* window = new_window();
+        window->test_click_check();
+        pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
+        window->test_click_install();
+        pump_until(3000, [&]() { return window->cleanup_visible_for_test(); });
+        expect_button_order(window, tag + "after a kernel Install", {C, I, K, U, S});
+        expect(window->restart_is_default_for_test(), "0.9.5-3: Restart is still the default after a kernel Install");
+        window->test_click_cleanup();
+        window->test_respond_cleanup(Gtk::RESPONSE_ACCEPT);
+        pump_until(3000, [&]() { return contains(window->status_text_for_test(), "Removed 2 unused packages."); });
+        expect_button_order(window, tag + "after Remove Unused Packages", {C, I, K, S});
+        destroy_window(window, pidfile);
+      }
+      {
+        unlink(pidfile.c_str());
+        set_mode("broken-fail");
+        UpdatesWindow* window = new_window();
+        window->test_click_check();
+        pump_until(3000, [&]() { return window->repair_visible_for_test(); });
+        expect_button_order(window, tag + "Check offers Repair", with_restart({C, I, K, R}));
+        expect(window->repair_is_default_for_test(), "0.9.5-3: Repair is still the default when offered");
+        window->test_click_repair();
+        pump_until(3000, [&]() { return window->check_sensitive_for_test(); });
+        expect_button_order(window, tag + "after a failed Repair", with_restart({C, I, K, R}));
+        destroy_window(window, pidfile);
+      }
+      {
+        unlink(pidfile.c_str());
+        unlink((release + ".repair").c_str());
+        set_mode("broken");
+        UpdatesWindow* window = new_window();
+        window->test_click_check();
+        pump_until(3000, [&]() { return window->repair_visible_for_test(); });
+        write_file(release + ".repair", "go\n");
+        window->test_click_repair();
+        pump_until(3000, [&]() { return contains(window->status_text_for_test(), "Repair finished."); });
+        expect_button_order(window, tag + "after Repair", with_restart({C, I, K}));
+        unlink((release + ".repair").c_str());
+        destroy_window(window, pidfile);
+      }
+    }
+    unlink(reboot_marker.c_str());
+    unlink(reboot_pkgs.c_str());
   }
 
   if (g_fails != 0) {

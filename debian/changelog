@@ -1,3 +1,15 @@
+lcos-updates (0.9.5-3) unstable; urgency=medium
+
+  * Button order: the action area keeps one order in every state (launch,
+    each Check result, after Install, Repair and Remove Unused Packages,
+    with or without /var/run/reboot-required): Cancel, Install updates,
+    Check for updates, Repair, Remove Unused Packages, Restart. This is the
+    order the post-install Restart state already used. Hidden buttons take
+    no space and no button moves when the default changes. Default buttons
+    are unchanged from 0.9.5-2.
+
+ -- LCOS <lcos@lunduke.com>  Sat, 17 Oct 2026 06:58:40 -0500
+
 lcos-updates (0.9.5-2) unstable; urgency=medium
 
   * 095-02 QA U-1: when /var/run/reboot-required exists, Updates shows the
