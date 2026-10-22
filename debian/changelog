@@ -1,3 +1,10 @@
+lcos-updates (0.9.6-1) unstable; urgency=medium
+
+  * Version 0.9.6 for the LCOS 0.9.6 track (About dialog and meson project
+    version). No other changes.
+
+ -- LCOS <lcos@lunduke.com>  Thu, 22 Oct 2026 14:46:05 -0500
+
 lcos-updates (0.9.5-4) unstable; urgency=medium
 
   * 095-03 real-ISO QA: with /var/run/reboot-required present and the Devuan
