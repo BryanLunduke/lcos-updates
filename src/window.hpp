@@ -17,9 +17,10 @@ namespace lcos_updates {
 constexpr const char* kVersion = "0.9.6";
 constexpr const char* kProductName = "LCOS Updates";
 constexpr const char* kAppId = "org.lunduke.LcosUpdates";
-/* Real hicolor artwork is not in the tree. The SVG only references a missing
- * PNG, so the menu and window use the stock software-update icon. */
-constexpr const char* kIconName = "system-software-update";
+/* The app's own icon: data/icons/hicolor/{32x32,48x48,128x128,256x256}/apps/
+ * org.lunduke.LcosUpdates.png, installed into the hicolor theme. Used by the
+ * window, the default window icon and the About dialog. */
+constexpr const char* kIconName = "org.lunduke.LcosUpdates";
 }  // namespace lcos_updates
 
 class UpdatesWindow : public Gtk::ApplicationWindow {
