@@ -66,9 +66,9 @@ install_data(
 )
 
 
-# The tree has no real hicolor PNGs (the SVG only references a missing file).
-# Skip absent paths so a clean meson setup succeeds. The desktop file and
-# window use system-software-update until artwork is added.
+# The app icon, org.lunduke.LcosUpdates, in the hicolor theme. The desktop
+# file, window and About dialog use it. Absent paths are skipped so a clean
+# meson setup still succeeds.
 fs = import('fs')
 foreach size : ['32x32', '48x48', '128x128', '256x256']
   png = 'data/icons/hicolor' / size / 'apps' / 'org.lunduke.LcosUpdates.png'

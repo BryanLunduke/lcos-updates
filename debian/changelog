@@ -1,3 +1,14 @@
+lcos-updates (0.9.6-2) unstable; urgency=medium
+
+  * Use the app's own icon, org.lunduke.LcosUpdates (the hicolor PNGs the
+    package already ships), instead of the stock system-software-update
+    icon: window and About dialog (kIconName), the .desktop Icon= and the
+    polkit policy icon_name. Corrects the comments that said the artwork
+    did not exist. The hicolor icon cache is refreshed by the
+    hicolor-icon-theme dpkg trigger on install and remove.
+
+ -- LCOS <lcos@lunduke.com>  Thu, 22 Oct 2026 15:03:33 -0500
+
 lcos-updates (0.9.6-1) unstable; urgency=medium
 
   * Version 0.9.6 for the LCOS 0.9.6 track (About dialog and meson project
