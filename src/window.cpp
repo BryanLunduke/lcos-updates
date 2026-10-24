@@ -440,8 +440,9 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
     /* GtkScrolledWindow does not do height-for-width, so pin the content
      * height to the wrapped text at the real width: no blank lines under a
      * status that wrapped at the narrower natural width. A scrolling status
-     * shows 8 whole lines inside a 6px inset. */
-    const int want_h = scroll ? cap + 12 : (text_h > 0 ? text_h : 1);
+     * shows 8 whole lines under a 6px top inset; the bottom inset scrolls
+     * with the text, so it does not show part of a ninth line. */
+    const int want_h = scroll ? cap + 6 : (text_h > 0 ? text_h : 1);
     if (vpol != want || m_status_scroll.get_min_content_height() != want_h) {
       m_status_policy = want;
       m_status_height = want_h;
