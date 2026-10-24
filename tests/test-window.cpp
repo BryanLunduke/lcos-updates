@@ -854,6 +854,11 @@ int main(int main_argc, char** main_argv)
         saw_gvfs = true;
     }
     expect(saw_eject && saw_gvfs, "the new-package list names eject and gvfs-backends");
+    pump_for(300);
+    expect(window->new_columns_aligned_for_test() == 1,
+           "0.9.7-2 UL-10: new-package Version and Size line up under New version and Size");
+    expect(window->visible_columns_for_test() == 5,
+           "0.9.7-2 UL-1: all five columns are visible with the new-package list shown");
     const std::string status = window->status_text_for_test();
     expect(status.find("New packages will also be installed: ") != std::string::npos,
            "the status names the new packages before install");
@@ -1662,6 +1667,30 @@ int main(int main_argc, char** main_argv)
     destroy_window(window, pidfile);
   }
 
+  int pulse_bar_height = -1;
+  {
+    /* 0.9.7-2 layout invariants: idle vs busy. */
+    unlink(pidfile.c_str());
+    set_mode("hang-check");
+    set_timeout_ms(8000);
+    UpdatesWindow* window = new_window();
+    pump_for(300);
+    const int idle_x = window->status_text_x_for_test();
+    expect(idle_x == 12, "0.9.7-2 UL-3: the idle status starts at the 12px window padding");
+    expect(window->buttons_gap_for_test() == 12, "0.9.7-2 UL-9: 12px group gap above the button row");
+    expect(window->allocated_width_for_test() == 560, "0.9.7-2: the idle window is 560px wide");
+    window->test_click_check();
+    const bool busy = pump_until(3000, [&]() { return window->progress_visible_for_test(); });
+    pump_for(400);
+    expect(busy, "0.9.7-2: hang-check shows the progress bar");
+    expect(window->status_text_x_for_test() == idle_x,
+           "0.9.7-2 UL-3: the status keeps its left edge while the spinner runs");
+    pulse_bar_height = window->progress_height_for_test();
+    expect(pulse_bar_height > 0, "0.9.7-2 UL-4: the pulsing bar has a height");
+    expect(window->allocated_width_for_test() == 560, "0.9.7-2: the busy window is 560px wide");
+    destroy_window(window, pidfile);
+  }
+
   {
     unlink(pidfile.c_str());
     set_mode("percent");
@@ -1675,6 +1704,9 @@ int main(int main_argc, char** main_argv)
     });
     expect(shown, "a download percent names the package and fills the bar");
     expect(window->progress_text_for_test() == "12%", "the bar shows the leading percent");
+    pump_for(200);
+    expect(window->progress_height_for_test() == pulse_bar_height,
+           "0.9.7-2 UL-4: the bar keeps its height when the percent arrives");
     expect(window->status_text_for_test().find("12% [") == std::string::npos,
            "the raw apt percent line is not the status");
     destroy_window(window, pidfile);
@@ -1777,6 +1809,11 @@ int main(int main_argc, char** main_argv)
       return window->package_rows_for_test() == 3 && window->columns_fit_for_test();
     });
     expect(listed, "name, version, and size columns fit in the window");
+    pump_for(300);
+    expect(window->allocated_width_for_test() == 560,
+           "0.9.7-2 UL-1: the list window stays 560px wide (no width jump)");
+    expect(window->visible_columns_for_test() == 5,
+           "0.9.7-2 UL-1: all five columns are visible at the default 560px width");
     /* 0.9.3-2: the window sizes to its rows instead of opening ~760px tall
      * around three packages; it must still show the list and the buttons. */
     pump_for(200);
@@ -2151,6 +2188,11 @@ int main(int main_argc, char** main_argv)
     pump_until(3000, [&]() { return window->install_sensitive_for_test(); });
     window->test_click_install();
     pump_until(3000, [&]() { return window->cleanup_visible_for_test(); });
+    pump_for(400);
+    const int five_w = window->allocated_width_for_test();
+    expect(five_w >= 560 && five_w < 760,
+           "0.9.7-2 UL-2: the five-button row widens the window less than the old 796px");
+    expect(window->buttons_inside_window_for_test(), "0.9.7-2 UL-2: the five-button row fits in the window");
     expect(window->restart_visible_for_test(), "U-1 r15: a kernel install offers Restart");
     expect(contains(window->status_text_for_test(), "Restart this computer to finish installing updates"),
            "U-1 r15: the restart sentence is shown");
@@ -2168,6 +2210,9 @@ int main(int main_argc, char** main_argv)
     pump_until(3000, [&]() { return contains(window->status_text_for_test(), "Removed 2 unused packages."); });
     expect(contains(window->status_text_for_test(), "Removed 2 unused packages."), "U-2 r15: cleanup result shown");
     expect(!window->cleanup_visible_for_test(), "U-2 r15: the button goes away when nothing is left");
+    pump_until(2000, [&]() { return window->allocated_width_for_test() == 560; });
+    expect(window->allocated_width_for_test() == 560,
+           "0.9.7-2 UL-2: the window is back to 560px once Remove Unused Packages goes away");
     expect(window->restart_visible_for_test(), "U-1 r15: Restart is still offered after the cleanup");
     const std::string pk = slurp(log);
     expect(contains(pk, " cleanup libold1 oldtool\n"), "U-2 r15: the helper gets exactly the listed names");
@@ -2503,6 +2548,9 @@ int main(int main_argc, char** main_argv)
                  ("095-4 replay (" + tag + "): the status starts with W: as on Chloe's screen").c_str());
         expect(window->status_overflows_for_test(),
                ("095-4 replay (" + tag + "): the status is taller than its scroller (the case that hid the notice)").c_str());
+        expect(window->status_framed_for_test() &&
+                   window->status_scroll_height_for_test() <= window->status_cap_for_test() + 12 + 4,
+               ("0.9.7-2 UL-7 (" + tag + "): a scrolling status is framed and capped at 8 whole lines").c_str());
         expect(window->restart_note_for_test() == kNeeded && window->restart_note_visible_for_test(),
                ("095-4 replay (" + tag + "): the restart notice is shown, laid out and outside the scroller").c_str());
         expect(window->restart_visible_for_test() && window->restart_sensitive_for_test(),

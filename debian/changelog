@@ -1,3 +1,25 @@
+lcos-updates (0.9.7-2) unstable; urgency=medium
+
+  * Layout fixes in the Updates window (UL-1 to UL-13). No logic, wording
+    or feature changes; button order is unchanged.
+    - One spacing scale: 12px window padding, 12px between groups, 6px
+      between controls; buttons are at least 96px and take their own width.
+    - The window is 560px wide in every state (also its minimum, so wrapped
+      text can no longer hold it taller than its content). The list no longer
+      jumps to 780px; its five columns fit at 560 and the new-package list
+      lines up under them. Only the five-button row widens the window, and
+      it goes back to 560 once the extra buttons go away.
+    - The status text keeps its left edge while busy (the spinner now sits
+      at the start of the button row). The progress bar keeps one height
+      with and without the percent.
+    - Buttons stay on the bottom edge when the window is enlarged; the
+      status line is capped at 8 whole lines and framed when it scrolls; no
+      resize on every status update; small list minimum, restart-note and
+      new-package heading spacing; the new-package dialog names at most 12
+      packages, then "and N more".
+
+ -- LCOS <lcos@lunduke.com>  Sat, 24 Oct 2026 18:08:56 -0500
+
 lcos-updates (0.9.7-1) unstable; urgency=medium
 
   * Version 0.9.7 for the LCOS 0.9.7 track (About dialog and meson project
