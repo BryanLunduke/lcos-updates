@@ -14,7 +14,7 @@
 #include <vector>
 
 namespace lcos_updates {
-constexpr const char* kVersion = "0.9.6";
+constexpr const char* kVersion = "0.9.7";
 constexpr const char* kProductName = "LCOS Updates";
 constexpr const char* kAppId = "org.lunduke.LcosUpdates";
 /* The app's own icon: data/icons/hicolor/{32x32,48x48,128x128,256x256}/apps/
