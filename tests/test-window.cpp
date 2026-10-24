@@ -2549,7 +2549,7 @@ int main(int main_argc, char** main_argv)
         expect(window->status_overflows_for_test(),
                ("095-4 replay (" + tag + "): the status is taller than its scroller (the case that hid the notice)").c_str());
         expect(window->status_framed_for_test() &&
-                   window->status_scroll_height_for_test() <= window->status_cap_for_test() + 12 + 4,
+                   window->status_scroll_height_for_test() <= window->status_cap_for_test() + 6 + 4,
                ("0.9.7-2 UL-7 (" + tag + "): a scrolling status is framed and capped at 8 whole lines").c_str());
         expect(window->restart_note_for_test() == kNeeded && window->restart_note_visible_for_test(),
                ("095-4 replay (" + tag + "): the restart notice is shown, laid out and outside the scroller").c_str());
