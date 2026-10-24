@@ -136,6 +136,16 @@ public:
   int allocated_height_for_test() const { return get_allocated_height(); }
   int allocated_width_for_test() const { return get_allocated_width(); }
   bool buttons_inside_window_for_test() const;
+  /* 0.9.7-2 layout invariants. */
+  int status_text_x_for_test() const;
+  int note_x_for_test() const;
+  int progress_height_for_test() const { return m_progress.get_allocated_height(); }
+  int visible_columns_for_test() const;
+  int new_columns_aligned_for_test() const;
+  int buttons_gap_for_test() const;
+  int status_cap_for_test() const { return status_cap(); }
+  int status_scroll_height_for_test() const { return m_status_scroll.get_allocated_height(); }
+  bool status_framed_for_test() const { return m_status_scroll.get_shadow_type() == Gtk::SHADOW_IN; }
 #endif
 
 protected:
@@ -192,6 +202,22 @@ private:
   Gtk::PolicyType m_status_policy = Gtk::POLICY_EXTERNAL;
   int m_status_height = -1;
   bool m_fit_queued = false;
+  /* 0.9.7-2: the status text changed since the last allocation, so a new
+   * wrapped height should refit the window (a rewrap from a user resize does not). */
+  bool m_status_changed = false;
+  bool m_fit_nudged = false;
+  /* Last width this window asked for; a wider allocation means the user widened it. */
+  int m_requested_width = 0;
+  /* Widest width asked for that the window has not settled at yet: an
+   * allocation up to this is still ours (a resize in flight), not the user's. */
+  int m_pending_width = 0;
+  /* 0.9.7-2 (UL-6): natural height at the last fit. A text change refits only
+   * if it changes this (a line wraps or unwraps), never on a user resize. */
+  int m_fit_nat_h = 0;
+  bool m_content_check_queued = false;
+  void queue_content_check();
+  void check_content_height();
+  int status_cap() const;
   void start_reviewed_install();
   void confirm_new_packages();
   void on_cancel_clicked();
@@ -205,6 +231,9 @@ private:
   void on_restart_clicked();
   void spawn_reboot();
   void tune_column(int index, int width, bool expand, Pango::EllipsizeMode ellipsize, bool resizable);
+  void sync_new_columns();
+  void tune_column(Gtk::TreeView& view, int index, int width, bool expand, Pango::EllipsizeMode ellipsize,
+                   bool resizable);
   bool on_view_tooltip(int x, int y, bool keyboard_tooltip, const Glib::RefPtr<Gtk::Tooltip>& tooltip);
   void set_status_text(const Glib::ustring& status);
   void append_stdout(const char* data, std::size_t n);
@@ -240,6 +269,9 @@ private:
   Gtk::MenuBar m_menubar;
   Gtk::Box m_content{Gtk::ORIENTATION_VERTICAL, 6};
   Gtk::Box m_status_row{Gtk::ORIENTATION_HORIZONTAL, 6};
+  /* 0.9.7-2: spinner at the start of the button row, buttons at the end, so
+   * the status text keeps one left edge whether or not a job is running. */
+  Gtk::Box m_action_row{Gtk::ORIENTATION_HORIZONTAL, 6};
   Gtk::Spinner m_spinner;
   Gtk::ScrolledWindow m_status_scroll;
   Gtk::Label m_status;

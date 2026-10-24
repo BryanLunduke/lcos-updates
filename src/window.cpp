@@ -352,12 +352,23 @@ std::string authentication_message(const std::string& err, int exit_code)
 }
 }
 
+/* 0.9.7-2: one window width for every state (wider only for the button row). */
+static constexpr int kWindowWidth = 560;
+
 UpdatesWindow::UpdatesWindow(bool check_on_start)
 {
   set_title("Check for updates…");
   /* Width only: height follows natural request so the pre-check window hugs
    * status + buttons (no blank strip under a taller default). */
-  set_default_size(560, -1);
+  set_default_size(kWindowWidth, -1);
+  /* 0.9.7-2: 560 is also the minimum width. GTK gives the window manager a
+   * minimum height measured at the minimum width, so a narrower minimum let
+   * wrapped text (the commit note) hold the window taller than its content. */
+  m_vbox.set_size_request(kWindowWidth, -1);
+  m_vbox.signal_size_allocate().connect([this](Gtk::Allocation& a) {
+    if (a.get_width() == m_requested_width)
+      m_pending_width = m_requested_width;
+  });
   set_border_width(0);
   /* Window-manager chrome only: do not call set_titlebar / HeaderBar. */
   /* Reinforce default icon for WMs that ignore gtk_window_set_default_icon_name. */
@@ -400,28 +411,46 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_status_scroll.set_policy(Gtk::POLICY_NEVER, Gtk::POLICY_EXTERNAL);
   m_status_scroll.set_shadow_type(Gtk::SHADOW_NONE);
   m_status_scroll.set_propagate_natural_height(true);
-  m_status_scroll.set_max_content_height(160);
   m_status_scroll.add(m_status);
   m_status_scroll.signal_size_allocate().connect([this](Gtk::Allocation& allocation) {
     const int width = allocation.get_width() > 80 ? allocation.get_width() : 80;
-    if (m_status.get_allocated_width() != width)
+    /* 0.9.7-2 (UL-7): measure the wrapped text at the full width and cap it
+     * at 8 whole lines; a cut-off half line read as broken text. */
+    auto layout = m_status.create_pango_layout(m_status.get_text());
+    layout->set_width(width * PANGO_SCALE);
+    layout->set_wrap(Pango::WRAP_WORD_CHAR);
+    int text_w = 0;
+    int text_h = 0;
+    layout->get_pixel_size(text_w, text_h);
+    const int cap = status_cap();
+    const bool scroll = text_h > cap;
+    if (scroll) {
+      int req_w = 0;
+      int req_h = 0;
+      m_status.get_size_request(req_w, req_h);
+      if (req_w != -1)
+        m_status.set_size_request(-1, -1);
+    } else if (m_status.get_allocated_width() != width) {
       m_status.set_size_request(width, -1);
-    int min_h = 0;
-    int nat_h = 0;
-    m_status.get_preferred_height_for_width(width, min_h, nat_h);
-    const Gtk::PolicyType want = nat_h > 160 ? Gtk::POLICY_AUTOMATIC : Gtk::POLICY_EXTERNAL;
+    }
+    const Gtk::PolicyType want = scroll ? Gtk::POLICY_AUTOMATIC : Gtk::POLICY_EXTERNAL;
     Gtk::PolicyType hpol;
     Gtk::PolicyType vpol;
     m_status_scroll.get_policy(hpol, vpol);
     /* GtkScrolledWindow does not do height-for-width, so pin the content
      * height to the wrapped text at the real width: no blank lines under a
-     * status that wrapped at the narrower natural width. */
-    const int want_h = nat_h > 160 ? 160 : (nat_h > 0 ? nat_h : 1);
+     * status that wrapped at the narrower natural width. A scrolling status
+     * shows 8 whole lines under a 6px top inset; the bottom inset scrolls
+     * with the text, so it does not show part of a ninth line. */
+    const int want_h = scroll ? cap + 6 : (text_h > 0 ? text_h : 1);
     if (vpol != want || m_status_scroll.get_min_content_height() != want_h) {
       m_status_policy = want;
       m_status_height = want_h;
       /* Trackable slot: dropped automatically if the window goes away first. */
       Glib::signal_idle().connect_once(sigc::mem_fun(*this, &UpdatesWindow::apply_status_height));
+    } else {
+      /* Same height as before: nothing to refit for this text. */
+      m_status_changed = false;
     }
   });
 
@@ -438,21 +467,27 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_warning.set_no_show_all(true);
   m_warning.hide();
 
-  /* 0.9.5-4: the restart-marker notice, outside the scrolling status. */
+  /* 0.9.5-4: the restart-marker notice, outside the scrolling status.
+   * 0.9.7-2 (UL-12): a 12px group gap separates it from the status. */
   m_restart_note.set_line_wrap(true);
+  m_restart_note.set_margin_bottom(6);
   m_restart_note.set_xalign(0.0f);
   m_restart_note.set_max_width_chars(64);
   m_restart_note.set_no_show_all(true);
   m_restart_note.hide();
 
-  /* Spinner lives beside status (not in ButtonBox — GtkButtonBox is for buttons). */
+  /* 0.9.7-2 (UL-3): the spinner sits at the start of the button row, not
+   * beside the status, so the text does not jump 24px when a job starts. */
   m_spinner.set_no_show_all(true);
   m_spinner.set_size_request(18, 18);
-  m_status_row.pack_start(m_spinner, Gtk::PACK_SHRINK, 0);
+  m_spinner.set_valign(Gtk::ALIGN_CENTER);
   m_status_row.pack_start(m_status_scroll, Gtk::PACK_EXPAND_WIDGET, 0);
 
   m_progress.set_no_show_all(true);
-  m_progress.set_show_text(false);
+  /* 0.9.7-2 (UL-4): the text line is always there (empty while pulsing), so
+   * the bar keeps one height when the first percent arrives. */
+  m_progress.set_show_text(true);
+  m_progress.set_text("");
   m_progress.set_pulse_step(0.05);
   m_progress.hide();
 
@@ -467,11 +502,12 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_view.get_selection()->set_mode(Gtk::SELECTION_NONE);
   /* Fixed shares keep the versions and the size inside the window. Long
    * package names ellipsize instead of pushing the new version off screen. */
-  tune_column(0, 160, true, Pango::ELLIPSIZE_END, false);
-  tune_column(1, 168, false, Pango::ELLIPSIZE_MIDDLE, true);
-  tune_column(2, 210, false, Pango::ELLIPSIZE_MIDDLE, true);
-  tune_column(3, 96, false, Pango::ELLIPSIZE_NONE, false);
-  tune_column(4, 84, false, Pango::ELLIPSIZE_NONE, false);
+  /* 0.9.7-2 (UL-1): the five columns fit the 534px list of a 560px window. */
+  tune_column(0, 128, true, Pango::ELLIPSIZE_END, false);
+  tune_column(1, 108, false, Pango::ELLIPSIZE_MIDDLE, true);
+  tune_column(2, 140, false, Pango::ELLIPSIZE_MIDDLE, true);
+  tune_column(3, 72, false, Pango::ELLIPSIZE_NONE, false);
+  tune_column(4, 72, false, Pango::ELLIPSIZE_NONE, false);
   m_view.set_has_tooltip(true);
   m_view.signal_query_tooltip().connect(sigc::mem_fun(*this, &UpdatesWindow::on_view_tooltip));
 
@@ -479,7 +515,8 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_scroller.set_shadow_type(Gtk::SHADOW_IN);
   /* Size the list to its rows (up to a cap set in show_package_list) instead
    * of opening a near-full-screen window around three rows. */
-  m_scroller.set_min_content_height(120);
+  /* 0.9.7-2 (UL-8): 72 = header + two rows, only for a small window. */
+  m_scroller.set_min_content_height(72);
   m_scroller.set_propagate_natural_height(true);
   m_scroller.set_max_content_height(420);
   m_scroller.set_no_show_all(true);
@@ -488,6 +525,8 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
 
   m_new_heading.set_text("New packages");
   m_new_heading.set_halign(Gtk::ALIGN_START);
+  /* 0.9.7-2 (UL-9): 12px group gap above the heading, 6px to its list. */
+  m_new_heading.set_margin_top(6);
   m_new_heading.set_no_show_all(true);
   m_new_heading.hide();
   m_new_store = Gtk::ListStore::create(m_new_cols);
@@ -497,6 +536,13 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_new_view.append_column("Size", m_new_cols.size);
   m_new_view.set_headers_visible(true);
   m_new_view.get_selection()->set_mode(Gtk::SELECTION_NONE);
+  /* 0.9.7-2 (UL-10): Version and Size line up under New version and Size. */
+  tune_column(m_new_view, 0, 236, false, Pango::ELLIPSIZE_END, false);
+  tune_column(m_new_view, 1, 140, false, Pango::ELLIPSIZE_MIDDLE, false);
+  tune_column(m_new_view, 2, 72, false, Pango::ELLIPSIZE_NONE, false);
+  for (int i = 0; i < 3; ++i)
+    if (Gtk::TreeViewColumn* column = m_view.get_column(i))
+      column->property_width().signal_changed().connect(sigc::mem_fun(*this, &UpdatesWindow::sync_new_columns));
   m_new_scroller.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
   m_new_scroller.set_shadow_type(Gtk::SHADOW_IN);
   /* Show every new package (the old fixed 72px clipped the list to two). */
@@ -507,7 +553,12 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_new_scroller.hide();
 
   m_buttons.set_layout(Gtk::BUTTONBOX_END);
-  m_buttons.set_spacing(8);
+  /* 0.9.7-2 (UL-2, UL-11): buttons take their own width (at least 96px)
+   * with 6px between them, instead of all growing to the widest. */
+  m_buttons.set_spacing(6);
+  m_buttons.set_homogeneous(false);
+  for (Gtk::Button* button : {&m_cancel, &m_install, &m_check, &m_restart, &m_repair, &m_cleanup})
+    button->set_size_request(96, -1);
   m_install.set_sensitive(false);
   m_install.set_can_default(true);
   m_check.set_can_default(true);
@@ -533,6 +584,8 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_cleanup.set_tooltip_text("Remove packages that were installed as dependencies and are no longer needed.");
   m_cleanup.hide();
   m_buttons.pack_start(m_cleanup, Gtk::PACK_SHRINK);
+  for (Gtk::Button* button : {&m_cancel, &m_install, &m_check, &m_restart, &m_repair, &m_cleanup})
+    m_buttons.set_child_non_homogeneous(*button, true);
   m_cleanup.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_cleanup_clicked));
   apply_button_order();
   m_check.signal_clicked().connect(sigc::mem_fun(*this, &UpdatesWindow::on_check_clicked));
@@ -550,17 +603,20 @@ UpdatesWindow::UpdatesWindow(bool check_on_start)
   m_content.pack_start(m_scroller, Gtk::PACK_EXPAND_WIDGET);
   m_content.pack_start(m_new_heading, Gtk::PACK_SHRINK);
   m_content.pack_start(m_new_scroller, Gtk::PACK_SHRINK);
-  m_content.pack_start(m_buttons, Gtk::PACK_SHRINK);
+  /* 0.9.7-2 (UL-5, UL-9): the button row is packed at the end with a 12px
+   * group gap, so an enlarged window keeps it on the bottom edge. */
+  m_action_row.pack_start(m_spinner, Gtk::PACK_SHRINK);
+  m_action_row.pack_end(m_buttons, Gtk::PACK_EXPAND_WIDGET);
+  m_action_row.set_margin_top(6);
+  m_content.pack_end(m_action_row, Gtk::PACK_SHRINK);
 
   m_vbox.pack_start(m_menubar, Gtk::PACK_SHRINK);
-  /* SHRINK while the list is hidden so expand space does not open under the
-   * buttons. show_package_list() switches this to EXPAND when the list appears. */
-  m_vbox.pack_start(m_content, Gtk::PACK_SHRINK);
+  m_vbox.pack_start(m_content, Gtk::PACK_EXPAND_WIDGET);
   add(m_vbox);
   show_all_children();
   /* Refit whenever an optional row comes or goes. */
   for (Gtk::Widget* w : std::initializer_list<Gtk::Widget*>{&m_progress, &m_warning, &m_commit_note, &m_restart_note,
-                                                           &m_new_scroller}) {
+                                                           &m_new_scroller, &m_restart, &m_repair, &m_cleanup}) {
     w->signal_show().connect(sigc::mem_fun(*this, &UpdatesWindow::queue_fit));
     w->signal_hide().connect(sigc::mem_fun(*this, &UpdatesWindow::queue_fit));
   }
@@ -698,7 +754,31 @@ void UpdatesWindow::set_status_text(const Glib::ustring& status)
 {
   m_status.set_text(status);
   m_status.select_region(0, 0);
-  queue_fit();
+  /* 0.9.7-2 (UL-6): refit only if the new text wraps to a different height
+   * (apply_status_height); a rewrap from a user resize does not refit. */
+  m_status_changed = true;
+  m_status.queue_resize();
+  queue_content_check();
+}
+
+void UpdatesWindow::queue_content_check()
+{
+  if (m_content_check_queued)
+    return;
+  m_content_check_queued = true;
+  Glib::signal_idle().connect_once(sigc::mem_fun(*this, &UpdatesWindow::check_content_height));
+}
+
+void UpdatesWindow::check_content_height()
+{
+  m_content_check_queued = false;
+  if (!get_realized() || is_maximized() || m_fit_nat_h <= 0)
+    return;
+  int min_h = 0;
+  int nat_h = 0;
+  get_preferred_height_for_width(m_requested_width > 0 ? m_requested_width : get_allocated_width(), min_h, nat_h);
+  if (nat_h > 0 && nat_h != m_fit_nat_h)
+    fit_height();
 }
 
 void UpdatesWindow::queue_fit()
@@ -719,42 +799,88 @@ void UpdatesWindow::apply_status_height()
 {
   if (m_status_height < 0)
     return;
+  const bool scroll = m_status_policy == Gtk::POLICY_AUTOMATIC;
+  m_status_scroll.set_shadow_type(scroll ? Gtk::SHADOW_IN : Gtk::SHADOW_NONE);
+  m_status_scroll.set_overlay_scrolling(!scroll);
+  const int inset = scroll ? 6 : 0;
+  m_status.set_margin_start(inset);
+  m_status.set_margin_end(inset);
+  m_status.set_margin_top(inset);
+  m_status.set_margin_bottom(inset);
   m_status_scroll.set_policy(Gtk::POLICY_NEVER, m_status_policy);
-  m_status_scroll.set_max_content_height(m_status_height);
-  m_status_scroll.set_min_content_height(m_status_height);
-  fit_height();
+  if (m_status_height < m_status_scroll.get_min_content_height()) {
+    m_status_scroll.set_min_content_height(m_status_height);
+    m_status_scroll.set_max_content_height(m_status_height);
+  } else {
+    m_status_scroll.set_max_content_height(m_status_height);
+    m_status_scroll.set_min_content_height(m_status_height);
+  }
+  if (m_status_changed) {
+    m_status_changed = false;
+    fit_height();
+  }
+}
+
+int UpdatesWindow::status_cap() const
+{
+  /* 8 whole lines of the status font. */
+  auto layout = const_cast<Gtk::Label&>(m_status).create_pango_layout("Xg");
+  int w = 0;
+  int h = 0;
+  layout->get_pixel_size(w, h);
+  if (h < 8)
+    h = 19;
+  return 8 * h;
 }
 
 bool UpdatesWindow::settle_fit()
 {
+  m_fit_nudged = true;
   fit_height();
+  m_fit_nudged = false;
   return false;
 }
 
 void UpdatesWindow::fit_height()
 {
-  /* The window hugs its content at its current width: drop height left over
-   * from a taller state (progress bar, long error) so no blank band opens
-   * under the buttons, and grow so the package lists are never clipped. */
-  if (!get_realized())
+  /* The window hugs its content: drop height left over from a taller state
+   * (progress bar, long error) so no blank band opens under the buttons, and
+   * grow so the package lists are never clipped.
+   * 0.9.7-2 (UL-1, UL-2): the width is 560 in every state, wider only while
+   * the button row needs it, and back to 560 afterwards. It is computed
+   * from the request, not read back from get_size(), which still reported
+   * the old width when a resize was pending and undid it. A window the user
+   * widened (or maximized) keeps its size. */
+  if (!get_realized() || is_maximized())
     return;
+  int min_w = 0;
+  int nat_w = 0;
+  get_preferred_width(min_w, nat_w);
+  int target_w = min_w > kWindowWidth ? min_w : kWindowWidth;
+  const int alloc_w = get_allocated_width();
+  if (alloc_w > target_w && alloc_w > m_requested_width && alloc_w > m_pending_width)
+    target_w = alloc_w;
   int width = 0;
   int height = 0;
   get_size(width, height);
   int min_h = 0;
   int nat_h = 0;
-  get_preferred_height_for_width(width, min_h, nat_h);
+  get_preferred_height_for_width(target_w, min_h, nat_h);
   /* Compare against the allocation: get_size() reports the last requested
    * size, which can already equal nat_h after the window grew by itself. */
   if (nat_h <= 0)
     return;
-  if (height != nat_h) {
-    resize(width, nat_h);
-  } else if (get_allocated_height() != nat_h) {
+  m_requested_width = target_w;
+  if (target_w > m_pending_width)
+    m_pending_width = target_w;
+  m_fit_nat_h = nat_h;
+  if (height != nat_h || width != target_w) {
+    resize(target_w, nat_h);
+  } else if (get_allocated_height() != nat_h && !m_fit_nudged) {
     /* The window grew past its request when a row appeared (the request
      * stayed nat_h), so re-requesting nat_h is a no-op. Nudge the request,
-     * then settle on nat_h once that has been processed. */
-    resize(width, nat_h + 1);
+     * then settle on nat_h once that has been processed (once). */
+    resize(target_w, nat_h + 1);
     Glib::signal_timeout().connect(sigc::mem_fun(*this, &UpdatesWindow::settle_fit), 50);
   }
 }
@@ -804,7 +930,7 @@ bool UpdatesWindow::on_pulse_tick()
     m_progress.set_text(std::to_string(m_progress_percent) + "%");
     m_progress.set_fraction(static_cast<double>(m_progress_percent) / 100.0);
   } else {
-    m_progress.set_show_text(false);
+    m_progress.set_text("");
     m_progress.pulse();
   }
   return true;
@@ -873,9 +999,6 @@ void UpdatesWindow::show_package_list()
   /* Explicit show(): show_all() is a no-op while no_show_all is set on the scroller. */
   m_view.show();
   m_scroller.show();
-  /* gtkmm Box no longer wraps this; expand content so the scroller absorbs growth. */
-  gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), TRUE, TRUE, 0,
-                            GTK_PACK_START);
   /* Cap the list so the window never outgrows the screen, then let the
    * window take its natural height: a short list no longer opens a tall
    * window full of empty rows. */
@@ -891,7 +1014,7 @@ void UpdatesWindow::show_package_list()
     }
   }
   m_scroller.set_max_content_height(list_cap);
-  resize(780, 1);
+  /* 0.9.7-2 (UL-1): no 780px widen; the columns fit the 560px window. */
   queue_fit();
   use_install_as_default();
 }
@@ -905,17 +1028,9 @@ void UpdatesWindow::hide_package_list()
   m_debconf_pkgs.clear();
   m_new_heading.hide();
   m_new_scroller.hide();
-  gtk_box_set_child_packing(m_vbox.gobj(), GTK_WIDGET(m_content.gobj()), FALSE, FALSE, 0,
-                            GTK_PACK_START);
   /* Collapse to the natural height of menubar + status + buttons. The fit
    * runs from idle, after every row for the new state is shown or hidden;
    * measuring here caught the progress bar mid-check and kept its height. */
-  int width = 0;
-  int height = 0;
-  get_size(width, height);
-  if (width < 560)
-    width = 560;
-  resize(width, height);
   queue_fit();
   use_check_as_default();
 }
@@ -923,7 +1038,32 @@ void UpdatesWindow::hide_package_list()
 void UpdatesWindow::tune_column(int index, int width, bool expand, Pango::EllipsizeMode ellipsize,
                                 bool resizable)
 {
-  Gtk::TreeViewColumn* column = m_view.get_column(index);
+  tune_column(m_view, index, width, expand, ellipsize, resizable);
+}
+
+/* 0.9.7-2 (UL-10): the new-packages Package column spans Package + Old
+ * version, so its Version and Size columns start under New version and Size. */
+void UpdatesWindow::sync_new_columns()
+{
+  const int widths[3] = {
+      (m_view.get_column(0) ? m_view.get_column(0)->get_width() : 0) +
+          (m_view.get_column(1) ? m_view.get_column(1)->get_width() : 0),
+      m_view.get_column(2) ? m_view.get_column(2)->get_width() : 0,
+      m_view.get_column(3) ? m_view.get_column(3)->get_width() : 0,
+  };
+  for (int i = 0; i < 3; ++i) {
+    Gtk::TreeViewColumn* column = m_new_view.get_column(i);
+    if (column != nullptr && widths[i] > 0 && column->get_fixed_width() != widths[i]) {
+      column->set_min_width(widths[i]);
+      column->set_fixed_width(widths[i]);
+    }
+  }
+}
+
+void UpdatesWindow::tune_column(Gtk::TreeView& view, int index, int width, bool expand,
+                                Pango::EllipsizeMode ellipsize, bool resizable)
+{
+  Gtk::TreeViewColumn* column = view.get_column(index);
   if (column == nullptr)
     return;
   column->set_sizing(Gtk::TREE_VIEW_COLUMN_FIXED);
@@ -1433,19 +1573,8 @@ void UpdatesWindow::show_restart(bool make_default)
     set_default(m_restart);
     m_restart.grab_default();
   }
-  {
-    queue_resize();
-    int min_h = 0;
-    int nat_h = 0;
-    get_preferred_height(min_h, nat_h);
-    int width = 0;
-    int height = 0;
-    get_size(width, height);
-    if (width < 560)
-      width = 560;
-    if (nat_h > height)
-      resize(width, nat_h);
-  }
+  /* 0.9.7-2 (UL-2): the fit sets width and height for the new button row. */
+  queue_fit();
 }
 
 void UpdatesWindow::offer_restart_for_marker()
@@ -2198,15 +2327,25 @@ void UpdatesWindow::confirm_new_packages()
   if (m_new_dialog != nullptr || (!have_new && m_debconf_pkgs.empty()))
     return;
   std::string names;
+  /* 0.9.7-2 (UL-13): name at most 12, like the cleanup dialog, so a long
+   * list does not grow the dialog past the screen. */
+  std::size_t named = 0;
+  std::size_t total = 0;
   const auto fresh = m_new_store->children();
   for (const auto& row : fresh) {
     const std::string name = static_cast<Glib::ustring>((*row)[m_new_cols.package]);
     if (name.empty())
       continue;
+    ++total;
+    if (named >= 12)
+      continue;
     if (!names.empty())
       names += ", ";
     names += name;
+    ++named;
   }
+  if (total > named)
+    names += ", and " + std::to_string(total - named) + " more";
   m_new_primary = have_new ? "Install new packages with these updates?" : "Install these updates?";
   m_new_secondary = have_new ? "These new packages will be installed: " + names + "." : std::string();
   /* Round 12 (U-1): say beforehand that setup questions get default answers. */
@@ -2326,6 +2465,7 @@ void UpdatesWindow::refresh_commit_note()
   }
   m_commit_note.set_text(note);
   m_commit_note.show();
+  queue_content_check();
 }
 
 void UpdatesWindow::apply_phase_status()
@@ -2537,6 +2677,66 @@ bool UpdatesWindow::buttons_inside_window_for_test() const
                                         m_buttons.get_allocated_height(), nullptr, &bottom))
     return false;
   return bottom <= get_allocated_height() + 2;
+}
+
+static int x_in_window(const Gtk::Widget& widget, const Gtk::Window& window)
+{
+  int x = 0;
+  int y = 0;
+  if (!gtk_widget_translate_coordinates(GTK_WIDGET(widget.gobj()), GTK_WIDGET(window.gobj()), 0, 0, &x, &y))
+    return -1;
+  return x;
+}
+
+int UpdatesWindow::status_text_x_for_test() const
+{
+  return x_in_window(m_status, *this) - m_status.get_margin_start();
+}
+
+int UpdatesWindow::note_x_for_test() const
+{
+  return x_in_window(m_commit_note, *this);
+}
+
+int UpdatesWindow::visible_columns_for_test() const
+{
+  const auto hadj = m_scroller.get_hadjustment();
+  const int page = hadj ? static_cast<int>(hadj->get_page_size()) : m_view.get_allocated_width();
+  int visible = 0;
+  for (int i = 0; i < static_cast<int>(m_view.get_n_columns()); ++i) {
+    const Gtk::TreeViewColumn* column = m_view.get_column(i);
+    if (column != nullptr && column->get_width() > 0 && column->get_x_offset() + column->get_width() <= page + 1)
+      ++visible;
+  }
+  return visible;
+}
+
+int UpdatesWindow::new_columns_aligned_for_test() const
+{
+  const Gtk::TreeViewColumn* a = m_new_view.get_column(1);
+  const Gtk::TreeViewColumn* b = m_view.get_column(2);
+  const Gtk::TreeViewColumn* c = m_new_view.get_column(2);
+  const Gtk::TreeViewColumn* d = m_view.get_column(3);
+  if (!a || !b || !c || !d)
+    return 0;
+  return std::abs(a->get_x_offset() - b->get_x_offset()) <= 1 && std::abs(c->get_x_offset() - d->get_x_offset()) <= 1;
+}
+
+int UpdatesWindow::buttons_gap_for_test() const
+{
+  int row_y = 0;
+  int x = 0;
+  if (!gtk_widget_translate_coordinates(GTK_WIDGET(m_action_row.gobj()), GTK_WIDGET(gobj()), 0, 0, &x, &row_y))
+    return -1;
+  int bottom = 0;
+  for (const Gtk::Widget* child : m_content.get_children()) {
+    if (child == &m_action_row || !child->get_visible())
+      continue;
+    int cy = 0;
+    if (gtk_widget_translate_coordinates(GTK_WIDGET(child->gobj()), GTK_WIDGET(gobj()), 0, 0, &x, &cy))
+      bottom = std::max(bottom, cy + child->get_allocated_height());
+  }
+  return row_y - bottom;
 }
 
 int UpdatesWindow::button_x_for_test(const Gtk::Widget& widget) const
