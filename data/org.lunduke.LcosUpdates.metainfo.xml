@@ -28,6 +28,11 @@
     <category>System</category>
   </categories>
   <releases>
+    <release version="1.0.0" date="2026-10-27">
+      <description>
+        <p>Version for LCOS 1.0.0. No functional changes.</p>
+      </description>
+    </release>
     <release version="0.9.5" date="2026-10-16">
       <description>
         <p>Offers Restart after kernel, firmware and microcode updates, deletes downloaded package files after installing, and can remove packages that are no longer needed.</p>
