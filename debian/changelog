@@ -1,3 +1,10 @@
+lcos-updates (1.0.0-1) unstable; urgency=medium
+
+  * Version 1.0.0 for the LCOS 1.0.0 track (About dialog, meson project
+    version and AppStream metainfo). No other changes.
+
+ -- LCOS <lcos@lunduke.com>  Tue, 27 Oct 2026 11:43:29 -0500
+
 lcos-updates (0.9.7-2) unstable; urgency=medium
 
   * Layout fixes in the Updates window (UL-1 to UL-13). No logic, wording
