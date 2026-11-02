@@ -1,3 +1,9 @@
+lcos-updates (1.0.1-1) unstable; urgency=medium
+
+  * Version bump for LCOS 1.0.1. No functional changes.
+
+ -- Ted <ted@brushpad.local>  Mon, 02 Nov 2026 21:30:00 +0000
+
 lcos-updates (1.0.0-1) unstable; urgency=medium
 
   * Version 1.0.0 for the LCOS 1.0.0 track (About dialog, meson project
