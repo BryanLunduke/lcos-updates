@@ -1,3 +1,9 @@
+lcos-updates (1.1.0-1) unstable; urgency=medium
+
+  * Version bump for LCOS 1.1.0. No functional changes.
+
+ -- Ted <ted@brushpad.local>  Thu, 12 Nov 2026 03:03:11 +0000
+
 lcos-updates (1.0.1-1) unstable; urgency=medium
 
   * Version bump for LCOS 1.0.1. No functional changes.
