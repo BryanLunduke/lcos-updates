@@ -28,6 +28,11 @@
     <category>System</category>
   </categories>
   <releases>
+    <release version="1.0.2" date="2026-11-21">
+      <description>
+        <p>BIOS installs with an empty grub-pc boot disk no longer fail the update and loop on Repair.</p>
+      </description>
+    </release>
     <release version="1.0.1" date="2026-11-02">
       <description>
         <p>Version for LCOS 1.0.1. No functional changes.</p>

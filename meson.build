@@ -1,7 +1,7 @@
 project(
   'lcos-updates',
   'cpp',
-  version: '1.0.1',
+  version: '1.0.2',
   license: 'GPL-3.0-or-later',
   meson_version: '>=0.56',
   default_options: [
@@ -46,11 +46,18 @@ lcos_updates = executable(
   install_dir: get_option('bindir'),
 )
 
+grub_pc = static_library(
+  'grub-pc',
+  'src/grub-pc.cpp',
+  include_directories: inc,
+  install: false,
+)
+
 helper = executable(
   'lcos-updates-helper',
   'src/helper.cpp',
   include_directories: inc,
-  link_with: [apt_parse, proc_group],
+  link_with: [apt_parse, proc_group, grub_pc],
   install: true,
   install_dir: get_option('libexecdir'),
 )
@@ -228,6 +235,21 @@ test(
   'round15-restart-cleanup-metainfo',
   test_r15,
   args: [helper.full_path(), meson.project_source_root()],
+  timeout: 120,
+)
+
+test_grub = executable(
+  'test-grub-pc',
+  'tests/test-grub-pc.cpp',
+  include_directories: inc,
+  link_with: [apt_parse, grub_pc],
+  install: false,
+)
+
+test(
+  'grub-pc-boot-disk',
+  test_grub,
+  args: [helper.full_path()],
   timeout: 120,
 )
 
