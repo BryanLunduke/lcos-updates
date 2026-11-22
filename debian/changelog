@@ -1,3 +1,15 @@
+lcos-updates (1.0.2-1) unstable; urgency=medium
+
+  * BIOS installs: when grub-pc is installed, /boot/grub/i386-pc/core.img
+    exists, and grub-pc/install_devices is empty, set that debconf value to
+    the whole boot disk (from grub-probe) before Install and before Repair.
+    A failed configure says to click Repair. If the disk cannot be
+    determined, Repair tells you to run
+    "sudo DEBIAN_FRONTEND=dialog dpkg --configure grub-pc" and choose the
+    whole disk. This package's postinst does not depend on grub-pc.
+
+ -- Ted <ted@brushpad.local>  Sat, 21 Nov 2026 23:15:00 +0000
+
 lcos-updates (1.0.1-1) unstable; urgency=medium
 
   * Version bump for LCOS 1.0.1. No functional changes.

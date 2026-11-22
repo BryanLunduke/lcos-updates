@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build lcos-updates_1.0.1-1_amd64.deb into packaging/debs/ (repo-local).
+# Build lcos-updates_1.0.2-1_amd64.deb into packaging/debs/ (repo-local).
 # Does NOT seed lcos-live-06 or lcos-live-07.
 set -eu
 
@@ -12,7 +12,7 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${LCOS_UPDATES_UNDER_XVFB:-}" ]; then
 fi
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-VERSION="1.0.1-1"
+VERSION="1.0.2-1"
 PKGNAME="lcos-updates_${VERSION}_amd64"
 BUILD="$ROOT/build"
 DEST="$ROOT/packaging/src/lcos-updates"
@@ -62,6 +62,10 @@ CTRL
 
 cat > "$DEST/DEBIAN/postinst" << 'POST'
 #!/bin/sh
+# Do not depend on grub-pc (or any other package) being configured. An
+# update can unpack this package and grub-pc together; if grub-pc's
+# postinst fails, this package must still configure so the next Repair
+# runs this helper.
 set -e
 if [ "$1" = configure ]; then
   update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
