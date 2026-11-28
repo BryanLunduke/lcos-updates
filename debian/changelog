@@ -1,3 +1,18 @@
+lcos-updates (1.1.0-2) unstable; urgency=medium
+
+  * Port the fix for LCOS issue #212 (shipped in 1.0.2-1) to 1.1: BIOS
+    installs, where Calamares never sets debconf grub-pc/install_devices,
+    made grub-pc's postinst exit 1 (grub2 2.12-9+deb13u4) and Repair looped.
+    When grub-pc is installed, /boot/grub/i386-pc/core.img exists, and
+    grub-pc/install_devices is empty, set that debconf value to the whole
+    boot disk (from grub-probe) before Install and before Repair.
+    A failed configure says to click Repair. If the disk cannot be
+    determined, Repair tells you to run
+    "sudo DEBIAN_FRONTEND=dialog dpkg --configure grub-pc" and choose the
+    whole disk. This package's postinst does not depend on grub-pc.
+
+ -- Ted <ted@brushpad.local>  Fri, 27 Nov 2026 18:20:00 -0600
+
 lcos-updates (1.1.0-1) unstable; urgency=medium
 
   * Version bump for LCOS 1.1.0. No functional changes.
