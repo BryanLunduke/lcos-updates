@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+# Binary package only. The deb layout (generated postinst, postrm, shlibdeps)
+# lives in packaging/build-deb.sh. This rules file exists so
+# dpkg-buildpackage -us -uc -b builds that same deb.
+
+.PHONY: clean build build-arch build-indep binary binary-arch binary-indep
+
+clean:
+	rm -rf build packaging/src packaging/debs debian/files
+	rm -f ../lcos-updates_*_amd64.deb ../lcos-updates_*_amd64.buildinfo ../lcos-updates_*_amd64.changes
+
+build build-arch build-indep binary-indep:
+	true
+
+binary: binary-arch
+
+binary-arch:
+	./packaging/build-deb.sh
+	cp -f packaging/debs/lcos-updates_*_amd64.deb ..
+	set -e; deb=$$(basename packaging/debs/lcos-updates_*_amd64.deb); echo "$$deb admin optional" > debian/files

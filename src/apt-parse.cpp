@@ -2262,7 +2262,7 @@ bool error_suggests_repair(const std::string& msg)
   /* A dpkg that is still running is not repairable yet. */
   if (has_text("still running"))
     return false;
-  return has_text("use repair") || has_text("dpkg was interrupted") ||
+  return has_text("use repair") || has_text("click repair") || has_text("dpkg was interrupted") ||
          has_text("dpkg --configure -a") || has_text("--fix-broken") ||
          has_text("unmet dependencies") || has_text("left unfinished") ||
          has_text("half-installed") || has_text("half-configured") ||
