@@ -8,6 +8,7 @@
  */
 
 #include "apt-parse.hpp"
+#include "grub-pc.hpp"
 #include "proc-group.hpp"
 #include "timeouts.hpp"
 
@@ -49,6 +50,7 @@ const char kNoRecommends[] = "APT::Install-Recommends=false";
  * is not added here: that command is only for an interrupted dpkg that has
  * already exited (see fail_apt). A full disk is this sentence plus kFreeSpace. */
 const char kUpgradeUnfinished[] = "The upgrade stopped with a package left unfinished.";
+const char kClickRepair[] = "Click Repair to finish configuring packages.";
 const char kFreeSpace[] = "Free disk space, then use Repair to finish configuring packages.";
 /* Round 10 (U-1): the window offers a Repair button for this state. */
 const char kDpkgRecovery[] =
@@ -953,6 +955,8 @@ std::string first_error_line(const std::string& out, const std::string& err)
     if (!apt_says_dpkg_interrupted(text)) {
       msg += "\n";
       msg += kUpgradeUnfinished;
+      msg += "\n";
+      msg += kClickRepair;
       if (no_space) {
         msg += "\n";
         msg += kFreeSpace;
@@ -2413,6 +2417,254 @@ int do_simulate()
   return result.status == SimulateResult::Error ? 1 : 0;
 }
 
+/* Root uses the real path. A non-root run (the tests) uses the override and
+ * never touches the machine it is running on. */
+const char* overridden_tool(const char* fallback, const char* env_key)
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv(env_key);
+    if (env != nullptr && env[0] == '/')
+      return env;
+    return nullptr;
+  }
+  return fallback;
+}
+
+bool safe_fs_name(const std::string& name)
+{
+  if (name.empty() || name.size() > 200 || name == "." || name == "..")
+    return false;
+  for (unsigned char c : name) {
+    if (std::isalnum(c) || c == '.' || c == '_' || c == '+' || c == '-')
+      continue;
+    return false;
+  }
+  return true;
+}
+
+std::string link_basename(const std::string& path)
+{
+  char buf[4096];
+  const ssize_t n = readlink(path.c_str(), buf, sizeof buf - 1);
+  if (n <= 0)
+    return {};
+  buf[n] = '\0';
+  std::string target(buf, static_cast<std::size_t>(n));
+  while (!target.empty() && target.back() == '/')
+    target.pop_back();
+  const std::size_t slash = target.find_last_of('/');
+  if (slash != std::string::npos)
+    target = target.substr(slash + 1);
+  return safe_fs_name(target) ? target : std::string();
+}
+
+std::string dir_override(const char* fallback, const char* env_key)
+{
+  if (geteuid() != 0) {
+    const char* env = std::getenv(env_key);
+    if (env != nullptr && env[0] == '/')
+      return env;
+    return {};
+  }
+  return fallback;
+}
+
+void read_block_slaves(const std::string& root, DiskTopology& topo)
+{
+  if (root.empty())
+    return;
+  DIR* dir = opendir(root.c_str());
+  if (dir == nullptr)
+    return;
+  while (const dirent* ent = readdir(dir)) {
+    const std::string name = ent->d_name;
+    if (!safe_fs_name(name))
+      continue;
+    const std::string slaves_dir = root + "/" + name + "/slaves";
+    DIR* slaves = opendir(slaves_dir.c_str());
+    if (slaves == nullptr)
+      continue;
+    std::vector<std::string> names;
+    while (const dirent* slave = readdir(slaves)) {
+      const std::string slave_name = slave->d_name;
+      if (safe_fs_name(slave_name))
+        names.push_back(slave_name);
+    }
+    closedir(slaves);
+    if (!names.empty())
+      topo.slaves.emplace_back(name, std::move(names));
+  }
+  closedir(dir);
+}
+
+void read_mapper_aliases(const std::string& root, DiskTopology& topo)
+{
+  if (root.empty())
+    return;
+  DIR* dir = opendir(root.c_str());
+  if (dir == nullptr)
+    return;
+  while (const dirent* ent = readdir(dir)) {
+    const std::string name = ent->d_name;
+    if (!safe_fs_name(name))
+      continue;
+    const std::string target = link_basename(root + "/" + name);
+    if (!target.empty())
+      topo.alias.emplace_back(name, target);
+  }
+  closedir(dir);
+}
+
+void read_by_id(const std::string& root, DiskTopology& topo)
+{
+  if (root.empty())
+    return;
+  DIR* dir = opendir(root.c_str());
+  if (dir == nullptr)
+    return;
+  while (const dirent* ent = readdir(dir)) {
+    const std::string name = ent->d_name;
+    if (!safe_fs_name(name))
+      continue;
+    const std::string target = link_basename(root + "/" + name);
+    if (!target.empty())
+      topo.by_id.emplace_back(name, target);
+  }
+  closedir(dir);
+}
+
+DiskTopology read_disk_topology()
+{
+  DiskTopology topo;
+  read_block_slaves(dir_override("/sys/class/block", "LCOS_UPDATES_SYS_BLOCK"), topo);
+  read_mapper_aliases(dir_override("/dev/mapper", "LCOS_UPDATES_DEV_MAPPER"), topo);
+  read_by_id(dir_override("/dev/disk/by-id", "LCOS_UPDATES_DISK_BY_ID"), topo);
+  return topo;
+}
+
+bool grub_bios_core_present()
+{
+  const char* path = "/boot/grub/i386-pc/core.img";
+  if (geteuid() != 0) {
+    const char* env = std::getenv("LCOS_UPDATES_GRUB_CORE");
+    if (env == nullptr || env[0] != '/')
+      return false;
+    path = env;
+  }
+  struct stat st {};
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+int run_short_tool(const std::vector<const char*>& argv, std::string& out, std::string& err)
+{
+  const AptClock clock = apt_clock(30, 60);
+  return run_apt(argv, clock.idle_sec, clock.hard_sec, out, err, false, false, false);
+}
+
+/* 0 written, -3 cancelled, 1 failed. The record is the same line the
+ * tested repair uses: grub-pc grub-pc/install_devices multiselect <disk>. */
+int write_grub_install_devices(const std::vector<std::string>& devices)
+{
+  const std::string line = grub_pc_debconf_line(devices);
+  if (line.empty())
+    return 1;
+  const char* tool = overridden_tool("/usr/bin/debconf-set-selections", "LCOS_UPDATES_DEBCONF_SET_SELECTIONS");
+  if (tool == nullptr)
+    return 1;
+  char tmpl[] = "/tmp/lcos-grub-XXXXXX";
+  const int fd = mkstemp(tmpl);
+  if (fd < 0)
+    return 1;
+  const std::string body = line + "\n";
+  const char* p = body.data();
+  std::size_t left = body.size();
+  bool stored = true;
+  while (left > 0) {
+    const ssize_t n = write(fd, p, left);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      stored = false;
+      break;
+    }
+    p += n;
+    left -= static_cast<std::size_t>(n);
+  }
+  if (stored && fsync(fd) != 0)
+    stored = false;
+  close(fd);
+  if (!stored) {
+    unlink(tmpl);
+    return 1;
+  }
+  const std::vector<const char*> argv = {tool, tmpl};
+  std::string out;
+  std::string err;
+  const int rc = run_short_tool(argv, out, err);
+  unlink(tmpl);
+  if (rc == -3)
+    return -3;
+  return rc == 0 ? 0 : 1;
+}
+
+enum class GrubPrep { Skip, Set, Unknown, Cancelled };
+
+/* Before Install and before Repair. UEFI-only machines (no i386 core.img)
+ * and a debconf value that is already set are left alone. install_devices_empty
+ * is never written. */
+GrubPrep prepare_grub_pc()
+{
+  if (geteuid() != 0) {
+    const char* probe_env = std::getenv("LCOS_UPDATES_GRUB_PROBE");
+    if (probe_env == nullptr || probe_env[0] != '/')
+      return GrubPrep::Skip;
+  }
+  if (stop_requested())
+    return GrubPrep::Cancelled;
+  if (!grub_pc_package_present(read_limited(dpkg_status_path(), 64 * 1024 * 1024)))
+    return GrubPrep::Skip;
+  if (!grub_bios_core_present())
+    return GrubPrep::Skip;
+
+  const std::string current = grub_pc_install_devices_value(read_debconf("config.dat"));
+  GrubPcFacts facts;
+  facts.package_present = true;
+  facts.bios_core_img = true;
+  facts.install_devices = current;
+  if (current.empty()) {
+    const char* probe = overridden_tool("/usr/sbin/grub-probe", "LCOS_UPDATES_GRUB_PROBE");
+    if (probe == nullptr) {
+      facts.probe_ok = false;
+    } else {
+      const std::vector<const char*> argv = {probe, "-t", "disk", "/boot/grub"};
+      std::string out;
+      std::string err;
+      const int rc = run_short_tool(argv, out, err);
+      if (rc == -3 || stop_requested())
+        return GrubPrep::Cancelled;
+      facts.probe_ok = rc == 0;
+      facts.probe_output = out;
+      if (facts.probe_ok)
+        facts.topo = read_disk_topology();
+    }
+  }
+  const GrubPcDecision decision = decide_grub_pc(facts);
+  if (!decision.log.empty())
+    write_all_fd(STDERR_FILENO, "NOTE " + decision.log + "\n");
+  if (decision.action != GrubPcAction::Set)
+    return decision.action == GrubPcAction::Unknown ? GrubPrep::Unknown : GrubPrep::Skip;
+  if (stop_requested())
+    return GrubPrep::Cancelled;
+  const int wrote = write_grub_install_devices(decision.devices);
+  if (wrote == -3)
+    return GrubPrep::Cancelled;
+  if (wrote != 0) {
+    write_all_fd(STDERR_FILENO, "NOTE grub-pc: could not record the boot disk\n");
+    return GrubPrep::Unknown;
+  }
+  return GrubPrep::Set;
+}
+
 int do_upgrade(const std::vector<std::string>& pins)
 {
   if (stop_requested()) {
@@ -2517,6 +2769,16 @@ int do_upgrade(const std::vector<std::string>& pins)
   }
 
   if (!note_debconf(sim, false)) {
+    emit_error("Install was cancelled");
+    return 1;
+  }
+
+  /* A BIOS install with an empty grub-pc/install_devices fails its postinst
+   * under DEBIAN_FRONTEND=noninteractive. Set the disk before apt asks dpkg
+   * to configure. A machine that still cannot be recognised installs anyway;
+   * the failure tells the user to click Repair. */
+  const GrubPrep seeded = prepare_grub_pc();
+  if (seeded == GrubPrep::Cancelled) {
     emit_error("Install was cancelled");
     return 1;
   }
@@ -2663,7 +2925,8 @@ std::string strip_install_wording(const std::string& msg)
   std::string line;
   std::string out;
   while (std::getline(in, line)) {
-    if (line == kUpgradeUnfinished || line == kFreeSpace || line == kDpkgRecovery)
+    if (line == kUpgradeUnfinished || line == kFreeSpace || line == kDpkgRecovery ||
+        line == kClickRepair)
       continue;
     if (!out.empty())
       out += "\n";
@@ -2691,7 +2954,7 @@ std::string repair_failure_message(int rc, const std::string& out, const std::st
     msg += "\n" + detail;
   if (rc == -1 || rc == 127)
     msg += "\nCould not run dpkg.";
-  msg += "\nFix the problem shown above, then use Repair again.";
+  msg += "\nClick Repair to try again.";
   return msg;
 }
 
@@ -2709,6 +2972,14 @@ int do_repair()
     return 1;
   }
   announce_ready();
+
+  /* Same preseed as Install. The package that failed may be half-configured;
+   * that still counts as grub-pc being on the system. */
+  const GrubPrep seeded = prepare_grub_pc();
+  if (seeded == GrubPrep::Cancelled) {
+    emit_error("Repair was cancelled");
+    return 1;
+  }
 
   const std::string dpkg = dpkg_path();
   const AptClock clock = apt_clock(kUpgradeIdleSec, kUpgradeHardCapSec);
@@ -2742,6 +3013,34 @@ int do_repair()
   out = strip_debconf_trace(out);
   err = strip_debconf_trace(err);
   note_answers();
+  /* The preseed can miss a disk that only shows up once configure has been
+   * attempted, and a value written above can still be unread if configure
+   * raced it. Detect again and run configure once more. A disk that still
+   * cannot be named is reported with the command to run by hand; another
+   * Repair would only repeat this. */
+  if (rc != 0 && grub_pc_configure_failed(out + "\n" + err)) {
+    const GrubPrep again = prepare_grub_pc();
+    if (again == GrubPrep::Cancelled) {
+      emit_error("Repair was cancelled");
+      return 1;
+    }
+    if (again == GrubPrep::Unknown) {
+      emit_error(grub_pc_manual_message());
+      return 1;
+    }
+    out.clear();
+    err.clear();
+    emit_phase("configure");
+    g_dpkg_committed = 1;
+    g_stop = 0;
+    write_all_fd(STDERR_FILENO, "DPKG_STARTED\n");
+    g_debconf_mark_seen = true;
+    rc = run_apt(cfg_argv, clock.idle_sec, clock.hard_sec, out, err, false, true, false);
+    g_debconf_mark_seen = false;
+    out = strip_debconf_trace(out);
+    err = strip_debconf_trace(err);
+    note_answers();
+  }
   if (rc != 0) {
     emit_error(repair_failure_message(rc, out, err));
     return 1;

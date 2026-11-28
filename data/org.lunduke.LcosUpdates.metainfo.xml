@@ -30,7 +30,7 @@
   <releases>
     <release version="1.1.0" date="2026-11-12">
       <description>
-        <p>Version for LCOS 1.1.0. No functional changes.</p>
+        <p>Version for LCOS 1.1.0. BIOS installs with an empty grub-pc boot disk no longer fail the update and loop on Repair (issue #212).</p>
       </description>
     </release>
     <release version="1.0.1" date="2026-11-02">

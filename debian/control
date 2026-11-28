@@ -4,6 +4,7 @@ Priority: optional
 Maintainer: LCOS <lcos@lunduke.com>
 Homepage: https://lunduke.com
 Standards-Version: 4.6.2
+Rules-Requires-Root: no
 Build-Depends: xvfb, xauth
 
 Package: lcos-updates
